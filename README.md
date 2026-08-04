@@ -117,7 +117,7 @@
 # docker-compose.yml
 services:
   fnysfd:
-    image: jimboo7339/fntv-proxy:latest
+    image: 544849412/fnysfd:latest
     container_name: fnysfd
     restart: unless-stopped
     ports:
@@ -147,8 +147,8 @@ docker compose up -d
 
 ```bash
 # 克隆仓库
-git clone https://github.com/jimboo7339/fntv-proxy.git
-cd fntv-proxy
+git clone https://github.com/544849412/fnysfd.git
+cd fnysfd
 
 # Docker 构建
 docker build -t fnysfd:3.3.11 .
@@ -273,7 +273,7 @@ PlaybackInfo 响应处理 -> 同步预读 STRM -> 缓存直链 URL
 ## 目录结构
 
 ```
-fntv-proxy/
+fnysfd/
 ├── cmd/
 │   └── main.go                 # 入口（内存监控 + 热重载触发）
 ├── internal/
@@ -390,10 +390,10 @@ v3.3.11 起，电影和电视剧都参与完整的预加载和 CDN 预热流程�
 
 ## 贡献者
 
-<a href="https://github.com/jimboo7339/fntv-proxy/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=jimboo7339/fntv-proxy" />
+<a href="https://github.com/544849412/fnysfd/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=544849412/fnysfd" />
 </a>
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=jimboo7339/fntv-proxy&type=Date)](https://star-history.com/#jimboo7339/fntv-proxy&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=544849412/fnysfd&type=Date)](https://star-history.com/#544849412/fnysfd&Date)

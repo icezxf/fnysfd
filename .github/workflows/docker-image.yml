@@ -16,7 +16,7 @@ on:
 
 env:
   REGISTRY: docker.io
-  IMAGE_NAME: jimboo7339/fntv-proxy
+  IMAGE_NAME: 544849412/fnysfd
 
 jobs:
   build:
