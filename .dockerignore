@@ -1,0 +1,46 @@
+# Git
+.git
+.gitignore
+.github
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 构建产物
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+fnysfd
+fnysfd-linux
+
+# 日志文件
+logs/
+*.log
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+*~
+.DS_Store
+Thumbs.db
+
+# 测试数据
+test_strm/
+
+# 文档（减小镜像体积）
+*.md
+docs/
+
+# Windows 脚本
+*.bat
+*.cmd
+*.ps1

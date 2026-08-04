@@ -1,0 +1,35 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 构建产物
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+fnysfd
+fnysfd-linux
+
+# 日志文件（运行时生成）
+logs/
+*.log
+
+# 配置文件（用户自行创建）
+fnysfd-config/
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+.DS_Store
+Thumbs.db
+
+# 测试数据
+test_strm/

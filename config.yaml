@@ -1,0 +1,24 @@
+cache_ttl: 30
+dashboard_addr: :28006
+dashboard_pass: admin
+dashboard_user: admin
+listen: :28005
+log_dir: ./logs
+log_level: info
+max_cache_items: 10000
+strm_paths:
+    - /vol00
+strm_volumes:
+    - /vol00:/vol00:ro
+target: http://127.0.0.1:8005
+
+# STRM 解析模式（v2.3.7 新增）
+#   auto（默认）：智能识别CDN直链跳过解析，其他走HTTP解析
+#   passthrough：所有strm直接把内容给播放器，不解析/不预热/不预连接（适合全302 strm）
+#   always：强制所有strm走HTTP解析（回退到v2.3.4行为）
+strm_resolve_mode: passthrough
+
+# v2.4.1 功能开关（默认全部打开）
+enable_lan_strm: true    # 内网strm地址支持（关闭后内网strm直接返回URL给播放器）
+enable_preload: true     # 预加载（关闭后每次播放都需等待解析）
+enable_smart_ttl: true   # 智能签名TTL检测（按URL签名有效期动态设置缓存，解决播放中403）

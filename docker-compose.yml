@@ -1,0 +1,107 @@
+# ============================================================================
+# FNYSFD v3.3.11 - 飞牛影视反代服务 (电影预热修复版)
+# ============================================================================
+#
+# 📋 使用方法（必须按顺序执行）：
+#
+#   第1步：导入镜像
+#     docker load -i fnysfd-3.2.tar
+#
+#   第2步：部署服务
+#     docker-compose up -d
+#
+#   第3步：访问面板
+#     http://你的NAS IP:28006  (admin/admin)
+#
+#   第4步：添加STRM路径（挂载包含.strm文件的目录）
+#     在面板的"路径管理"中添加主机路径和容器路径
+#     如果路径在已挂载的根目录下，会立即生效，无需重启！
+#
+#   第5步（仅必要时）：重启容器
+#     点击面板"重启容器"按钮，或执行：docker compose restart
+#
+# ============================================================================
+# ⚠️  核心功能（v3.2）：
+#   - 自动解析.strm文件（文本文件，内容为真实视频URL）
+#   - 拦截流请求，302重定向到真实视频地址
+#   - 智能预加载引擎（16个worker，双优先级队列，零延迟响应）
+#   - 三客户端并行解析（fast 2s + medium 4s + slow 8s，第一遍成功率95%）
+#   - 异步CDN预热（不阻塞302响应，起播延迟降到~0ms）
+#   - MP4 moov atom 智能检测（faststart文件省一个尾部预热请求）
+#   - 预热去重（60s/30s/5s差异化TTL，避免重复预热）
+#   - 解析失败自动换UA重试（绕过源站UA限流）
+#   - CDN预连接（解析后立即预建TCP+TLS连接，省200-500ms起播时间）
+#   - bytes.Buffer池化（warmupCDN专用，减少GC压力）
+#   - 智能302直链识别（自动识别CDN直链，跳过解析直接缓存）
+#   - 智能签名TTL检测（解决播放30分钟403问题）
+#     自动检测URL签名参数（OSS/阿里云/腾讯云/七牛等），按签名有效期
+#     动态设置缓存TTL（取50%安全余量），确保缓存过期早于签名过期
+#   - 内网strm支持开关（面板可切换，默认打开）
+#     关闭后内网地址strm直接返回URL给播放器（适合bridge网络模式）
+#   - 预加载开关（面板可切换，默认打开）
+#     关闭后禁用所有预加载，仅按需解析（适合调试或资源受限场景）
+#   - 电影probe深度优化（30次重试+直接解析+8s等待，解决电影首播慢）
+#   - 详情页持续重试（飞牛probe期间每秒轮询，最多8次）
+#   - 同步预读STRM（PlaybackInfo响应时同步读取strm并缓存URL，直链立即就绪）
+#   - STRM解析模式开关（config.yaml: strm_resolve_mode）
+#     - auto（默认）：智能模式，自动识别CDN直链跳过解析，其他走HTTP解析
+#     - passthrough：透传模式，所有strm直接把内容给播放器，不解析/不预热/不预连接
+#                    适合全302 strm场景（用户用openlist/litepan等工具生成的strm）
+#     - always：始终解析模式，强制所有strm走HTTP解析
+#   - 多级缓存策略（LRU + TTL + singleFlight）
+#   - 支持夸克/115等网盘生成的strm文件
+#   - v3.2 新增：起播护航预热3s超时+5s去重，解决切集3003
+#   - v3.2 新增：URL校验与CDN预热并行执行，起播速度提升约900ms
+#   - v3.2 新增：全格式媒体检测（MP4/MKV/M2TS/ISO/MPG/FLV/AVI等）
+#   - v3.2 新增：日志显示剧集名称（从PlaybackInfo或STRM路径提取）
+#   - v3.2 新增：超时/网络错误不清缓存，避免死循环
+#   - v3.2 新增：下一集预取显示剧集名称和集数
+# ============================================================================
+
+services:
+  fnysfd:
+    # 使用v3.3.11镜像（电影预热修复版）
+    image: fnysfd:3.3.11
+
+    # 容器名称
+    container_name: fnysfd
+
+    # 自动重启策略
+    restart: unless-stopped
+
+    # 端口映射
+    ports:
+      - "28005:28005"
+      - "28006:28006"
+
+    # 卷挂载（关键配置！整个项目目录挂载到/data）
+    # 默认挂载常见NAS根目录，子路径添加后可立即生效，无需重启容器
+    volumes:
+      - .:/data
+      - /vol00:/vol00:ro
+      - /volume1:/volume1:ro
+      - /volume2:/volume2:ro
+
+    # 环境变量
+    environment:
+      - TZ=Asia/Shanghai
+      - CONTAINER_NAME=fnysfd
+
+    # 工作目录（必须在 /data 才能正确读写项目目录）
+    working_dir: /data
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:28006/api/system"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+    # 网络
+    networks:
+      - fnysfd-network
+
+networks:
+  fnysfd-network:
+    driver: bridge
