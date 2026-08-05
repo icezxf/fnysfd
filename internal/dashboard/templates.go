@@ -160,10 +160,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Ar
 /* 配置表单：分组标题左侧 3px 蓝色竖线 */
 .form-group-title{font-size:15px;font-weight:600;color:var(--text);margin-bottom:16px;border-left:3px solid var(--primary);padding-left:8px}
 .form-item{margin-bottom:16px}
-.form-item label{display:block;font-size:13px;color:#71717a;margin-bottom:6px}
-.form-item input,.form-item select{width:100%;height:32px;border:1px solid var(--border);border-radius:4px;padding:0 8px;font-size:14px;color:#18181b;background:#fff;font-family:inherit;transition:all .15s ease}
+.form-item>label{display:block;font-size:13px;color:#71717a;margin-bottom:6px}
+.form-item>label.switch{display:inline-flex;margin-bottom:0}
+.form-item input[type="text"],.form-item input[type="number"],.form-item input[type="password"],.form-item select{width:100%;height:32px;border:1px solid var(--border);border-radius:4px;padding:0 8px;font-size:14px;color:#18181b;background:#fff;font-family:inherit;transition:all .15s ease}
 /* 聚焦：蓝色边框 + 微妙外发光 */
-.form-item input:focus,.form-item select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
+.form-item input[type="text"]:focus,.form-item input[type="number"]:focus,.form-item input[type="password"]:focus,.form-item select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
 .form-item .hint{font-size:12px;color:#a1a1aa;margin-top:4px}
 .form-actions{display:flex;justify-content:flex-end;margin-top:16px}
 /* 保存按钮：圆角 6px */
