@@ -22,3 +22,18 @@ strm_resolve_mode: passthrough
 enable_lan_strm: true    # 内网strm地址支持（关闭后内网strm直接返回URL给播放器）
 enable_preload: true     # 预加载（关闭后每次播放都需等待解析）
 enable_smart_ttl: true   # 智能签名TTL检测（按URL签名有效期动态设置缓存，解决播放中403）
+enable_cdn_warmup: true  # CDN预热（解析URL后异步预热CDN边缘节点，首播更快）
+
+# ===== 媒体信息预取（v3.4.0 新增）=====
+# 海报墙预取：用户浏览海报墙时，拦截列表响应，批量预取电影的PlaybackInfo
+enable_poster_prefetch: false       # 默认关闭，开启后浏览海报墙自动预取
+poster_prefetch_concurrency: 4      # 海报墙预取并发数（建议2-8）
+poster_prefetch_max_items: 50       # 单次预取上限
+
+# 全库扫描预取：定时扫描整个媒体库，批量预取所有影片的PlaybackInfo
+enable_library_scan: false          # 默认关闭，开启后按定时任务扫描
+library_scan_cron: "03:00"          # 定时扫描时间 HH:MM（留空则不定时扫描）
+library_scan_on_start: false        # 启动后立即扫描（需认证信息就绪）
+library_scan_concurrency: 2         # 扫描并发数（建议1-4，过高可能卡死容器）
+library_scan_interval_ms: 500       # 每页查询间隔毫秒（建议300-1000ms）
+library_scan_episode_count: 5       # 每季预取前N集

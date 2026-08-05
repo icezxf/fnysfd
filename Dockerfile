@@ -1,4 +1,4 @@
-# v3.3.11 - 飞牛影视反代 (STRM专用优化 + 电影预热修复)
+# v3.4.0 - 飞牛影视反代 (STRM专用优化 + 媒体信息预取)
 # =================================================================
 
 # 阶段1: 编译Go程序
@@ -23,7 +23,7 @@ RUN go mod download
 # 支持多平台构建（amd64 + arm64），由 buildx 注入 TARGETARCH
 ARG TARGETARCH=amd64
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
-    -ldflags="-s -w -X main.version=3.3.11" \
+    -ldflags="-s -w -X main.version=3.4.0" \
     -o fnysfd-linux \
     ./cmd
 
@@ -31,8 +31,8 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
 FROM alpine:latest
 
 LABEL maintainer="FNYSFD"
-LABEL description="飞牛影视反代服务 + 管理面板 (STRM专用优化)"
-LABEL version="3.3.11"
+LABEL description="飞牛影视反代服务 + 管理面板 (STRM专用优化 + 媒体信息预取)"
+LABEL version="3.4.0"
 
 WORKDIR /app
 

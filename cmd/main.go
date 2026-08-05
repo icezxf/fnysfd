@@ -77,6 +77,7 @@ func main() {
 
 	dash := dashboard.New(config.Global, server.GetCache(), server.GetLogger(), version)
 	dash.SetStreamHandler(server.GetStreamHandler())
+	dash.SetLibraryScanner(server.GetLibraryScanner())
 
 	log.Printf("🚀 FNYSFD 启动")
 	log.Printf("   反代监听: %s", config.Global.GetListenAddr())

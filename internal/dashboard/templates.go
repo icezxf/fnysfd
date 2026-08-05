@@ -402,6 +402,64 @@ body.sidebar-open .sidebar-overlay{display:block}
 </div>
 </div>
 
+<div class="card">
+<div class="form-group-title">海报墙预取</div>
+<div class="form-item">
+<label class="switch"><input type="checkbox" id="cfgEnablePosterPrefetch"><span class="track"></span><span>启用海报墙预取</span></label>
+<div class="hint">用户浏览海报墙时，自动批量预取电影的 PlaybackInfo，进入详情页即可秒播</div>
+</div>
+<div class="form-item">
+<label>预取并发数</label>
+<input type="number" id="cfgPosterPrefetchConcurrency" min="1" max="20" placeholder="4">
+<div class="hint">同时预取的影片数量（建议 2-8，过高可能影响飞牛性能）</div>
+</div>
+<div class="form-item">
+<label>单次预取上限</label>
+<input type="number" id="cfgPosterPrefetchMaxItems" min="1" max="500" placeholder="50">
+<div class="hint">每次海报墙列表最多预取的影片数</div>
+</div>
+</div>
+
+<div class="card">
+<div class="form-group-title">全库扫描预取</div>
+<div class="form-item">
+<label class="switch"><input type="checkbox" id="cfgEnableLibraryScan"><span class="track"></span><span>启用全库扫描</span></label>
+<div class="hint">定时扫描整个媒体库，批量预取所有影片的 PlaybackInfo（首次播放无需等待）</div>
+</div>
+<div class="form-item">
+<label>定时扫描时间</label>
+<input type="text" id="cfgLibraryScanCron" placeholder="03:00" style="width:120px">
+<div class="hint">24小时制 HH:MM 格式，如 03:00 表示每天凌晨3点扫描（留空则不定时扫描）</div>
+</div>
+<div class="form-item">
+<label class="switch"><input type="checkbox" id="cfgLibraryScanOnStart"><span class="track"></span><span>启动后立即扫描</span></label>
+<div class="hint">服务启动后立即执行一次全库扫描（需要认证信息就绪，即用户已访问过飞牛）</div>
+</div>
+<div class="form-item">
+<label>扫描并发数</label>
+<input type="number" id="cfgLibraryScanConcurrency" min="1" max="20" placeholder="2">
+<div class="hint">同时预取的影片数量（建议 1-4，过高可能卡死容器）</div>
+</div>
+<div class="form-item">
+<label>每页间隔（毫秒）</label>
+<input type="number" id="cfgLibraryScanIntervalMs" min="0" max="60000" placeholder="500">
+<div class="hint">每页查询之间的等待时间，避免请求过密（建议 300-1000ms）</div>
+</div>
+<div class="form-item">
+<label>每季预取集数</label>
+<input type="number" id="cfgLibraryScanEpisodeCount" min="1" max="50" placeholder="5">
+<div class="hint">每部电视剧预取前 N 集（建议 3-10，避免预取过多占用资源）</div>
+</div>
+<div class="form-item">
+<label>手动扫描</label>
+<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+<button class="btn btn-primary" id="triggerScanBtn" onclick="triggerScan()">立即扫描</button>
+<span id="scanStatus" style="font-size:13px;color:#888">未扫描</span>
+</div>
+<div class="hint">手动触发一次全库扫描。扫描需要认证信息（用户已访问过飞牛网页端）</div>
+</div>
+</div>
+
 <div class="form-actions">
 <button class="btn btn-primary" id="saveConfigBtn">保存配置</button>
 </div>
@@ -635,6 +693,19 @@ $('cfgEnableLanStrm').checked = data.enable_lan_strm !== false;
 $('cfgEnablePreload').checked = data.enable_preload !== false;
 $('cfgEnableCDNWarmup').checked = data.enable_cdn_warmup !== false;
 $('cfgEnableSmartTTL').checked = data.enable_smart_ttl !== false;
+// 海报墙预取
+$('cfgEnablePosterPrefetch').checked = data.enable_poster_prefetch === true;
+$('cfgPosterPrefetchConcurrency').value = data.poster_prefetch_concurrency || 4;
+$('cfgPosterPrefetchMaxItems').value = data.poster_prefetch_max_items || 50;
+// 全库扫描
+$('cfgEnableLibraryScan').checked = data.enable_library_scan === true;
+$('cfgLibraryScanCron').value = data.library_scan_cron || '';
+$('cfgLibraryScanOnStart').checked = data.library_scan_on_start === true;
+$('cfgLibraryScanConcurrency').value = data.library_scan_concurrency || 2;
+$('cfgLibraryScanIntervalMs').value = data.library_scan_interval_ms != null ? data.library_scan_interval_ms : 500;
+$('cfgLibraryScanEpisodeCount').value = data.library_scan_episode_count || 5;
+// 扫描状态
+loadScanStatus();
 });
 }
 
@@ -658,7 +729,18 @@ max_cache_items:maxItemsVal,
 enable_lan_strm:$('cfgEnableLanStrm').checked,
 enable_preload:$('cfgEnablePreload').checked,
 enable_cdn_warmup:$('cfgEnableCDNWarmup').checked,
-enable_smart_ttl:$('cfgEnableSmartTTL').checked
+enable_smart_ttl:$('cfgEnableSmartTTL').checked,
+// 海报墙预取
+enable_poster_prefetch:$('cfgEnablePosterPrefetch').checked,
+poster_prefetch_concurrency:parseInt($('cfgPosterPrefetchConcurrency').value.trim(),10)||4,
+poster_prefetch_max_items:parseInt($('cfgPosterPrefetchMaxItems').value.trim(),10)||50,
+// 全库扫描
+enable_library_scan:$('cfgEnableLibraryScan').checked,
+library_scan_cron:$('cfgLibraryScanCron').value.trim(),
+library_scan_on_start:$('cfgLibraryScanOnStart').checked,
+library_scan_concurrency:parseInt($('cfgLibraryScanConcurrency').value.trim(),10)||2,
+library_scan_interval_ms:parseInt($('cfgLibraryScanIntervalMs').value.trim(),10)||500,
+library_scan_episode_count:parseInt($('cfgLibraryScanEpisodeCount').value.trim(),10)||5
 };
 // 仅当用户输入了非占位符的新密码时才提交
 if(pass&&pass!==''&&pass!=='****'){data.dashboard_pass=pass}
@@ -677,6 +759,71 @@ setTimeout(loadConfig,300);
 toast((r&&r.message)||'保存失败','error');
 }
 });
+}
+
+/* ===== 全库扫描 ===== */
+function triggerScan(){
+var btn=$('triggerScanBtn');
+btn.disabled=true;
+btn.textContent='扫描中...';
+ajax('/api/scan/trigger','POST',null,function(err,r){
+if(err){toast('扫描触发失败: '+err,'error');btn.disabled=false;btn.textContent='立即扫描';return}
+if(r&&r.code===200){
+toast(r.message||'扫描已启动','success');
+// 开始轮询状态
+pollScanStatus();
+}else{
+toast((r&&r.message)||'扫描触发失败','error');
+btn.disabled=false;
+btn.textContent='立即扫描';
+}
+});
+}
+
+var scanStatusTimer=null;
+function loadScanStatus(){
+ajax('/api/scan/status','GET',null,function(err,d){
+if(err||!d||d.code!==200||!d.data){updateScanStatusUI(null);return}
+updateScanStatusUI(d.data);
+// 轮询模式：扫描完成后停止
+if(scanStatusTimer&&!d.data.running){
+clearInterval(scanStatusTimer);scanStatusTimer=null;
+var btn=$('triggerScanBtn');
+if(btn){btn.disabled=false;btn.textContent='立即扫描'}
+}
+});
+}
+
+function pollScanStatus(){
+if(scanStatusTimer){clearInterval(scanStatusTimer)}
+loadScanStatus();
+scanStatusTimer=setInterval(loadScanStatus,3000);
+}
+
+function updateScanStatusUI(data){
+var el=$('scanStatus');
+var btn=$('triggerScanBtn');
+if(!el)return;
+if(!data){
+el.textContent='未扫描';
+if(btn){btn.disabled=false;btn.textContent='立即扫描'}
+return;
+}
+if(data.running){
+el.textContent='扫描中...';
+el.style.color='#2196f3';
+if(btn){btn.disabled=true;btn.textContent='扫描中...'}
+}else{
+var stats=data.lastScanStats||{};
+var time=data.lastScanTime||'';
+if(time){
+el.textContent='上次扫描: '+time+' | 成功 '+stats.success+' 跳过 '+stats.skipped+' 失败 '+stats.failed;
+}else{
+el.textContent='未扫描';
+}
+el.style.color='#888';
+if(btn){btn.disabled=false;btn.textContent='立即扫描'}
+}
 }
 
 /* ===== 路径管理 ===== */

@@ -45,6 +45,11 @@ type Server struct {
 	prefetchRecent  map[string]int64 // 详情页预请求去重（itemID -> unix时间戳）
 	prefetchMu      sync.Mutex       // 保护 prefetchRecent
 	version         string           // 版本号（由 main 包注入）
+	// 批量预取相关组件
+	authStore       *AuthStore          // 认证信息缓存（从用户请求中提取，供后台扫描复用）
+	batchPrefetcher *BatchPrefetcher    // 批量预取引擎（海报墙 + 全库扫描共用）
+	posterPrefetch  *PosterPrefetcher   // 海报墙预取器
+	libraryScanner  *LibraryScanner     // 全库扫描器
 }
 
 // NewServer 创建代理服务器
@@ -130,6 +135,19 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 	// 流请求先到但 MediaSource 尚未缓存时，同步轮询 PlaybackInfo，避免原始流请求直转导致3003。
 	sh.SetMediaSourceMissHandler(s.prefetchForMediaSourceMiss)
 
+	// 初始化批量预取组件
+	// 使用海报墙和全库扫描并发数的最大值作为初始并发，避免运行时频繁调整
+	initialConcurrency := cfg.GetPosterPrefetchConcurrency()
+	if scanConc := cfg.GetLibraryScanConcurrency(); scanConc > initialConcurrency {
+		initialConcurrency = scanConc
+	}
+	s.authStore = NewAuthStore()
+	s.batchPrefetcher = NewBatchPrefetcher(s, initialConcurrency)
+	s.posterPrefetch = NewPosterPrefetcher(s, s.batchPrefetcher, s.authStore)
+	s.libraryScanner = NewLibraryScanner(s, s.batchPrefetcher, s.authStore)
+	s.logger.Info("📦 [批量预取] 引擎已初始化: 并发=%d (海报墙=%d, 全库扫描=%d)",
+		initialConcurrency, cfg.GetPosterPrefetchConcurrency(), cfg.GetLibraryScanConcurrency())
+
 	return s, nil
 }
 
@@ -165,6 +183,11 @@ func (s *Server) Start() error {
 	s.logger.Info("⏭️ [下一集预取] 当前运行版本包含：详情页成功显式触发 + STRM缓存回调触发")
 	s.logger.Info("📊 性能监控: http://localhost%s/stats", s.config.GetListenAddr())
 
+	// 启动全库扫描器（如果已启用）
+	if s.libraryScanner != nil {
+		s.libraryScanner.Start()
+	}
+
 	return s.httpServer.ListenAndServe()
 }
 
@@ -175,6 +198,11 @@ func (s *Server) setupProxy(targetURL *url.URL) {
 		originalDirector(req)
 		// 仅设置Host头（不含scheme），避免将完整URL写入Host
 		req.Host = targetURL.Host
+
+		// 捕获认证信息（所有请求都捕获，轻量操作，供后台全库扫描复用）
+		if s.authStore != nil {
+			s.authStore.CaptureFromRequest(req)
+		}
 
 		// 进入详情页就主动预请求 PlaybackInfo
 		// 进入详情页（GET /Items/{id}）时立即构造 PlaybackInfo 请求并行发送
@@ -230,6 +258,14 @@ func (s *Server) Stop() error {
 	s.stopOnce.Do(func() {
 		s.logger.Info("🛑 正在关闭服务...")
 
+		// 0. 先停止后台扫描和批量预取（避免关闭后还在产生请求）
+		if s.libraryScanner != nil {
+			s.libraryScanner.Stop()
+		}
+		if s.batchPrefetcher != nil {
+			s.batchPrefetcher.Stop()
+		}
+
 		// 1. 先停止预加载引擎，避免产生新日志
 		if s.streamHandler != nil {
 			s.streamHandler.Stop()
@@ -269,6 +305,11 @@ func (s *Server) GetStreamHandler() *handler.StreamHandler {
 	return s.streamHandler
 }
 
+// GetLibraryScanner 获取全库扫描器
+func (s *Server) GetLibraryScanner() *LibraryScanner {
+	return s.libraryScanner
+}
+
 // Reload 重新加载配置（完整热更新）
 func (s *Server) Reload() {
 	newTarget := s.config.GetTargetAddr()
@@ -295,6 +336,11 @@ func (s *Server) Reload() {
 		newProxy.Director = func(req *http.Request) {
 			originalDirector(req)
 			req.Host = targetURL.Host
+
+			// 捕获认证信息
+			if s.authStore != nil {
+				s.authStore.CaptureFromRequest(req)
+			}
 
 			// Reload 后的新 proxy 也要拦截详情页请求和 PlaybackInfo 请求
 			if itemID, userID, ok := s.isItemDetailRequest(req); ok {
@@ -326,6 +372,28 @@ func (s *Server) Reload() {
 
 // handleResponse 处理响应
 func (s *Server) handleResponse(resp *http.Response) error {
+	// 海报墙列表响应拦截：提取 ItemID 批量预取 Movie PlaybackInfo
+	// 在 PlaybackInfo 检查之前执行，因为列表请求不是 PlaybackInfo 请求
+	if s.posterPrefetch != nil && resp.StatusCode == http.StatusOK {
+		if userID, ok := s.posterPrefetch.IsItemListRequest(resp.Request); ok {
+			// 列表响应可能较大（几MB），限制读取 5MB
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+			if err != nil {
+				s.logger.Warn("🖼️ [海报墙预取] 读取响应体失败: %v", err)
+				return err
+			}
+			resp.Body.Close()
+			// 放回 body 供客户端接收
+			resp.Body = io.NopCloser(bytes.NewBuffer(body))
+			resp.ContentLength = int64(len(body))
+			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+			resp.Header.Del("Transfer-Encoding")
+			// 异步预取，不阻塞响应返回
+			go s.posterPrefetch.HandleListResponse(resp, body, userID)
+			return nil
+		}
+	}
+
 	if !s.isPlaybackInfoRequest(resp.Request) {
 		return nil
 	}

@@ -27,17 +27,25 @@ import (
 
 // Dashboard 管理面板
 type Dashboard struct {
-	config        *config.Config
-	cache         *cache.Cache
-	logger        *logger.Logger
-	streamHandler *handler.StreamHandler
-	startTime     time.Time
-	sessions      map[string]session
-	sessionMutex  sync.RWMutex
-	server        *http.Server
-	version       string // 由 main 包注入的版本号
-	stopChan      chan struct{}
-	stopOnce      sync.Once
+	config         *config.Config
+	cache          *cache.Cache
+	logger         *logger.Logger
+	streamHandler  *handler.StreamHandler
+	libraryScanner LibraryScannerInterface // 全库扫描器接口（可选）
+	startTime      time.Time
+	sessions       map[string]session
+	sessionMutex   sync.RWMutex
+	server         *http.Server
+	version        string // 由 main 包注入的版本号
+	stopChan       chan struct{}
+	stopOnce       sync.Once
+}
+
+// LibraryScannerInterface 全库扫描器接口（解耦 dashboard 对 proxy 包的依赖）
+type LibraryScannerInterface interface {
+	TriggerScan() error
+	IsRunning() bool
+	GetStatus() map[string]interface{}
 }
 
 type session struct {
@@ -97,6 +105,11 @@ func (d *Dashboard) SetStreamHandler(sh *handler.StreamHandler) {
 	d.streamHandler = sh
 }
 
+// SetLibraryScanner 设置全库扫描器引用
+func (d *Dashboard) SetLibraryScanner(ls LibraryScannerInterface) {
+	d.libraryScanner = ls
+}
+
 // Start 启动面板服务（独立端口）
 func (d *Dashboard) Start() error {
 	mux := http.NewServeMux()
@@ -116,6 +129,8 @@ func (d *Dashboard) Start() error {
 	mux.HandleFunc("/api/strm_paths/volumes", d.authMiddleware(d.handleStrmPathsVolumes))
 	mux.HandleFunc("/api/docker/restart", d.authMiddleware(d.csrfMiddleware(d.handleDockerRestart)))
 	mux.HandleFunc("/api/logs", d.authMiddleware(d.handleLogs))
+	mux.HandleFunc("/api/scan/trigger", d.authMiddleware(d.csrfMiddleware(d.handleScanTrigger)))
+	mux.HandleFunc("/api/scan/status", d.authMiddleware(d.handleScanStatus))
 
 	mux.HandleFunc("/", d.authMiddleware(d.handleIndex))
 
@@ -934,4 +949,47 @@ func (d *Dashboard) handleDockerRestart(w http.ResponseWriter, r *http.Request) 
 		Code:    200,
 		Message: "容器重启命令已发送，请等待约 5-10 秒后刷新页面",
 	})
+}
+
+// handleScanTrigger 手动触发全库扫描
+func (d *Dashboard) handleScanTrigger(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
+		return
+	}
+
+	if d.libraryScanner == nil {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 500, Message: "全库扫描器未初始化"})
+		return
+	}
+
+	if err := d.libraryScanner.TriggerScan(); err != nil {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 409, Message: err.Error()})
+		return
+	}
+
+	d.logger.Info("📚 面板触发全库扫描")
+	d.writeJSON(w, http.StatusOK, APIResponse{
+		Code:    200,
+		Message: "全库扫描已启动，请稍后查看状态",
+	})
+}
+
+// handleScanStatus 获取全库扫描状态
+func (d *Dashboard) handleScanStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
+		return
+	}
+
+	if d.libraryScanner == nil {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: map[string]interface{}{
+			"running":       false,
+			"lastScanTime":  "",
+			"lastScanStats": map[string]interface{}{},
+		}})
+		return
+	}
+
+	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: d.libraryScanner.GetStatus()})
 }
