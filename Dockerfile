@@ -1,8 +1,9 @@
 # v3.4.0 - 飞牛影视反代 (STRM专用优化 + 媒体信息预取)
+# 仅支持 ARM64 架构
 # =================================================================
 
 # 阶段1: 编译Go程序
-FROM golang:1.21-alpine AS builder
+FROM --platform=linux/arm64 golang:1.21-alpine AS builder
 
 WORKDIR /app
 
@@ -20,19 +21,21 @@ COPY . .
 RUN go mod download
 
 # 编译参数：静态链接、去除调试信息、优化大小
-# 支持多平台构建（amd64 + arm64），由 buildx 注入 TARGETARCH
-ARG TARGETARCH=amd64
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
+# 固定为 ARM64 架构
+ENV GOARCH=arm64
+ENV GOOS=linux
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build \
     -ldflags="-s -w -X main.version=3.4.0" \
     -o fnysfd-linux \
     ./cmd
 
-# 阶段2: 运行时镜像（轻量级Alpine）
-FROM alpine:latest
+# 阶段2: 运行时镜像（轻量级Alpine ARM64）
+FROM --platform=linux/arm64 alpine:latest
 
 LABEL maintainer="FNYSFD"
-LABEL description="飞牛影视反代服务 + 管理面板 (STRM专用优化 + 媒体信息预取)"
+LABEL description="飞牛影视反代服务 + 管理面板 (STRM专用优化 + 媒体信息预取) - ARM64"
 LABEL version="3.4.0"
+LABEL architecture="arm64"
 
 WORKDIR /app
 
