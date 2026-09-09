@@ -381,23 +381,17 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 	}
 
 	// ✅ 关键修改：飞牛 Emby API 要求 X-Emby-Authorization 头
-	// 直接从 authHeaders 读取，避免类型误判
 	if authHeaders != nil {
-		// 复制所有认证头
 		req.Header = authHeaders.Clone()
 		
-		// 如果存在 Authorization 头，将其值也设置到 X-Emby-Authorization
 		if auth := authHeaders.Get("Authorization"); auth != "" {
 			req.Header.Set("X-Emby-Authorization", auth)
 		}
-		// 如果存在 X-Emby-Token，也一并设置
 		if token := authHeaders.Get("X-Emby-Token"); token != "" {
 			req.Header.Set("X-Emby-Authorization", "Bearer "+token)
 		}
 	}
 
-	// 强制要求 X-Emby-Authorization 头
-	// 如果 authHeaders 为空或没有认证信息，尝试从 AuthStore 获取
 	if req.Header.Get("X-Emby-Authorization") == "" {
 		_, headers, _ := ls.authStore.Get()
 		if headers != nil {
