@@ -11,7 +11,7 @@ on:
       tag:
         description: '镜像标签'
         required: true
-        default: 'dev'
+        default: 'cc'
         type: string
 
 env:
