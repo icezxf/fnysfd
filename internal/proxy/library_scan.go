@@ -47,33 +47,31 @@ type fnosPlayItem struct {
 	Type string `json:"type"` // Movie / Series
 }
 
-// fnosSeasonListResponse FNOS 季列表接口响应（待抓包确认结构）
+// fnosSeasonListResponse FNOS 季列表接口响应（待完善）
 type fnosSeasonListResponse struct {
 	Msg  string           `json:"msg"`
 	Code int              `json:"code"`
 	Data []fnosSeasonItem `json:"data"`
 }
 
-// fnosSeasonItem FNOS 季项
 type fnosSeasonItem struct {
-	ID   string `json:"id"`   // 季 ID
-	Name string `json:"name"` // 季名称（如 "第1季"）
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
-// fnosEpisodeListResponse FNOS 集列表接口响应（待抓包确认结构）
+// fnosEpisodeListResponse FNOS 集列表接口响应（待完善）
 type fnosEpisodeListResponse struct {
 	Msg  string            `json:"msg"`
 	Code int               `json:"code"`
 	Data []fnosEpisodeItem `json:"data"`
 }
 
-// fnosEpisodeItem FNOS 集项
 type fnosEpisodeItem struct {
-	ID   string `json:"id"`   // 集 ID
-	Name string `json:"name"` // 集名称（如 "第1集"）
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
-// ========== 原有结构体（保留用于兼容） ==========
+// ========== 内部使用的基础类型 ==========
 
 // libraryInfo 媒体库信息
 type libraryInfo struct {
@@ -99,22 +97,6 @@ type jsonItem struct {
 	Type string `json:"Type"`
 }
 
-// PrefetchItem 预取项
-type PrefetchItem struct {
-	ItemID string
-	UserID string
-	Name   string
-	Type   string
-}
-
-// BatchStats 批量统计
-type BatchStats struct {
-	Total   int
-	Success int
-	Skipped int
-	Failed  int
-}
-
 // 常量
 const maxScanItems = 10000
 const batchFlushSize = 50
@@ -122,14 +104,14 @@ const memSafetyThresholdMB = 400
 
 // LibraryScanner 全库扫描预取器
 type LibraryScanner struct {
-	server       *Server
-	batch        *BatchPrefetcher
-	logger       *logger.Logger
-	authStore    *AuthStore
-	stopCh       chan struct{}
-	stopOnce     sync.Once
-	running      atomic.Bool
-	lastScanTime time.Time
+	server        *Server
+	batch         *BatchPrefetcher
+	logger        *logger.Logger
+	authStore     *AuthStore
+	stopCh        chan struct{}
+	stopOnce      sync.Once
+	running       atomic.Bool
+	lastScanTime  time.Time
 	lastScanStats BatchStats
 }
 
@@ -150,7 +132,6 @@ func (ls *LibraryScanner) Start() {
 		ls.logger.Info("📚 [全库扫描] 功能未开启，跳过启动")
 		return
 	}
-
 	cron := config.Global.GetLibraryScanCron()
 	if cron != "" {
 		go ls.cronScheduler(cron)
@@ -158,7 +139,6 @@ func (ls *LibraryScanner) Start() {
 	} else {
 		ls.logger.Info("📚 [全库扫描] 未配置定时任务 (library_scan_cron 为空)")
 	}
-
 	if config.Global.GetLibraryScanOnStart() {
 		go func() {
 			ls.logger.Info("📚 [全库扫描] 启动后立即扫描")
@@ -443,10 +423,8 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 	return ls.server.retryClient.Do(req)
 }
 
-// ==================== 核心修改：queryViews ====================
-// queryViews 查询所有媒体库（适配 FNOS API）
+// ==================== queryViews（已适配 FNOS） ====================
 func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHeaders http.Header) ([]libraryInfo, error) {
-	// ✅ 修改点1：路径改为 FNOS 原生 API
 	path := "/v/api/v1/mediadb/list"
 
 	resp, err := ls.doRequest(ctx, authHeaders, path)
@@ -464,18 +442,15 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 		return nil, fmt.Errorf("读取响应体失败: %w", err)
 	}
 
-	// ✅ 修改点2：使用 FNOS 结构体解析
 	var fnosResp fnosLibraryListResponse
 	if err := json.Unmarshal(body, &fnosResp); err != nil {
 		return nil, fmt.Errorf("JSON解析失败: %w", err)
 	}
 
-	// ✅ 修改点3：FNOS 的 code=0 表示成功
 	if fnosResp.Code != 0 {
 		return nil, fmt.Errorf("FNOS API 返回错误: code=%d, msg=%s", fnosResp.Code, fnosResp.Msg)
 	}
 
-	// ✅ 修改点4：字段映射 guid -> ID, title -> Name
 	libraries := make([]libraryInfo, 0, len(fnosResp.Data))
 	for _, item := range fnosResp.Data {
 		if item.GUID == "" {
@@ -486,16 +461,13 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 			Name: item.Title,
 		})
 	}
-
 	return libraries, nil
 }
 
-// ==================== 核心修改：queryItems ====================
-// queryItems 分页查询指定媒体库的项目（适配 FNOS API）
+// ==================== queryItems（已适配 FNOS） ====================
 func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHeaders http.Header, parentID string, startIndex, limit int) ([]PrefetchItem, int, error) {
-	// ✅ 修改点1：路径改为 FNOS 原生 API
 	query := url.Values{}
-	query.Set("libraryId", parentID)   // 参数名待确认
+	query.Set("libraryId", parentID)
 	query.Set("start", strconv.Itoa(startIndex))
 	query.Set("limit", strconv.Itoa(limit))
 	path := "/v/api/v1/play/list?" + query.Encode()
@@ -515,7 +487,6 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 		return nil, 0, fmt.Errorf("读取响应体失败: %w", err)
 	}
 
-	// ✅ 修改点2：使用 FNOS 结构体解析
 	var fnosResp fnosPlayListResponse
 	if err := json.Unmarshal(body, &fnosResp); err != nil {
 		return nil, 0, fmt.Errorf("JSON解析失败: %w", err)
@@ -525,7 +496,6 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 		return nil, 0, fmt.Errorf("FNOS API 返回错误: code=%d, msg=%s", fnosResp.Code, fnosResp.Msg)
 	}
 
-	// ✅ 修改点3：转换为 PrefetchItem
 	var result []PrefetchItem
 	totalCount := len(fnosResp.Data)
 
@@ -540,15 +510,12 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 			Type:   item.Type,
 		})
 	}
-
 	return result, totalCount, nil
 }
 
-// ==================== 待修改：querySeasons ====================
-// querySeasons 查询季列表（需要抓包确认 FNOS API）
+// ==================== querySeasons（待完善） ====================
 func (ls *LibraryScanner) querySeasons(ctx context.Context, userID string, authHeaders http.Header, seriesID string) ([]seasonInfo, error) {
-	// ⚠️ 待修改：需要抓包确认 FNOS 获取季列表的 API 路径和参数
-	// 当前保留 Emby 风格路径，如果你的 FNOS 不支持，需要替换
+	// ⚠️ 待修改：需要抓包确认 FNOS 获取季列表的 API
 	path := "/emby/Shows/" + seriesID + "/Seasons"
 
 	resp, err := ls.doRequest(ctx, authHeaders, path)
@@ -584,11 +551,9 @@ func (ls *LibraryScanner) querySeasons(ctx context.Context, userID string, authH
 	return seasons, nil
 }
 
-// ==================== 待修改：queryEpisodes ====================
-// queryEpisodes 查询集列表（需要抓包确认 FNOS API）
+// ==================== queryEpisodes（待完善） ====================
 func (ls *LibraryScanner) queryEpisodes(ctx context.Context, userID string, authHeaders http.Header, seriesID, seasonID string) ([]PrefetchItem, error) {
-	// ⚠️ 待修改：需要抓包确认 FNOS 获取集列表的 API 路径和参数
-	// 当前保留 Emby 风格路径，如果你的 FNOS 不支持，需要替换
+	// ⚠️ 待修改：需要抓包确认 FNOS 获取集列表的 API
 	query := url.Values{}
 	query.Set("ParentId", seasonID)
 	query.Set("fields", "ShareLevel,MediaSources")
