@@ -17,58 +17,20 @@ import (
 	"time"
 )
 
-// ========== FNOS API 专用结构体定义 ==========
+// ========== FNOS Emby API 兼容结构体 ==========
 
-// fnosLibraryListResponse FNOS /v/api/v1/mediadb/list 接口响应
-type fnosLibraryListResponse struct {
-	Msg  string            `json:"msg"`
-	Code int               `json:"code"` // 0 表示成功
-	Data []fnosLibraryItem `json:"data"`
+// fnosEmbyResponse FNOS 对 Emby API 的响应包装
+// 飞牛的 Emby 兼容接口返回格式可能与原生 Emby 不同，使用此结构体统一处理
+type fnosEmbyResponse struct {
+	Items            []fnosEmbyItem `json:"Items"`
+	TotalRecordCount int            `json:"TotalRecordCount"`
 }
 
-// fnosLibraryItem FNOS 媒体库项
-type fnosLibraryItem struct {
-	GUID     string `json:"guid"`     // 媒体库 ID
-	Title    string `json:"title"`    // 媒体库名称
-	Category string `json:"category"` // Movie / Series
-}
-
-// fnosPlayListResponse FNOS /v/api/v1/play/list 接口响应
-type fnosPlayListResponse struct {
-	Msg  string         `json:"msg"`
-	Code int            `json:"code"` // 0 表示成功
-	Data []fnosPlayItem `json:"data"`
-}
-
-// fnosPlayItem FNOS 影片项
-type fnosPlayItem struct {
-	ID   string `json:"id"`   // 影片 ID
-	Name string `json:"name"` // 影片名称
-	Type string `json:"type"` // Movie / Series
-}
-
-// fnosSeasonListResponse FNOS 季列表接口响应（待完善）
-type fnosSeasonListResponse struct {
-	Msg  string           `json:"msg"`
-	Code int              `json:"code"`
-	Data []fnosSeasonItem `json:"data"`
-}
-
-type fnosSeasonItem struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
-
-// fnosEpisodeListResponse FNOS 集列表接口响应（待完善）
-type fnosEpisodeListResponse struct {
-	Msg  string            `json:"msg"`
-	Code int               `json:"code"`
-	Data []fnosEpisodeItem `json:"data"`
-}
-
-type fnosEpisodeItem struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+// fnosEmbyItem FNOS Emby API 返回的媒体项
+type fnosEmbyItem struct {
+	Id   string `json:"Id"`
+	Name string `json:"Name"`
+	Type string `json:"Type"`
 }
 
 // ========== 内部使用的基础类型 ==========
@@ -85,7 +47,7 @@ type seasonInfo struct {
 	Name string
 }
 
-// jsonListResponse 保留 Emby 风格响应（备用）
+// jsonListResponse 保留原生 Emby 风格响应（备用）
 type jsonListResponse struct {
 	Items            []jsonItem `json:"Items"`
 	TotalRecordCount int        `json:"TotalRecordCount"`
@@ -403,7 +365,7 @@ func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 	}
 }
 
-// doRequest 发送 HTTP 请求
+// doRequest 发送 HTTP 请求（复用现有的 HTTP 客户端）
 func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header, path string) (*http.Response, error) {
 	ls.server.proxyMu.RLock()
 	targetURL := ls.server.targetURL
@@ -423,9 +385,14 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 	return ls.server.retryClient.Do(req)
 }
 
-// ==================== queryViews（已适配 FNOS） ====================
+// ============================================================
+// 核心修改：使用 Emby 兼容 API（不需要签名）
+// ============================================================
+
+// queryViews 查询所有媒体库（使用 Emby 兼容 API）
 func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHeaders http.Header) ([]libraryInfo, error) {
-	path := "/v/api/v1/mediadb/list"
+	// ✅ 使用 Emby 兼容 API，不需要签名
+	path := "/emby/Users/" + userID + "/Views"
 
 	resp, err := ls.doRequest(ctx, authHeaders, path)
 	if err != nil {
@@ -434,7 +401,8 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("查询媒体库失败: status=%d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("查询媒体库失败: status=%d, body=%s", resp.StatusCode, string(body))
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
@@ -442,35 +410,35 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 		return nil, fmt.Errorf("读取响应体失败: %w", err)
 	}
 
-	var fnosResp fnosLibraryListResponse
+	// ✅ 尝试解析为 FNOS Emby 响应格式
+	var fnosResp fnosEmbyResponse
 	if err := json.Unmarshal(body, &fnosResp); err != nil {
-		return nil, fmt.Errorf("JSON解析失败: %w", err)
+		return nil, fmt.Errorf("JSON解析失败: %w, body=%s", err, string(body))
 	}
 
-	if fnosResp.Code != 0 {
-		return nil, fmt.Errorf("FNOS API 返回错误: code=%d, msg=%s", fnosResp.Code, fnosResp.Msg)
-	}
-
-	libraries := make([]libraryInfo, 0, len(fnosResp.Data))
-	for _, item := range fnosResp.Data {
-		if item.GUID == "" {
+	libraries := make([]libraryInfo, 0, len(fnosResp.Items))
+	for _, item := range fnosResp.Items {
+		if item.Id == "" {
 			continue
 		}
 		libraries = append(libraries, libraryInfo{
-			ID:   item.GUID,
-			Name: item.Title,
+			ID:   item.Id,
+			Name: item.Name,
 		})
 	}
 	return libraries, nil
 }
 
-// ==================== queryItems（已适配 FNOS） ====================
+// queryItems 分页查询指定媒体库的项目（使用 Emby 兼容 API）
 func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHeaders http.Header, parentID string, startIndex, limit int) ([]PrefetchItem, int, error) {
+	// ✅ 使用 Emby 兼容 API，不需要签名
 	query := url.Values{}
-	query.Set("libraryId", parentID)
-	query.Set("start", strconv.Itoa(startIndex))
-	query.Set("limit", strconv.Itoa(limit))
-	path := "/v/api/v1/play/list?" + query.Encode()
+	query.Set("ParentId", parentID)
+	query.Set("Recursive", "true")
+	query.Set("IncludeItemTypes", "Movie,Series")
+	query.Set("StartIndex", strconv.Itoa(startIndex))
+	query.Set("Limit", strconv.Itoa(limit))
+	path := "/emby/Users/" + userID + "/Items?" + query.Encode()
 
 	resp, err := ls.doRequest(ctx, authHeaders, path)
 	if err != nil {
@@ -479,7 +447,8 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, 0, fmt.Errorf("查询项目失败: status=%d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		return nil, 0, fmt.Errorf("查询项目失败: status=%d, body=%s", resp.StatusCode, string(body))
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
@@ -487,24 +456,21 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 		return nil, 0, fmt.Errorf("读取响应体失败: %w", err)
 	}
 
-	var fnosResp fnosPlayListResponse
+	// ✅ 尝试解析为 FNOS Emby 响应格式
+	var fnosResp fnosEmbyResponse
 	if err := json.Unmarshal(body, &fnosResp); err != nil {
-		return nil, 0, fmt.Errorf("JSON解析失败: %w", err)
-	}
-
-	if fnosResp.Code != 0 {
-		return nil, 0, fmt.Errorf("FNOS API 返回错误: code=%d, msg=%s", fnosResp.Code, fnosResp.Msg)
+		return nil, 0, fmt.Errorf("JSON解析失败: %w, body=%s", err, string(body))
 	}
 
 	var result []PrefetchItem
-	totalCount := len(fnosResp.Data)
+	totalCount := fnosResp.TotalRecordCount
 
-	for _, item := range fnosResp.Data {
-		if item.ID == "" {
+	for _, item := range fnosResp.Items {
+		if item.Id == "" {
 			continue
 		}
 		result = append(result, PrefetchItem{
-			ItemID: item.ID,
+			ItemID: item.Id,
 			UserID: userID,
 			Name:   item.Name,
 			Type:   item.Type,
@@ -513,9 +479,12 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 	return result, totalCount, nil
 }
 
-// ==================== querySeasons（待完善） ====================
+// ============================================================
+// querySeasons / queryEpisodes（暂保留 Emby 兼容模式）
+// ============================================================
+
+// querySeasons 查询季列表
 func (ls *LibraryScanner) querySeasons(ctx context.Context, userID string, authHeaders http.Header, seriesID string) ([]seasonInfo, error) {
-	// ⚠️ 待修改：需要抓包确认 FNOS 获取季列表的 API
 	path := "/emby/Shows/" + seriesID + "/Seasons"
 
 	resp, err := ls.doRequest(ctx, authHeaders, path)
@@ -551,9 +520,8 @@ func (ls *LibraryScanner) querySeasons(ctx context.Context, userID string, authH
 	return seasons, nil
 }
 
-// ==================== queryEpisodes（待完善） ====================
+// queryEpisodes 查询集列表
 func (ls *LibraryScanner) queryEpisodes(ctx context.Context, userID string, authHeaders http.Header, seriesID, seasonID string) ([]PrefetchItem, error) {
-	// ⚠️ 待修改：需要抓包确认 FNOS 获取集列表的 API
 	query := url.Values{}
 	query.Set("ParentId", seasonID)
 	query.Set("fields", "ShareLevel,MediaSources")
