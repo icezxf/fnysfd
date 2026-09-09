@@ -366,7 +366,7 @@ func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 
 // doRequest 发送 HTTP 请求（添加 X-Emby-Authorization 认证头）
 // 修复点：确保 authHeaders 类型为 http.Header
-func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header, path string) (*http.Response, error) {
+func (ls *LibraryScanner) doRequest(ctx context.Context, headers http.Header, path string) (*http.Response, error) {
 	ls.server.proxyMu.RLock()
 	targetURL := ls.server.targetURL
 	ls.server.proxyMu.RUnlock()
