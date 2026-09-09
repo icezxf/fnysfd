@@ -20,7 +20,6 @@ import (
 // ========== FNOS Emby API 兼容结构体 ==========
 
 // fnosEmbyResponse FNOS 对 Emby API 的响应包装
-// 飞牛的 Emby 兼容接口返回格式可能与原生 Emby 不同，使用此结构体统一处理
 type fnosEmbyResponse struct {
 	Items            []fnosEmbyItem `json:"Items"`
 	TotalRecordCount int            `json:"TotalRecordCount"`
@@ -365,7 +364,11 @@ func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 	}
 }
 
-// doRequest 发送 HTTP 请求（复用现有的 HTTP 客户端）
+// ============================================================
+// ✅ 核心修改：doRequest 添加 X-Emby-Authorization 头
+// ============================================================
+
+// doRequest 发送 HTTP 请求（添加 X-Emby-Authorization 认证头）
 func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header, path string) (*http.Response, error) {
 	ls.server.proxyMu.RLock()
 	targetURL := ls.server.targetURL
@@ -376,22 +379,49 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 	if err != nil {
 		return nil, err
 	}
+
+	// ✅ 关键修改：飞牛 Emby API 要求 X-Emby-Authorization 头
 	if authHeaders != nil {
+		// 复制所有认证头
 		req.Header = authHeaders.Clone()
+		
+		// 如果存在 Authorization 头，将其值也设置到 X-Emby-Authorization
+		if auth := authHeaders.Get("Authorization"); auth != "" {
+			req.Header.Set("X-Emby-Authorization", auth)
+		}
+		// 如果存在 X-Emby-Token，也一并设置
+		if token := authHeaders.Get("X-Emby-Token"); token != "" {
+			req.Header.Set("X-Emby-Authorization", "Bearer "+token)
+		}
 	}
+
+	// 强制要求 X-Emby-Authorization 头
+	// 如果 authHeaders 为空或没有认证信息，尝试从 AuthStore 获取
+	if req.Header.Get("X-Emby-Authorization") == "" {
+		_, headers, _ := ls.authStore.Get()
+		if headers != nil {
+			if auth := headers.Get("Authorization"); auth != "" {
+				req.Header.Set("X-Emby-Authorization", auth)
+			} else if token := headers.Get("X-Emby-Token"); token != "" {
+				req.Header.Set("X-Emby-Authorization", "Bearer "+token)
+			}
+		}
+	}
+
 	req.Header.Del("Accept-Encoding")
 	req.Header.Set("Accept", "application/json")
 	req.Host = targetURL.Host
+	
+	ls.logger.Debug("📤 [Emby请求] %s %s, X-Emby-Authorization=%s", req.Method, path, req.Header.Get("X-Emby-Authorization"))
 	return ls.server.retryClient.Do(req)
 }
 
 // ============================================================
-// 核心修改：使用 Emby 兼容 API（不需要签名）
+// queryViews 和 queryItems（使用 Emby 兼容 API）
 // ============================================================
 
-// queryViews 查询所有媒体库（使用 Emby 兼容 API）
+// queryViews 查询所有媒体库
 func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHeaders http.Header) ([]libraryInfo, error) {
-	// ✅ 使用 Emby 兼容 API，不需要签名
 	path := "/emby/Users/" + userID + "/Views"
 
 	resp, err := ls.doRequest(ctx, authHeaders, path)
@@ -410,7 +440,6 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 		return nil, fmt.Errorf("读取响应体失败: %w", err)
 	}
 
-	// ✅ 尝试解析为 FNOS Emby 响应格式
 	var fnosResp fnosEmbyResponse
 	if err := json.Unmarshal(body, &fnosResp); err != nil {
 		return nil, fmt.Errorf("JSON解析失败: %w, body=%s", err, string(body))
@@ -429,9 +458,8 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 	return libraries, nil
 }
 
-// queryItems 分页查询指定媒体库的项目（使用 Emby 兼容 API）
+// queryItems 分页查询指定媒体库的项目
 func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHeaders http.Header, parentID string, startIndex, limit int) ([]PrefetchItem, int, error) {
-	// ✅ 使用 Emby 兼容 API，不需要签名
 	query := url.Values{}
 	query.Set("ParentId", parentID)
 	query.Set("Recursive", "true")
@@ -456,7 +484,6 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 		return nil, 0, fmt.Errorf("读取响应体失败: %w", err)
 	}
 
-	// ✅ 尝试解析为 FNOS Emby 响应格式
 	var fnosResp fnosEmbyResponse
 	if err := json.Unmarshal(body, &fnosResp); err != nil {
 		return nil, 0, fmt.Errorf("JSON解析失败: %w, body=%s", err, string(body))
