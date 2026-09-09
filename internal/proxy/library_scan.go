@@ -237,11 +237,9 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 		ls.lastScanTime = time.Now()
 		ls.lastScanStats = allStats
 		if reason != "" {
-			ls.logger.Info("📚 [全库扫描] 结束(%s): 总计=%d 成功=%d 跳过=%d 失败=%d 耗时=%v",
-				reason, allStats.Total, allStats.Success, allStats.Skipped, allStats.Failed, time.Since(startTime))
+			ls.logger.Info("📚 [全库扫描] 结束(%s): 总计=%d 成功=%d 跳过=%d 失败=%d 耗时=%v", reason, allStats.Total, allStats.Success, allStats.Skipped, allStats.Failed, time.Since(startTime))
 		} else {
-			ls.logger.Info("📚 [全库扫描] 完成: 总计=%d 成功=%d 跳过=%d 失败=%d 耗时=%v",
-				allStats.Total, allStats.Success, allStats.Skipped, allStats.Failed, time.Since(startTime))
+			ls.logger.Info("📚 [全库扫描] 完成: 总计=%d 成功=%d 跳过=%d 失败=%d 耗时=%v", allStats.Total, allStats.Success, allStats.Skipped, allStats.Failed, time.Since(startTime))
 		}
 	}
 
@@ -255,9 +253,9 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 		}
 
 		ls.logger.Info("📚 [全库扫描] 扫描媒体库: %s (ID=%s)", lib.Name, lib.ID)
-
 		startIndex := 0
 		const pageSize = 200
+
 		for {
 			select {
 			case <-ls.stopCh:
@@ -290,14 +288,12 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 			if startIndex >= total || len(items) == 0 {
 				break
 			}
-
 			if !ls.sleep(ctx) {
 				finishScan("已停止")
 				return
 			}
 		}
 	}
-
 	finishScan("")
 }
 
@@ -369,6 +365,7 @@ func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 // ============================================================
 
 // doRequest 发送 HTTP 请求（添加 X-Emby-Authorization 认证头）
+// 修复点：确保 authHeaders 类型为 http.Header
 func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header, path string) (*http.Response, error) {
 	ls.server.proxyMu.RLock()
 	targetURL := ls.server.targetURL
@@ -380,18 +377,23 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 		return nil, err
 	}
 
-	// ✅ 关键修改：飞牛 Emby API 要求 X-Emby-Authorization 头
+	// --- 认证头处理逻辑 ---
+
+	// 1. 优先处理传入的 authHeaders
 	if authHeaders != nil {
 		req.Header = authHeaders.Clone()
-		
+
+		// 如果传入了 Authorization，直接设置
 		if auth := authHeaders.Get("Authorization"); auth != "" {
 			req.Header.Set("X-Emby-Authorization", auth)
 		}
+		// 如果传入了 X-Emby-Token，转换为 Bearer 格式
 		if token := authHeaders.Get("X-Emby-Token"); token != "" {
 			req.Header.Set("X-Emby-Authorization", "Bearer "+token)
 		}
 	}
 
+	// 2. 兜底逻辑：如果 req.Header 中仍然没有认证信息，尝试从 authStore 获取
 	if req.Header.Get("X-Emby-Authorization") == "" {
 		_, headers, _ := ls.authStore.Get()
 		if headers != nil {
@@ -403,11 +405,13 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 		}
 	}
 
+	// --- 其他请求头设置 ---
 	req.Header.Del("Accept-Encoding")
 	req.Header.Set("Accept", "application/json")
 	req.Host = targetURL.Host
-	
+
 	ls.logger.Debug("📤 [Emby请求] %s %s, X-Emby-Authorization=%s", req.Method, path, req.Header.Get("X-Emby-Authorization"))
+
 	return ls.server.retryClient.Do(req)
 }
 
@@ -418,7 +422,6 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 // queryViews 查询所有媒体库
 func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHeaders http.Header) ([]libraryInfo, error) {
 	path := "/emby/Users/" + userID + "/Views"
-
 	resp, err := ls.doRequest(ctx, authHeaders, path)
 	if err != nil {
 		return nil, fmt.Errorf("请求失败: %w", err)
@@ -461,8 +464,8 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 	query.Set("IncludeItemTypes", "Movie,Series")
 	query.Set("StartIndex", strconv.Itoa(startIndex))
 	query.Set("Limit", strconv.Itoa(limit))
-	path := "/emby/Users/" + userID + "/Items?" + query.Encode()
 
+	path := "/emby/Users/" + userID + "/Items?" + query.Encode()
 	resp, err := ls.doRequest(ctx, authHeaders, path)
 	if err != nil {
 		return nil, 0, fmt.Errorf("请求失败: %w", err)
@@ -486,7 +489,6 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 
 	var result []PrefetchItem
 	totalCount := fnosResp.TotalRecordCount
-
 	for _, item := range fnosResp.Items {
 		if item.Id == "" {
 			continue
@@ -508,7 +510,6 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 // querySeasons 查询季列表
 func (ls *LibraryScanner) querySeasons(ctx context.Context, userID string, authHeaders http.Header, seriesID string) ([]seasonInfo, error) {
 	path := "/emby/Shows/" + seriesID + "/Seasons"
-
 	resp, err := ls.doRequest(ctx, authHeaders, path)
 	if err != nil {
 		return nil, fmt.Errorf("请求失败: %w", err)
@@ -549,8 +550,8 @@ func (ls *LibraryScanner) queryEpisodes(ctx context.Context, userID string, auth
 	query.Set("fields", "ShareLevel,MediaSources")
 	query.Set("SortBy", "IndexNumber")
 	query.Set("SortOrder", "Ascending")
-	path := "/emby/Users/" + userID + "/Items?" + query.Encode()
 
+	path := "/emby/Users/" + userID + "/Items?" + query.Encode()
 	resp, err := ls.doRequest(ctx, authHeaders, path)
 	if err != nil {
 		return nil, fmt.Errorf("请求失败: %w", err)
@@ -558,30 +559,3 @@ func (ls *LibraryScanner) queryEpisodes(ctx context.Context, userID string, auth
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("查询集列表失败: status=%d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
-	if err != nil {
-		return nil, fmt.Errorf("读取响应体失败: %w", err)
-	}
-
-	var listResp jsonListResponse
-	if err := json.Unmarshal(body, &listResp); err != nil {
-		return nil, fmt.Errorf("JSON解析失败: %w", err)
-	}
-
-	var episodes []PrefetchItem
-	for _, item := range listResp.Items {
-		if item.Id == "" {
-			continue
-		}
-		episodes = append(episodes, PrefetchItem{
-			ItemID: item.Id,
-			UserID: userID,
-			Name:   item.Name,
-			Type:   item.Type,
-		})
-	}
-	return episodes, nil
-}
