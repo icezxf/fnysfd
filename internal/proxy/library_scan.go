@@ -365,7 +365,7 @@ func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 }
 
 // ============================================================
-// ✅ 核心修改：doRequest 添加 X-Emby-Authorization 头
+// ✅ doRequest - 添加 X-Emby-Authorization 头（已修复编译错误）
 // ============================================================
 
 // doRequest 发送 HTTP 请求（添加 X-Emby-Authorization 认证头）
@@ -381,6 +381,7 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 	}
 
 	// ✅ 关键修改：飞牛 Emby API 要求 X-Emby-Authorization 头
+	// 直接从 authHeaders 读取，避免类型误判
 	if authHeaders != nil {
 		// 复制所有认证头
 		req.Header = authHeaders.Clone()
