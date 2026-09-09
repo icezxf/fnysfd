@@ -559,3 +559,30 @@ func (ls *LibraryScanner) queryEpisodes(ctx context.Context, userID string, auth
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("查询集列表失败: status=%d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+	if err != nil {
+		return nil, fmt.Errorf("读取响应体失败: %w", err)
+	}
+
+	var listResp jsonListResponse
+	if err := json.Unmarshal(body, &listResp); err != nil {
+		return nil, fmt.Errorf("JSON解析失败: %w", err)
+	}
+
+	var result []PrefetchItem
+	for _, item := range listResp.Items {
+		if item.Id == "" {
+			continue
+		}
+		result = append(result, PrefetchItem{
+			ItemID: item.Id,
+			UserID: userID,
+			Name:   item.Name,
+			Type:   item.Type,
+		})
+	}
+	return result, nil
+} // <--- 确保这个函数有正确的闭合括号
