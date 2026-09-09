@@ -2,592 +2,294 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"fnysfd/internal/config"
 	"fnysfd/internal/logger"
 	"io"
 	"net/http"
-	"net/url"
-	"runtime"
-	"strconv"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-// ========== FNOS Emby API 兼容结构体 ==========
+// batch_prefetch.go 批量预取引擎
+//
+// 提供海报墙预取、全库扫描等场景复用的公共预取能力：
+//   - 通过信号量控制对飞牛的并发 PlaybackInfo 请求，避免压垮上游
+//   - 支持运行时动态调整并发数（UpdateConcurrency）
+//   - 支持优雅停止（Stop），关闭后等待在途任务完成
+//   - 复用 Server 已有的缓存检查、去重、PlaybackHandler.Handle 链路，
+//     保证批量预取与详情页/主动预取走同一套 STRM 缓存 + 预加载逻辑
 
-// fnosEmbyResponse FNOS 对 Emby API 的响应包装
-type fnosEmbyResponse struct {
-	Items            []fnosEmbyItem `json:"Items"`
-	TotalRecordCount int            `json:"TotalRecordCount"`
+// PrefetchItem 单个预取任务描述
+type PrefetchItem struct {
+	ItemID string // 飞牛 ItemId
+	UserID string // 用户 UserId（用于构造 PlaybackInfo 请求，可为空）
+	Name   string // 媒体名称（仅用于日志展示）
+	Type   string // 媒体类型（Movie/Episode/Series 等，仅用于日志展示）
 }
 
-// fnosEmbyItem FNOS Emby API 返回的媒体项
-type fnosEmbyItem struct {
-	Id   string `json:"Id"`
-	Name string `json:"Name"`
-	Type string `json:"Type"`
+// BatchStats 批量预取统计
+type BatchStats struct {
+	Total    int           // 总任务数
+	Success  int           // 新预取成功数
+	Skipped  int           // 跳过数（缓存已命中，无需预取）
+	Failed   int           // 失败数（去重跳过或请求失败）
+	Duration time.Duration // 总耗时
 }
 
-// ========== 内部使用的基础类型 ==========
-
-// libraryInfo 媒体库信息
-type libraryInfo struct {
-	ID   string
-	Name string
+// String 返回统计的可读字符串（用于日志输出）
+func (s BatchStats) String() string {
+	return fmt.Sprintf("总计=%d 成功=%d 跳过=%d 失败=%d 耗时=%v",
+		s.Total, s.Success, s.Skipped, s.Failed, s.Duration)
 }
 
-// seasonInfo 季信息
-type seasonInfo struct {
-	ID   string
-	Name string
+// BatchPrefetcher 批量预取引擎
+type BatchPrefetcher struct {
+	server      *Server
+	logger      *logger.Logger
+	sem         chan struct{}  // 信号量控制并发
+	concurrency int            // 当前并发数
+	stopCh      chan struct{}  // 停止信号
+	wg          sync.WaitGroup // 等待在途任务完成
+	semMu       sync.RWMutex   // 保护 sem / concurrency 的并发读写（动态调整并发时使用）
 }
 
-// jsonListResponse 保留原生 Emby 风格响应（备用）
-type jsonListResponse struct {
-	Items            []jsonItem `json:"Items"`
-	TotalRecordCount int        `json:"TotalRecordCount"`
-}
-
-type jsonItem struct {
-	Id   string `json:"Id"`
-	Name string `json:"Name"`
-	Type string `json:"Type"`
-}
-
-// 常量
-const maxScanItems = 10000
-const batchFlushSize = 50
-const memSafetyThresholdMB = 400
-
-// LibraryScanner 全库扫描预取器
-type LibraryScanner struct {
-	server        *Server
-	batch         *BatchPrefetcher
-	logger        *logger.Logger
-	authStore     *AuthStore
-	stopCh        chan struct{}
-	stopOnce      sync.Once
-	running       atomic.Bool
-	lastScanTime  time.Time
-	lastScanStats BatchStats
-}
-
-// NewLibraryScanner 创建全库扫描器
-func NewLibraryScanner(s *Server, b *BatchPrefetcher, auth *AuthStore) *LibraryScanner {
-	return &LibraryScanner{
-		server:    s,
-		batch:     b,
-		logger:    s.logger,
-		authStore: auth,
-		stopCh:    make(chan struct{}),
+// NewBatchPrefetcher 创建批量预取引擎
+func NewBatchPrefetcher(s *Server, concurrency int) *BatchPrefetcher {
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	return &BatchPrefetcher{
+		server:      s,
+		logger:      s.logger,
+		sem:         make(chan struct{}, concurrency),
+		concurrency: concurrency,
+		stopCh:      make(chan struct{}),
 	}
 }
 
-// Start 启动定时扫描
-func (ls *LibraryScanner) Start() {
-	if !config.Global.GetEnableLibraryScan() {
-		ls.logger.Info("📚 [全库扫描] 功能未开启，跳过启动")
+// UpdateConcurrency 动态调整并发数（重建信号量 channel）
+//
+// 重建后新的并发限制对后续获取信号量的任务立即生效；已在飞的旧任务仍按旧
+// channel 释放令牌，过渡期内并发可能短暂超出新上限（best-effort，不阻塞调用）。
+func (bp *BatchPrefetcher) UpdateConcurrency(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	bp.semMu.Lock()
+	defer bp.semMu.Unlock()
+	if bp.concurrency == n {
 		return
 	}
-	cron := config.Global.GetLibraryScanCron()
-	if cron != "" {
-		go ls.cronScheduler(cron)
-		ls.logger.Info("📚 [全库扫描] 定时任务已启动: %s", cron)
-	} else {
-		ls.logger.Info("📚 [全库扫描] 未配置定时任务 (library_scan_cron 为空)")
-	}
-	if config.Global.GetLibraryScanOnStart() {
-		go func() {
-			ls.logger.Info("📚 [全库扫描] 启动后立即扫描")
-			ls.scanOnce(context.Background())
-		}()
-	}
+	bp.sem = make(chan struct{}, n)
+	bp.concurrency = n
+	bp.logger.Info("⚙️ [批量预取] 并发数已调整为: %d", n)
 }
 
-// cronScheduler 定时调度器
-func (ls *LibraryScanner) cronScheduler(cron string) {
-	for {
-		nextDelay, err := ls.calcNextDelay(cron)
-		if err != nil {
-			ls.logger.Warn("📚 [全库扫描] cron 解析失败，停止定时调度: %v", err)
-			return
+// Stop 停止引擎：关闭 stopCh 并等待所有在途任务完成（幂等，可安全多次调用）
+func (bp *BatchPrefetcher) Stop() {
+	select {
+	case <-bp.stopCh:
+		// 已关闭，直接返回
+		return
+	default:
+		close(bp.stopCh)
+	}
+	bp.wg.Wait()
+}
+
+// PrefetchItem 预取单个媒体项的 PlaybackInfo
+//
+// 返回值：
+//   - hit: 缓存是否已命中（true 表示已缓存且直链已解析，无需发起请求）
+//   - ok:  预取是否成功（true 表示本次新预取成功）
+//
+// 处理流程：缓存命中检查 → 去重检查 → 信号量限流 → 单次请求 → Handle 处理。
+// 单次请求不重试（批量场景由调用方控制重试/范围），失败返回 ok=false。
+// 请求头设置 X-Fnysfd-Next-Prefetch: 1，避免 Handle 内部"下一集预取"回调
+// 重复触发（海报墙/全库扫描自行控制预取范围）。
+func (bp *BatchPrefetcher) PrefetchItem(ctx context.Context, itemID, userID string, authHeaders http.Header, prefix string, dedupTTL int64) (hit bool, ok bool) {
+	if itemID == "" {
+		return false, false
+	}
+
+	// 1. 缓存命中检查：MediaSource 已缓存且直链已解析，直接返回命中
+	if source, found := bp.server.cache.GetByItemID(itemID); found {
+		if _, urlFound := bp.server.cache.GetStreamURL(source.ID); urlFound {
+			bp.logger.Debug("⏭️ [批量预取] 跳过（已缓存且直链已解析）: ItemId=%s", itemID)
+			return true, true
 		}
-		ls.logger.Info("📚 [全库扫描] 下次扫描: %v 后", nextDelay)
-		select {
-		case <-time.After(nextDelay):
-			ls.scanOnce(context.Background())
-		case <-ls.stopCh:
-			return
-		}
 	}
-}
 
-// calcNextDelay 计算 cron 到下次触发的时间间隔
-func (ls *LibraryScanner) calcNextDelay(cron string) (time.Duration, error) {
-	parts := strings.Split(cron, ":")
-	if len(parts) != 2 {
-		return 0, fmt.Errorf("cron 格式错误，应为 HH:MM: %s", cron)
+	// 2. 去重检查：TTL 内已请求过则跳过（shouldSkipPrefetch 内部会写入去重标记）
+	dedupKey := buildPrefetchKey(prefix, itemID, "")
+	if bp.server.shouldSkipPrefetch(dedupKey, dedupTTL, "批量预取") {
+		return false, false
 	}
-	hour, err := strconv.Atoi(parts[0])
-	if err != nil || hour < 0 || hour > 23 {
-		return 0, fmt.Errorf("cron 小时无效: %s", parts[0])
-	}
-	minute, err := strconv.Atoi(parts[1])
-	if err != nil || minute < 0 || minute > 59 {
-		return 0, fmt.Errorf("cron 分钟无效: %s", parts[1])
-	}
-	now := time.Now()
-	next := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, time.Local)
-	if !next.After(now) {
-		next = next.Add(24 * time.Hour)
-	}
-	return next.Sub(now), nil
-}
 
-// Stop 停止扫描
-func (ls *LibraryScanner) Stop() {
-	ls.stopOnce.Do(func() {
-		close(ls.stopCh)
-	})
-}
-
-// TriggerScan 手动触发扫描
-func (ls *LibraryScanner) TriggerScan() error {
-	if ls.running.Load() {
-		return fmt.Errorf("扫描正在进行中，请稍后再试")
+	// 3. 信号量限流：获取令牌或响应 ctx 取消 / 引擎停止
+	bp.semMu.RLock()
+	sem := bp.sem
+	bp.semMu.RUnlock()
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	case <-ctx.Done():
+		return false, false
+	case <-bp.stopCh:
+		return false, false
 	}
-	go ls.scanOnce(context.Background())
-	return nil
-}
 
-// IsRunning 是否正在扫描
-func (ls *LibraryScanner) IsRunning() bool {
-	return ls.running.Load()
-}
+	// 4. 构造 PlaybackInfo 请求（复用项目标准 URL 与 header 处理模式）
+	//    targetURL 通过 proxyMu 读锁保护读取（与 Reload 写入互斥）
+	bp.server.proxyMu.RLock()
+	targetURL := bp.server.targetURL
+	bp.server.proxyMu.RUnlock()
 
-// GetStatus 获取扫描状态
-func (ls *LibraryScanner) GetStatus() map[string]interface{} {
-	status := map[string]interface{}{
-		"running": ls.running.Load(),
-		"lastScanStats": map[string]interface{}{
-			"total":   ls.lastScanStats.Total,
-			"success": ls.lastScanStats.Success,
-			"skipped": ls.lastScanStats.Skipped,
-			"failed":  ls.lastScanStats.Failed,
-		},
+	fullURL := targetURL.Scheme + "://" + targetURL.Host + "/emby/Items/" + itemID + "/PlaybackInfo"
+	if userID != "" {
+		fullURL += "?UserId=" + userID
 	}
-	if !ls.lastScanTime.IsZero() {
-		status["lastScanTime"] = ls.lastScanTime.Format("2006-01-02 15:04:05")
+
+	// 请求头处理：克隆 header（nil 时用空 header）→ 删除 Accept-Encoding → 设置 Accept: application/json
+	reqHeaders := http.Header{}
+	if authHeaders != nil {
+		reqHeaders = authHeaders.Clone()
 	}
-	return status
-}
+	reqHeaders.Del("Accept-Encoding")            // 让 Transport 自动处理 gzip，避免压缩响应导致解析失败
+	reqHeaders.Set("Accept", "application/json") // 强制 JSON 响应，避免飞牛返回 HTML
+	// 标记为批量预取请求：Handle 内部的"下一集预取"回调检测到此头会跳过，
+	// 避免批量预取逐集递归触发（海报墙/全库扫描自行控制预取范围）
+	reqHeaders.Set("X-Fnysfd-Next-Prefetch", "1")
 
-// scanOnce 执行一次完整扫描
-func (ls *LibraryScanner) scanOnce(ctx context.Context) {
-	if !ls.running.CompareAndSwap(false, true) {
-		ls.logger.Warn("📚 [全库扫描] 已有扫描在进行中，跳过")
-		return
-	}
-	defer ls.running.Store(false)
-
-	ls.logger.Info("📚 [全库扫描] 开始")
-	startTime := time.Now()
-
-	userID, authHeaders, ok := ls.waitForAuth(ctx)
-	if !ok {
-		ls.logger.Warn("📚 [全库扫描] 认证信息未就绪，等待超时，取消扫描")
-		return
-	}
-	ls.logger.Info("📚 [全库扫描] 认证就绪，UserID=%s", userID)
-
-	libraries, err := ls.queryViews(ctx, userID, authHeaders)
+	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
 	if err != nil {
-		ls.logger.Warn("📚 [全库扫描] 查询媒体库失败: %v", err)
-		return
+		bp.logger.Warn("❌ [批量预取] 创建请求失败: ItemId=%s err=%v", itemID, err)
+		return false, false
 	}
-	if len(libraries) == 0 {
-		ls.logger.Warn("📚 [全库扫描] 未发现任何媒体库")
-		return
-	}
-	ls.logger.Info("📚 [全库扫描] 发现 %d 个媒体库", len(libraries))
+	req.Header = reqHeaders
+	req.Host = targetURL.Host
 
-	var allStats BatchStats
-	totalItems := 0
-	var pending []PrefetchItem
-
-	flushBatch := func() {
-		if len(pending) == 0 {
-			return
-		}
-		stats := ls.batch.PrefetchBatch(ctx, pending, authHeaders, "library", 3600, "全库扫描")
-		allStats.Total += stats.Total
-		allStats.Success += stats.Success
-		allStats.Skipped += stats.Skipped
-		allStats.Failed += stats.Failed
-		pending = pending[:0]
-		ls.checkMemoryAndYield(ctx)
+	// 5. 单次请求（不重试），失败直接返回
+	resp, err := bp.server.retryClient.Do(req)
+	if err != nil {
+		bp.logger.Debug("⚠️ [批量预取] 请求失败: ItemId=%s err=%v", itemID, err)
+		return false, false
 	}
 
-	finishScan := func(reason string) {
-		flushBatch()
-		ls.lastScanTime = time.Now()
-		ls.lastScanStats = allStats
-		if reason != "" {
-			ls.logger.Info("📚 [全库扫描] 结束(%s): 总计=%d 成功=%d 跳过=%d 失败=%d 耗时=%v",
-				reason, allStats.Total, allStats.Success, allStats.Skipped, allStats.Failed, time.Since(startTime))
-		} else {
-			ls.logger.Info("📚 [全库扫描] 完成: 总计=%d 成功=%d 跳过=%d 失败=%d 耗时=%v",
-				allStats.Total, allStats.Success, allStats.Skipped, allStats.Failed, time.Since(startTime))
-		}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		bp.logger.Debug("⚠️ [批量预取] 非200响应: ItemId=%s status=%d", itemID, resp.StatusCode)
+		return false, false
 	}
 
-	for _, lib := range libraries {
+	// 6. 读取响应体（限制 10MB，防止恶意大响应导致 OOM）
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+	resp.Body.Close()
+	if err != nil {
+		bp.logger.Warn("⚠️ [批量预取] 读取响应体失败: ItemId=%s err=%v", itemID, err)
+		return false, false
+	}
+	if len(body) == 0 {
+		bp.logger.Debug("⚠️ [批量预取] 响应体为空: ItemId=%s", itemID)
+		return false, false
+	}
+
+	// 7. 交给 PlaybackHandler 处理（自动完成 STRM 缓存 + 预加载 + 回调）
+	//    X-Fnysfd-Next-Prefetch 头已设置，下一集预取回调会被跳过
+	_, _ = bp.server.playbackHandler.Handle(resp, body)
+	bp.logger.Debug("✅ [批量预取] 成功: ItemId=%s", itemID)
+	return false, true
+}
+
+// PrefetchBatch 批量并发预取
+//
+// authHeaders 为从 AuthStore 获取的认证头（X-Emby-Token / Authorization），
+// 传给每个 PrefetchItem 用于构造带认证的 PlaybackInfo 请求。
+// 通过信号量控制总并发，返回汇总统计。
+//
+// 统计规则（基于 PrefetchItem 返回值）：
+//   - hit=true → Skipped（缓存已命中，无需预取）
+//   - ok=true  → Success（本次新预取成功）
+//   - 其余      → Failed（去重跳过或请求失败，二者返回值均为 hit=false, ok=false）
+//
+// 引擎停止（Stop）后调用本方法会立即返回，全部计入 Failed。
+func (bp *BatchPrefetcher) PrefetchBatch(ctx context.Context, items []PrefetchItem, authHeaders http.Header, prefix string, dedupTTL int64, logTag string) BatchStats {
+	start := time.Now()
+	stats := BatchStats{Total: len(items)}
+
+	if len(items) == 0 {
+		return stats
+	}
+
+	if logTag == "" {
+		logTag = "批量预取"
+	}
+
+	// 引擎已停止则不启动新任务，避免向已 Wait 完成的 wg 添加任务
+	select {
+	case <-bp.stopCh:
+		stats.Failed = len(items)
+		stats.Duration = time.Since(start)
+		bp.logger.Info("📊 [%s] 批量预取跳过（引擎已停止）: %s", logTag, stats.String())
+		return stats
+	default:
+	}
+
+	// 派生受 stopCh 控制的 ctx：Stop() 关闭 stopCh 后，批量内所有在途请求尽快退出
+	batchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
 		select {
-		case <-ls.stopCh:
-			ls.logger.Info("📚 [全库扫描] 收到停止信号，中止扫描")
-			finishScan("已停止")
-			return
-		default:
+		case <-bp.stopCh:
+			cancel()
+		case <-batchCtx.Done():
 		}
+	}()
 
-		ls.logger.Info("📚 [全库扫描] 扫描媒体库: %s (ID=%s)", lib.Name, lib.ID)
+	var mu sync.Mutex
+	var localWg sync.WaitGroup
+	success, skipped, failed := 0, 0, 0
 
-		startIndex := 0
-		const pageSize = 200
-		for {
+	// localWg 用于本批次统计收集；bp.wg 用于 Stop() 等待在途任务
+	localWg.Add(len(items))
+	bp.wg.Add(len(items))
+	for i := range items {
+		item := items[i] // Go 1.21 循环变量需显式拷贝
+		go func() {
+			defer localWg.Done()
+			defer bp.wg.Done()
+
+			// 引擎已停止则直接计入失败
 			select {
-			case <-ls.stopCh:
-				ls.logger.Info("📚 [全库扫描] 收到停止信号，中止扫描")
-				finishScan("已停止")
+			case <-bp.stopCh:
+				mu.Lock()
+				failed++
+				mu.Unlock()
 				return
 			default:
 			}
 
-			items, total, err := ls.queryItems(ctx, userID, authHeaders, lib.ID, startIndex, pageSize)
-			if err != nil {
-				ls.logger.Warn("📚 [全库扫描] 查询项目失败: 库=%s startIndex=%d err=%v", lib.Name, startIndex, err)
-				break
+			hit, ok := bp.PrefetchItem(batchCtx, item.ItemID, item.UserID, authHeaders, prefix, dedupTTL)
+
+			mu.Lock()
+			switch {
+			case hit:
+				skipped++ // 缓存已命中
+			case ok:
+				success++ // 新预取成功
+			default:
+				failed++ // 去重跳过或请求失败
 			}
-
-			for _, item := range items {
-				totalItems++
-				if totalItems > maxScanItems {
-					ls.logger.Warn("📚 [全库扫描] 达到安全阀上限 %d，停止扫描", maxScanItems)
-					finishScan("安全阀")
-					return
-				}
-				pending = append(pending, item)
-				if len(pending) >= batchFlushSize {
-					flushBatch()
-				}
-			}
-
-			startIndex += pageSize
-			if startIndex >= total || len(items) == 0 {
-				break
-			}
-
-			if !ls.sleep(ctx) {
-				finishScan("已停止")
-				return
-			}
-		}
+			mu.Unlock()
+		}()
 	}
+	localWg.Wait()
 
-	finishScan("")
-}
+	stats.Success = success
+	stats.Skipped = skipped
+	stats.Failed = failed
+	stats.Duration = time.Since(start)
 
-// waitForAuth 等待认证信息就绪
-func (ls *LibraryScanner) waitForAuth(ctx context.Context) (string, http.Header, bool) {
-	const maxWait = 10 * time.Minute
-	const checkInterval = 30 * time.Second
-	deadline := time.Now().Add(maxWait)
-
-	for {
-		if ls.authStore.IsReady() {
-			headers, userID, expired := ls.authStore.Get()
-			if !expired && userID != "" && headers != nil {
-				return userID, headers, true
-			}
-		}
-		if time.Now().After(deadline) {
-			return "", nil, false
-		}
-		ls.logger.Warn("📚 [全库扫描] 认证信息未就绪，等待 %v 后重试...", checkInterval)
-		select {
-		case <-time.After(checkInterval):
-		case <-ls.stopCh:
-			return "", nil, false
-		case <-ctx.Done():
-			return "", nil, false
-		}
-	}
-}
-
-// sleep 按配置的间隔休眠
-func (ls *LibraryScanner) sleep(ctx context.Context) bool {
-	intervalMs := config.Global.GetLibraryScanIntervalMs()
-	if intervalMs <= 0 {
-		return true
-	}
-	select {
-	case <-time.After(time.Duration(intervalMs) * time.Millisecond):
-		return true
-	case <-ls.stopCh:
-		return false
-	case <-ctx.Done():
-		return false
-	}
-}
-
-// checkMemoryAndYield 内存安全检查
-func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	memMB := float64(m.Alloc) / 1024 / 1024
-	if memMB > memSafetyThresholdMB {
-		ls.logger.Warn("📚 [全库扫描] 内存过高 (%.1fMB/%dMB)，暂停扫描并触发GC", memMB, memSafetyThresholdMB)
-		runtime.GC()
-		var m2 runtime.MemStats
-		runtime.ReadMemStats(&m2)
-		newMemMB := float64(m2.Alloc) / 1024 / 1024
-		ls.logger.Info("📚 [全库扫描] GC完成，内存释放: %.1fMB -> %.1fMB", memMB, newMemMB)
-		select {
-		case <-time.After(2 * time.Second):
-		case <-ls.stopCh:
-		case <-ctx.Done():
-		}
-	}
-}
-
-// ============================================================
-// ✅ doRequest - 添加 X-Emby-Authorization 头（已修复编译错误）
-// ============================================================
-
-// doRequest 发送 HTTP 请求（添加 X-Emby-Authorization 认证头）
-func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header, path string) (*http.Response, error) {
-	ls.server.proxyMu.RLock()
-	targetURL := ls.server.targetURL
-	ls.server.proxyMu.RUnlock()
-
-	fullURL := targetURL.Scheme + "://" + targetURL.Host + path
-	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// ✅ 关键修改：飞牛 Emby API 要求 X-Emby-Authorization 头
-	// 直接从 authHeaders 读取，避免类型误判
-	if authHeaders != nil {
-		// 复制所有认证头
-		req.Header = authHeaders.Clone()
-		
-		// 如果存在 Authorization 头，将其值也设置到 X-Emby-Authorization
-		if auth := authHeaders.Get("Authorization"); auth != "" {
-			req.Header.Set("X-Emby-Authorization", auth)
-		}
-		// 如果存在 X-Emby-Token，也一并设置
-		if token := authHeaders.Get("X-Emby-Token"); token != "" {
-			req.Header.Set("X-Emby-Authorization", "Bearer "+token)
-		}
-	}
-
-	// 强制要求 X-Emby-Authorization 头
-	// 如果 authHeaders 为空或没有认证信息，尝试从 AuthStore 获取
-	if req.Header.Get("X-Emby-Authorization") == "" {
-		_, headers, _ := ls.authStore.Get()
-		if headers != nil {
-			if auth := headers.Get("Authorization"); auth != "" {
-				req.Header.Set("X-Emby-Authorization", auth)
-			} else if token := headers.Get("X-Emby-Token"); token != "" {
-				req.Header.Set("X-Emby-Authorization", "Bearer "+token)
-			}
-		}
-	}
-
-	req.Header.Del("Accept-Encoding")
-	req.Header.Set("Accept", "application/json")
-	req.Host = targetURL.Host
-	
-	ls.logger.Debug("📤 [Emby请求] %s %s, X-Emby-Authorization=%s", req.Method, path, req.Header.Get("X-Emby-Authorization"))
-	return ls.server.retryClient.Do(req)
-}
-
-// ============================================================
-// queryViews 和 queryItems（使用 Emby 兼容 API）
-// ============================================================
-
-// queryViews 查询所有媒体库
-func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHeaders http.Header) ([]libraryInfo, error) {
-	path := "/emby/Users/" + userID + "/Views"
-
-	resp, err := ls.doRequest(ctx, authHeaders, path)
-	if err != nil {
-		return nil, fmt.Errorf("请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("查询媒体库失败: status=%d, body=%s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
-	if err != nil {
-		return nil, fmt.Errorf("读取响应体失败: %w", err)
-	}
-
-	var fnosResp fnosEmbyResponse
-	if err := json.Unmarshal(body, &fnosResp); err != nil {
-		return nil, fmt.Errorf("JSON解析失败: %w, body=%s", err, string(body))
-	}
-
-	libraries := make([]libraryInfo, 0, len(fnosResp.Items))
-	for _, item := range fnosResp.Items {
-		if item.Id == "" {
-			continue
-		}
-		libraries = append(libraries, libraryInfo{
-			ID:   item.Id,
-			Name: item.Name,
-		})
-	}
-	return libraries, nil
-}
-
-// queryItems 分页查询指定媒体库的项目
-func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHeaders http.Header, parentID string, startIndex, limit int) ([]PrefetchItem, int, error) {
-	query := url.Values{}
-	query.Set("ParentId", parentID)
-	query.Set("Recursive", "true")
-	query.Set("IncludeItemTypes", "Movie,Series")
-	query.Set("StartIndex", strconv.Itoa(startIndex))
-	query.Set("Limit", strconv.Itoa(limit))
-	path := "/emby/Users/" + userID + "/Items?" + query.Encode()
-
-	resp, err := ls.doRequest(ctx, authHeaders, path)
-	if err != nil {
-		return nil, 0, fmt.Errorf("请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, 0, fmt.Errorf("查询项目失败: status=%d, body=%s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
-	if err != nil {
-		return nil, 0, fmt.Errorf("读取响应体失败: %w", err)
-	}
-
-	var fnosResp fnosEmbyResponse
-	if err := json.Unmarshal(body, &fnosResp); err != nil {
-		return nil, 0, fmt.Errorf("JSON解析失败: %w, body=%s", err, string(body))
-	}
-
-	var result []PrefetchItem
-	totalCount := fnosResp.TotalRecordCount
-
-	for _, item := range fnosResp.Items {
-		if item.Id == "" {
-			continue
-		}
-		result = append(result, PrefetchItem{
-			ItemID: item.Id,
-			UserID: userID,
-			Name:   item.Name,
-			Type:   item.Type,
-		})
-	}
-	return result, totalCount, nil
-}
-
-// ============================================================
-// querySeasons / queryEpisodes（暂保留 Emby 兼容模式）
-// ============================================================
-
-// querySeasons 查询季列表
-func (ls *LibraryScanner) querySeasons(ctx context.Context, userID string, authHeaders http.Header, seriesID string) ([]seasonInfo, error) {
-	path := "/emby/Shows/" + seriesID + "/Seasons"
-
-	resp, err := ls.doRequest(ctx, authHeaders, path)
-	if err != nil {
-		return nil, fmt.Errorf("请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("查询季列表失败: status=%d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
-	if err != nil {
-		return nil, fmt.Errorf("读取响应体失败: %w", err)
-	}
-
-	var listResp jsonListResponse
-	if err := json.Unmarshal(body, &listResp); err != nil {
-		return nil, fmt.Errorf("JSON解析失败: %w", err)
-	}
-
-	seasons := make([]seasonInfo, 0, len(listResp.Items))
-	for _, item := range listResp.Items {
-		if item.Id == "" {
-			continue
-		}
-		seasons = append(seasons, seasonInfo{
-			ID:   item.Id,
-			Name: item.Name,
-		})
-	}
-	return seasons, nil
-}
-
-// queryEpisodes 查询集列表
-func (ls *LibraryScanner) queryEpisodes(ctx context.Context, userID string, authHeaders http.Header, seriesID, seasonID string) ([]PrefetchItem, error) {
-	query := url.Values{}
-	query.Set("ParentId", seasonID)
-	query.Set("fields", "ShareLevel,MediaSources")
-	query.Set("SortBy", "IndexNumber")
-	query.Set("SortOrder", "Ascending")
-	path := "/emby/Users/" + userID + "/Items?" + query.Encode()
-
-	resp, err := ls.doRequest(ctx, authHeaders, path)
-	if err != nil {
-		return nil, fmt.Errorf("请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("查询集列表失败: status=%d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
-	if err != nil {
-		return nil, fmt.Errorf("读取响应体失败: %w", err)
-	}
-
-	var listResp jsonListResponse
-	if err := json.Unmarshal(body, &listResp); err != nil {
-		return nil, fmt.Errorf("JSON解析失败: %w", err)
-	}
-
-	var episodes []PrefetchItem
-	for _, item := range listResp.Items {
-		if item.Id == "" {
-			continue
-		}
-		episodes = append(episodes, PrefetchItem{
-			ItemID: item.Id,
-			UserID: userID,
-			Name:   item.Name,
-			Type:   item.Type,
-		})
-	}
-	return episodes, nil
+	bp.logger.Info("📊 [%s] 批量预取完成: %s", logTag, stats.String())
+	return stats
 }
