@@ -454,7 +454,7 @@ body.sidebar-open .sidebar-overlay{display:block}
 <div class="form-item">
 <label>手动扫描</label>
 <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-<button class="btn btn-primary" id="triggerScanBtn" onclick="triggerScan()">立即扫描</button>
+<button class="btn btn-primary" id="triggerScanBtn">立即扫描</button>
 <span id="scanStatus" style="font-size:13px;color:#888">未扫描</span>
 </div>
 <div class="hint">手动触发一次全库扫描。扫描需要认证信息（用户已访问过飞牛网页端）</div>
@@ -1013,6 +1013,7 @@ if(window.innerWidth<=768){document.body.classList.remove('sidebar-open')}
 $('logoutBtn').onclick=logout;
 $('saveConfigBtn').onclick=saveConfig;
 $('addVolumeBtn').onclick=addVolume;
+$('triggerScanBtn').onclick=triggerScan;
 $('restartContainerBtn').onclick=restartContainer;
 $('clearCacheBtn').onclick=clearCache;
 $('refreshLogBtn').onclick=loadLogs;
