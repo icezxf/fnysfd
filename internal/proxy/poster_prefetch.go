@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // PosterPrefetcher 海报墙预取器
@@ -141,7 +142,7 @@ func (p *PosterPrefetcher) IsItemListRequest(req *http.Request) (userID string, 
 //  3. 解析 JSON 列表（✅ 兼容飞牛的数组格式和标准 Emby 对象格式）
 //  4. 只取 Type="Movie" 的项目（Series 留给详情页预取链路）
 //  5. 受 GetPosterPrefetchMaxItems 限制
-//  6. 异步执行 batch.PrefetchBatch，前缀 "poster"，TTL 600 秒
+//  6. ✅ 分块预取（每批 3 个）+ 批次间延迟 1s + 失败重试，避免飞牛 probe 拥堵
 func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, userID string) {
 	// 1. 捕获认证信息（无论功能是否开启，都需为全库扫描积累认证）
 	if resp != nil && resp.Request != nil {
@@ -218,12 +219,78 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 	p.logger.Info("🖼️ [海报墙预取] 提取到 %d 部电影（列表共 %d 项），开始批量预取",
 		len(items), len(rawItems))
 
-	// 6. 异步执行批量预取（使用 authStore 中的认证头）
+	// 6. ✅ 异步执行分块预取（每批 3 个）+ 批次间延迟 + 失败重试
+	// 避免一次性把全部丢给飞牛，probe 互相竞争导致超时
 	authHeaders, _, _ := p.authStore.Get()
 	go func() {
-		stats := p.batch.PrefetchBatch(context.Background(), items, authHeaders, "poster", 600, "海报墙预取")
-		p.logger.Info("🖼️ [海报墙预取] 完成: 成功=%d 跳过=%d 失败=%d",
-			stats.Success, stats.Skipped, stats.Failed)
+		const chunkSize = 3
+		totalStats := BatchStats{Total: len(items)}
+
+		// 收集失败项
+		var failedItems []PrefetchItem
+
+		// 第一批：分块预取
+		for i := 0; i < len(items); i += chunkSize {
+			end := i + chunkSize
+			if end > len(items) {
+				end = len(items)
+			}
+			chunk := items[i:end]
+
+			stats := p.batch.PrefetchBatch(context.Background(), chunk, authHeaders, "poster", 600, "海报墙预取")
+			totalStats.Success += stats.Success
+			totalStats.Skipped += stats.Skipped
+			totalStats.Failed += stats.Failed
+
+			// 收集失败项（Failed > 0 说明有超时的）
+			if stats.Failed > 0 {
+				for _, item := range chunk {
+					failedItems = append(failedItems, item)
+				}
+			}
+
+			// 批次之间延迟 1 秒，给飞牛 probe 喘息时间
+			if i+chunkSize < len(items) {
+				time.Sleep(1 * time.Second)
+			}
+		}
+
+		p.logger.Info("🖼️ [海报墙预取] 首批完成: 成功=%d 跳过=%d 失败=%d",
+			totalStats.Success, totalStats.Skipped, totalStats.Failed)
+
+		// ✅ 重试失败项（每批 2 个，间隔 2 秒）
+		if len(failedItems) > 0 {
+			p.logger.Info("🖼️ [海报墙预取] 重试 %d 个失败项", len(failedItems))
+
+			retrySuccess := 0
+			retrySkipped := 0
+			retryFailed := 0
+
+			for i := 0; i < len(failedItems); i += 2 {
+				end := i + 2
+				if end > len(failedItems) {
+					end = len(failedItems)
+				}
+				chunk := failedItems[i:end]
+
+				stats := p.batch.PrefetchBatch(context.Background(), chunk, authHeaders, "poster_retry", 60, "海报墙预取-重试")
+				retrySuccess += stats.Success
+				retrySkipped += stats.Skipped
+				retryFailed += stats.Failed
+
+				if i+2 < len(failedItems) {
+					time.Sleep(2 * time.Second)
+				}
+			}
+
+			// 更新最终统计（重试成功后成功数增加，失败数用重试后的结果）
+			totalStats.Success += retrySuccess
+			totalStats.Skipped += retrySkipped
+			totalStats.Failed = retryFailed
+		}
+
+		p.logger.Info("🖼️ [海报墙预取] 最终完成: 成功=%d 跳过=%d 失败=%d",
+			totalStats.Success, totalStats.Skipped, totalStats.Failed)
 	}()
 }
 
