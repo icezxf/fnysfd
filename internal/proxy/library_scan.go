@@ -231,9 +231,8 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 		}
 	}
 
-	// ✅ 关键修改：因为 queryItems 不再支持 ParentId 参数（飞牛 Emby API 不支持），
-	// 不带参数时会返回所有项目，所以只需要扫描一次，不用对每个媒体库循环。
-	// 使用第一个媒体库的 ID 作为占位（实际不用）
+	// 因为 queryItems 使用最简路径（飞牛不支持任何参数），
+	// 不带参数时会返回所有项目，所以只需要调用一次，不用对每个媒体库循环
 	_ = libraries
 
 	// 一次性拉取所有项目
@@ -325,7 +324,8 @@ func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 }
 
 // ============================================================
-// doRequest：添加 Emby 标准格式的 X-Emby-Authorization 头
+// ✅ doRequest：添加 Emby 标准格式的 X-Emby-Authorization 头
+//    同时补充 X-Emby-Token 头（双保险）
 // ============================================================
 func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header, path string) (*http.Response, error) {
 	ls.server.proxyMu.RLock()
@@ -344,7 +344,7 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 		req.Header = authHeaders.Clone()
 	}
 
-	// ✅ 提取 Token 并构造 Emby 标准格式的 X-Emby-Authorization
+	// ✅ 提取 Token
 	token := ""
 	if authHeaders != nil {
 		if auth := authHeaders.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
@@ -368,11 +368,13 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 		}
 	}
 
-	// 构造 Emby 标准格式认证头（飞牛要求这个格式）
+	// ✅ 构造 Emby 标准格式认证头（Client/Device/DeviceId/Version 在前，Token 在最后）
 	if token != "" {
-		embyAuth := `MediaBrowser Token="` + token + `", Client="fnysfd", Device="fnysfd", DeviceId="fnysfd", Version="3.4.0"`
+		embyAuth := `MediaBrowser Client="fnysfd", Device="fnysfd", DeviceId="fnysfd", Version="3.4.0", Token="` + token + `"`
 		req.Header.Set("X-Emby-Authorization", embyAuth)
-		ls.logger.Debug("📤 [Emby请求] 已设置 X-Emby-Authorization (Token: %s...)", token[:minInt(8, len(token))])
+		// 同时带上 X-Emby-Token，双保险
+		req.Header.Set("X-Emby-Token", token)
+		ls.logger.Debug("📤 [Emby请求] 已设置 X-Emby-Authorization 和 X-Emby-Token (Token: %s...)", token[:minInt(8, len(token))])
 	} else {
 		ls.logger.Warn("⚠️ [Emby请求] 未找到 Token，无法构造 X-Emby-Authorization")
 	}
