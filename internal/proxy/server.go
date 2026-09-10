@@ -142,6 +142,22 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		initialConcurrency = scanConc
 	}
 	s.authStore = NewAuthStore()
+
+	// ✅ 主动登录：从环境变量读取飞牛影视账号密码，启动时自动登录获取 Token
+	// 这样 fnysfd 每次启动都能自动获取认证信息，无需依赖被动捕获
+	fnosUser := os.Getenv("FNOS_USERNAME")
+	fnosPass := os.Getenv("FNOS_PASSWORD")
+	if fnosUser != "" && fnosPass != "" {
+		serverAddr := targetURL.Scheme + "://" + targetURL.Host
+		if err := s.authStore.LoginViaEmby(fnosUser, fnosPass, serverAddr); err != nil {
+			log.Warn("⚠️ [主动登录] 飞牛影视登录失败，将依赖被动捕获: %v", err)
+		} else {
+			log.Info("✅ [主动登录] 飞牛影视登录成功，UserID=%s", s.authStore.userID)
+		}
+	} else {
+		log.Info("ℹ️ [主动登录] 未配置 FNOS_USERNAME/FNOS_PASSWORD，依赖被动捕获")
+	}
+
 	s.batchPrefetcher = NewBatchPrefetcher(s, initialConcurrency)
 	s.posterPrefetch = NewPosterPrefetcher(s, s.batchPrefetcher, s.authStore)
 	s.libraryScanner = NewLibraryScanner(s, s.batchPrefetcher, s.authStore)
@@ -469,7 +485,7 @@ func (s *Server) retryPlaybackInfo(originalReq *http.Request) {
 	reqPath := originalReq.URL.Path
 	reqHost := targetURL.Host
 	reqHeaders := originalReq.Header.Clone()
-	reqHeaders.Del("Accept-Encoding")    // 让 Transport 自动处理 gzip
+	reqHeaders.Del("Accept-Encoding")             // 让 Transport 自动处理 gzip
 	reqHeaders.Set("Accept", "application/json") // 强制 JSON 响应，避免飞牛返回 HTML
 
 	// 冷启动优化，缩短首次兜底重试延迟
@@ -577,7 +593,7 @@ func (s *Server) proactivePlaybackInfo(originalReq *http.Request) {
 	reqPath := originalReq.URL.Path
 	reqHost := targetURL.Host
 	reqHeaders := originalReq.Header.Clone()
-	reqHeaders.Del("Accept-Encoding")    // 让 Transport 自动处理 gzip
+	reqHeaders.Del("Accept-Encoding")             // 让 Transport 自动处理 gzip
 	reqHeaders.Set("Accept", "application/json") // 强制 JSON 响应，避免飞牛返回 HTML
 
 	// 冷启动优化，缩短主动预请求延迟
@@ -723,7 +739,7 @@ func (s *Server) prefetchForDetailPage(originalReq *http.Request, itemID string,
 	}
 
 	reqHeaders := originalReq.Header.Clone()
-	reqHeaders.Del("Accept-Encoding")    // 让 Transport 自动处理 gzip，避免压缩响应导致解析失败
+	reqHeaders.Del("Accept-Encoding")             // 让 Transport 自动处理 gzip，避免压缩响应导致解析失败
 	reqHeaders.Set("Accept", "application/json") // 强制 JSON 响应，避免飞牛返回 HTML
 	reqHost := targetURL.Host
 
@@ -826,7 +842,7 @@ func (s *Server) prefetchForMediaSourceMiss(originalReq *http.Request, itemID st
 	}
 
 	reqHeaders := originalReq.Header.Clone()
-	reqHeaders.Del("Accept-Encoding")    // 让 Transport 自动处理 gzip
+	reqHeaders.Del("Accept-Encoding")             // 让 Transport 自动处理 gzip
 	reqHeaders.Set("Accept", "application/json") // 强制 JSON 响应，避免飞牛返回 HTML
 	reqHost := targetURL.Host
 
@@ -1252,6 +1268,7 @@ func prefetchElapsedSeconds(attempt int) float64 {
 //   - detail:    详情页预请求，30秒去重（进入详情页才触发，不需要频繁）
 //   - proactive: PlaybackInfo 触发的主动预请求，15秒去重（切换集数/版本时能重新触发）
 //   - retry:     400 响应触发的重试，5秒去重（飞牛返回400后能较快重试，但不会无限重试）
+//
 // key 格式建议："{前缀}:{itemID}|{mediaSourceId}"
 // 包含 mediaSourceId 是为了支持版本切换场景（同 itemID 不同版本不去重）
 // 返回 true 表示应该跳过，false 表示可以继续（并已记录本次预请求时间）
