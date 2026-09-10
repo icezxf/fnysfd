@@ -19,21 +19,25 @@ import (
 
 // ========== 辅助结构体 ==========
 
+// libraryInfo 媒体库信息
 type libraryInfo struct {
 	ID   string
 	Name string
 }
 
+// seasonInfo 季信息
 type seasonInfo struct {
 	ID   string
 	Name string
 }
 
+// jsonListResponse Emby 列表 API 通用响应结构
 type jsonListResponse struct {
 	Items            []jsonItem `json:"Items"`
 	TotalRecordCount int        `json:"TotalRecordCount"`
 }
 
+// jsonItem Emby Item 通用结构
 type jsonItem struct {
 	Id   string `json:"Id"`
 	Name string `json:"Name"`
@@ -42,7 +46,7 @@ type jsonItem struct {
 
 // 常量
 const maxScanItems = 10000
-const batchFlushSize = 50
+const batchFlushSize = 3
 const memSafetyThresholdMB = 400
 
 // LibraryScanner 全库扫描预取器
@@ -58,6 +62,7 @@ type LibraryScanner struct {
 	lastScanStats BatchStats
 }
 
+// NewLibraryScanner 创建全库扫描器
 func NewLibraryScanner(s *Server, b *BatchPrefetcher, auth *AuthStore) *LibraryScanner {
 	return &LibraryScanner{
 		server:    s,
@@ -68,6 +73,7 @@ func NewLibraryScanner(s *Server, b *BatchPrefetcher, auth *AuthStore) *LibraryS
 	}
 }
 
+// Start 启动定时扫描
 func (ls *LibraryScanner) Start() {
 	if !config.Global.GetEnableLibraryScan() {
 		ls.logger.Info("📚 [全库扫描] 功能未开启，跳过启动")
@@ -88,6 +94,7 @@ func (ls *LibraryScanner) Start() {
 	}
 }
 
+// cronScheduler 定时调度器
 func (ls *LibraryScanner) cronScheduler(cron string) {
 	for {
 		nextDelay, err := ls.calcNextDelay(cron)
@@ -105,6 +112,7 @@ func (ls *LibraryScanner) cronScheduler(cron string) {
 	}
 }
 
+// calcNextDelay 计算 cron 到下次触发的时间间隔
 func (ls *LibraryScanner) calcNextDelay(cron string) (time.Duration, error) {
 	parts := strings.Split(cron, ":")
 	if len(parts) != 2 {
@@ -126,12 +134,14 @@ func (ls *LibraryScanner) calcNextDelay(cron string) (time.Duration, error) {
 	return next.Sub(now), nil
 }
 
+// Stop 停止扫描
 func (ls *LibraryScanner) Stop() {
 	ls.stopOnce.Do(func() {
 		close(ls.stopCh)
 	})
 }
 
+// TriggerScan 手动触发扫描
 func (ls *LibraryScanner) TriggerScan() error {
 	if ls.running.Load() {
 		return fmt.Errorf("扫描正在进行中，请稍后再试")
@@ -140,10 +150,12 @@ func (ls *LibraryScanner) TriggerScan() error {
 	return nil
 }
 
+// IsRunning 是否正在扫描
 func (ls *LibraryScanner) IsRunning() bool {
 	return ls.running.Load()
 }
 
+// GetStatus 获取扫描状态
 func (ls *LibraryScanner) GetStatus() map[string]interface{} {
 	status := map[string]interface{}{
 		"running": ls.running.Load(),
@@ -193,6 +205,9 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 	totalItems := 0
 	var pending []PrefetchItem
 
+	// ✅ 失败的 item 收集起来，一轮扫完后重试
+	var failedItems []PrefetchItem
+
 	flushBatch := func() {
 		if len(pending) == 0 {
 			return
@@ -202,12 +217,68 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 		allStats.Success += stats.Success
 		allStats.Skipped += stats.Skipped
 		allStats.Failed += stats.Failed
+
+		// ✅ 收集失败项（Failed > 0 说明有超时的）
+		if stats.Failed > 0 {
+			for _, item := range pending {
+				failedItems = append(failedItems, item)
+			}
+			ls.logger.Debug("📚 [全库扫描] 本批 %d 个，失败 %d 个，加入重试队列", len(pending), stats.Failed)
+		}
+
 		pending = pending[:0]
 		ls.checkMemoryAndYield(ctx)
+
+		// ✅ 批次之间强制延迟，给飞牛 probe 喘息时间
+		select {
+		case <-time.After(800 * time.Millisecond):
+		case <-ls.stopCh:
+		case <-ctx.Done():
+		}
+	}
+
+	// ✅ 重试所有失败项（在 finishScan 之前调用）
+	retryFailed := func() {
+		if len(failedItems) == 0 {
+			return
+		}
+		ls.logger.Info("📚 [全库扫描] 重试 %d 个失败项", len(failedItems))
+
+		// 分批重试，每批 2 个
+		for i := 0; i < len(failedItems); i += 2 {
+			select {
+			case <-ls.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			end := i + 2
+			if end > len(failedItems) {
+				end = len(failedItems)
+			}
+			batch := failedItems[i:end]
+
+			stats := ls.batch.PrefetchBatch(ctx, batch, authHeaders, "library_retry", 60, "全库扫描-重试")
+			allStats.Success += stats.Success
+			allStats.Failed += stats.Failed
+
+			// 重试之间也加延迟
+			select {
+			case <-time.After(1 * time.Second):
+			case <-ls.stopCh:
+			case <-ctx.Done():
+				return
+			}
+		}
+		ls.logger.Info("📚 [全库扫描] 重试完成")
 	}
 
 	finishScan := func(reason string) {
 		flushBatch()
+		// ✅ 先重试失败项，再统计最终结果
+		retryFailed()
 		ls.lastScanTime = time.Now()
 		ls.lastScanStats = allStats
 		if reason != "" {
@@ -255,6 +326,7 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 	finishScan("")
 }
 
+// waitForAuth 等待认证信息就绪
 func (ls *LibraryScanner) waitForAuth(ctx context.Context) (string, http.Header, bool) {
 	const maxWait = 10 * time.Minute
 	const checkInterval = 30 * time.Second
@@ -281,6 +353,7 @@ func (ls *LibraryScanner) waitForAuth(ctx context.Context) (string, http.Header,
 	}
 }
 
+// checkMemoryAndYield 内存安全检查
 func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -297,7 +370,7 @@ func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 }
 
 // ============================================================
-// ✅ doRequest：使用 X-Emby-Token 认证（已验证可用）
+// doRequest：使用 X-Emby-Token 认证（已验证可用）
 // ============================================================
 func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header, path string) (*http.Response, error) {
 	ls.server.proxyMu.RLock()
@@ -358,11 +431,13 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 	return ls.server.retryClient.Do(req)
 }
 
+// getUserID 获取缓存的 UserID
 func (ls *LibraryScanner) getUserID() string {
 	_, userID, _ := ls.authStore.Get()
 	return userID
 }
 
+// minInt 辅助函数
 func minInt(a, b int) int {
 	if a < b {
 		return a
@@ -392,6 +467,7 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 		return nil, fmt.Errorf("读取响应体失败: %w", err)
 	}
 
+	// 先尝试解析为标准 Emby 对象格式
 	var listResp jsonListResponse
 	if err := json.Unmarshal(body, &listResp); err == nil && len(listResp.Items) > 0 {
 		libraries := make([]libraryInfo, 0, len(listResp.Items))
@@ -407,6 +483,7 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 		return libraries, nil
 	}
 
+	// 再尝试解析为数组
 	var items []jsonItem
 	if err := json.Unmarshal(body, &items); err != nil {
 		return nil, fmt.Errorf("JSON解析失败: %w, body=%s", err, string(body))
@@ -490,6 +567,7 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 // querySeasons / queryEpisodes（保留 Emby 兼容模式）
 // ============================================================
 
+// querySeasons 查询季列表
 func (ls *LibraryScanner) querySeasons(ctx context.Context, userID string, authHeaders http.Header, seriesID string) ([]seasonInfo, error) {
 	path := "/emby/Shows/" + seriesID + "/Seasons"
 
@@ -526,6 +604,7 @@ func (ls *LibraryScanner) querySeasons(ctx context.Context, userID string, authH
 	return seasons, nil
 }
 
+// queryEpisodes 查询集列表
 func (ls *LibraryScanner) queryEpisodes(ctx context.Context, userID string, authHeaders http.Header, seriesID, seasonID string) ([]PrefetchItem, error) {
 	query := url.Values{}
 	query.Set("ParentId", seasonID)
