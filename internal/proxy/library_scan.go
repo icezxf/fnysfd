@@ -383,7 +383,7 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 
 	// 兜底：从 authStore 再取一次
 	if token == "" {
-		_, storedHeaders, _ := ls.authStore.Get()
+        storedHeaders, _, _ := ls.authStore.Get()
 		if storedHeaders != nil {
 			if auth := storedHeaders.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 				token = strings.TrimPrefix(auth, "Bearer ")
