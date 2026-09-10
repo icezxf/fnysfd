@@ -49,8 +49,7 @@ const maxScanItems = 10000
 const batchFlushSize = 50
 const memSafetyThresholdMB = 400
 
-// ========== LibraryScanner ==========
-
+// LibraryScanner 全库扫描预取器
 type LibraryScanner struct {
 	server        *Server
 	batch         *BatchPrefetcher
@@ -63,6 +62,7 @@ type LibraryScanner struct {
 	lastScanStats BatchStats
 }
 
+// NewLibraryScanner 创建全库扫描器
 func NewLibraryScanner(s *Server, b *BatchPrefetcher, auth *AuthStore) *LibraryScanner {
 	return &LibraryScanner{
 		server:    s,
@@ -231,56 +231,30 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 		}
 	}
 
-	for _, lib := range libraries {
-		select {
-		case <-ls.stopCh:
-			ls.logger.Info("📚 [全库扫描] 收到停止信号，中止扫描")
-			finishScan("已停止")
+	// ✅ 关键修改：因为 queryItems 不再支持 ParentId 参数（飞牛 Emby API 不支持），
+	// 不带参数时会返回所有项目，所以只需要扫描一次，不用对每个媒体库循环。
+	// 使用第一个媒体库的 ID 作为占位（实际不用）
+	_ = libraries
+
+	// 一次性拉取所有项目
+	items, total, err := ls.queryItems(ctx, userID, authHeaders, "", 0, 0)
+	if err != nil {
+		ls.logger.Warn("📚 [全库扫描] 查询项目失败: %v", err)
+		finishScan("失败")
+		return
+	}
+	ls.logger.Info("📚 [全库扫描] 获取到 %d 个项目 (total=%d)", len(items), total)
+
+	for _, item := range items {
+		totalItems++
+		if totalItems > maxScanItems {
+			ls.logger.Warn("📚 [全库扫描] 达到安全阀上限 %d，停止扫描", maxScanItems)
+			finishScan("安全阀")
 			return
-		default:
 		}
-
-		ls.logger.Info("📚 [全库扫描] 扫描媒体库: %s (ID=%s)", lib.Name, lib.ID)
-
-		startIndex := 0
-		const pageSize = 200
-		for {
-			select {
-			case <-ls.stopCh:
-				ls.logger.Info("📚 [全库扫描] 收到停止信号，中止扫描")
-				finishScan("已停止")
-				return
-			default:
-			}
-
-			items, total, err := ls.queryItems(ctx, userID, authHeaders, lib.ID, startIndex, pageSize)
-			if err != nil {
-				ls.logger.Warn("📚 [全库扫描] 查询项目失败: 库=%s startIndex=%d err=%v", lib.Name, startIndex, err)
-				break
-			}
-
-			for _, item := range items {
-				totalItems++
-				if totalItems > maxScanItems {
-					ls.logger.Warn("📚 [全库扫描] 达到安全阀上限 %d，停止扫描", maxScanItems)
-					finishScan("安全阀")
-					return
-				}
-				pending = append(pending, item)
-				if len(pending) >= batchFlushSize {
-					flushBatch()
-				}
-			}
-
-			startIndex += pageSize
-			if startIndex >= total || len(items) == 0 {
-				break
-			}
-
-			if !ls.sleep(ctx) {
-				finishScan("已停止")
-				return
-			}
+		pending = append(pending, item)
+		if len(pending) >= batchFlushSize {
+			flushBatch()
 		}
 	}
 
@@ -351,7 +325,7 @@ func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 }
 
 // ============================================================
-// ✅ doRequest：添加 Emby 标准格式的 X-Emby-Authorization 头
+// doRequest：添加 Emby 标准格式的 X-Emby-Authorization 头
 // ============================================================
 func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header, path string) (*http.Response, error) {
 	ls.server.proxyMu.RLock()
@@ -383,7 +357,7 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 
 	// 兜底：从 authStore 再取一次
 	if token == "" {
-        storedHeaders, _, _ := ls.authStore.Get()
+		storedHeaders, _, _ := ls.authStore.Get()
 		if storedHeaders != nil {
 			if auth := storedHeaders.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 				token = strings.TrimPrefix(auth, "Bearer ")
@@ -398,7 +372,7 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 	if token != "" {
 		embyAuth := `MediaBrowser Token="` + token + `", Client="fnysfd", Device="fnysfd", DeviceId="fnysfd", Version="3.4.0"`
 		req.Header.Set("X-Emby-Authorization", embyAuth)
-		ls.logger.Debug("📤 [Emby请求] 已设置 X-Emby-Authorization (Token: %s...)", token[:min(8, len(token))])
+		ls.logger.Debug("📤 [Emby请求] 已设置 X-Emby-Authorization (Token: %s...)", token[:minInt(8, len(token))])
 	} else {
 		ls.logger.Warn("⚠️ [Emby请求] 未找到 Token，无法构造 X-Emby-Authorization")
 	}
@@ -410,8 +384,8 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 	return ls.server.retryClient.Do(req)
 }
 
-// min 辅助函数（Go 1.21 已内置，但为兼容旧版本保留）
-func min(a, b int) int {
+// minInt 辅助函数
+func minInt(a, b int) int {
 	if a < b {
 		return a
 	}
@@ -476,17 +450,20 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 }
 
 // ============================================================
-// queryItems：兼容数组或对象两种格式
+// queryItems：使用最简路径（模仿 Web 客户端成功请求）
+//
+// ⚠️ 飞牛的 Emby 兼容 API 不支持任何查询参数（ParentId/Recursive/
+// IncludeItemTypes/StartIndex/Limit 都会导致 400）。
+// Web 客户端成功的请求是完全不带参数的 GET /emby/Users/{uid}/Items
+//
+// 参数 parentID/startIndex/limit 保留是为了兼容调用方签名，实际不使用。
 // ============================================================
 func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHeaders http.Header, parentID string, startIndex, limit int) ([]PrefetchItem, int, error) {
-	query := url.Values{}
-	query.Set("ParentId", parentID)
-	query.Set("Recursive", "true")
-// query.Set("IncludeItemTypes", "Movie,Series")//
-	query.Set("StartIndex", strconv.Itoa(startIndex))
-	query.Set("Limit", strconv.Itoa(limit))
+	// 忽略未使用的参数（避免编译器报错）
+	_, _, _ = parentID, startIndex, limit
 
-	path := "/emby/Users/" + userID + "/Items?" + query.Encode()
+	// ✅ 不带任何参数（飞牛只认这个格式）
+	path := "/emby/Users/" + userID + "/Items"
 
 	resp, err := ls.doRequest(ctx, authHeaders, path)
 	if err != nil {
@@ -499,7 +476,8 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 		return nil, 0, fmt.Errorf("查询项目失败: status=%d, body=%s", resp.StatusCode, string(body))
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+	// 提高读取上限到 50MB（全库可能很大）
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 50*1024*1024))
 	if err != nil {
 		return nil, 0, fmt.Errorf("读取响应体失败: %w", err)
 	}
@@ -512,7 +490,11 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 	if err := json.Unmarshal(body, &listResp); err == nil && len(listResp.Items) > 0 {
 		totalCount = listResp.TotalRecordCount
 		for _, item := range listResp.Items {
+			// 只处理 Movie 和 Series 类型
 			if item.Id == "" {
+				continue
+			}
+			if item.Type != "Movie" && item.Type != "Series" {
 				continue
 			}
 			result = append(result, PrefetchItem{
@@ -525,7 +507,7 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 		return result, totalCount, nil
 	}
 
-	// 再尝试数组格式
+	// 再尝试数组格式（飞牛返回数组的情况）
 	var items []jsonItem
 	if err := json.Unmarshal(body, &items); err != nil {
 		return nil, 0, fmt.Errorf("JSON解析失败: %w, body=%s", err, string(body))
@@ -533,6 +515,9 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 
 	for _, item := range items {
 		if item.Id == "" {
+			continue
+		}
+		if item.Type != "Movie" && item.Type != "Series" {
 			continue
 		}
 		result = append(result, PrefetchItem{
@@ -546,8 +531,10 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 }
 
 // ============================================================
-// querySeasons / queryEpisodes（保留 Emby 兼容模式）
+// querySeasons / queryEpisodes（保留 Emby 兼容模式，暂未使用）
 // ============================================================
+
+// querySeasons 查询季列表
 func (ls *LibraryScanner) querySeasons(ctx context.Context, userID string, authHeaders http.Header, seriesID string) ([]seasonInfo, error) {
 	path := "/emby/Shows/" + seriesID + "/Seasons"
 
@@ -584,6 +571,7 @@ func (ls *LibraryScanner) querySeasons(ctx context.Context, userID string, authH
 	return seasons, nil
 }
 
+// queryEpisodes 查询集列表
 func (ls *LibraryScanner) queryEpisodes(ctx context.Context, userID string, authHeaders http.Header, seriesID, seasonID string) ([]PrefetchItem, error) {
 	query := url.Values{}
 	query.Set("ParentId", seasonID)
