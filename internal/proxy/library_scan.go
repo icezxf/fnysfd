@@ -482,7 +482,7 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 	query := url.Values{}
 	query.Set("ParentId", parentID)
 	query.Set("Recursive", "true")
-#    query.Set("IncludeItemTypes", "Movie,Series")
+// query.Set("IncludeItemTypes", "Movie,Series")//
 	query.Set("StartIndex", strconv.Itoa(startIndex))
 	query.Set("Limit", strconv.Itoa(limit))
 
