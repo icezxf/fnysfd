@@ -36,6 +36,9 @@ func NewAuthStore() *AuthStore {
 // 以及从路径 /emby/Users/{uid}/Items/... 提取 userID。
 // 只在提取到有效认证信息（至少一个认证头）时才更新缓存，
 // 避免无认证请求覆盖已有有效缓存。
+//
+// ✅ 关键修复：如果请求里没有 X-Emby-Token，但缓存里已有（来自主动登录），
+// 则保留缓存里的 X-Emby-Token，避免被被动捕获的请求覆盖掉。
 func (a *AuthStore) CaptureFromRequest(req *http.Request) {
 	if req == nil {
 		return
@@ -67,6 +70,13 @@ func (a *AuthStore) CaptureFromRequest(req *http.Request) {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// ✅ 关键：保留已有的 X-Emby-Token（主动登录获取的），
+	// 避免被动捕获的请求覆盖掉主动登录的 Token
+	if a.headers.Get("X-Emby-Token") != "" && captured.Get("X-Emby-Token") == "" {
+		captured.Set("X-Emby-Token", a.headers.Get("X-Emby-Token"))
+	}
+
 	a.headers = captured
 	// 仅在新请求携带 userID 时更新，避免无 userID 的请求清空已有缓存
 	if userID != "" {
