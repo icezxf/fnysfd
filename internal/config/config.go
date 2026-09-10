@@ -60,7 +60,10 @@ type Config struct {
 	LibraryScanConcurrency  int    `mapstructure:"library_scan_concurrency"`   // 扫描并发数
 	LibraryScanIntervalMs   int    `mapstructure:"library_scan_interval_ms"`  // 每页间隔（毫秒）
 	LibraryScanEpisodeCount int    `mapstructure:"library_scan_episode_count"` // 每季预取前N集
-	mutex     sync.RWMutex
+	// ✅ Webhook 通知配置（QMS 联动）
+	WebhookNotifyToken        string `mapstructure:"webhook_notify_token"`         // 预共享密钥（空=禁用）
+	WebhookNotifyDelaySeconds int    `mapstructure:"webhook_notify_delay_seconds"` // 延迟秒数（默认15）
+	mutex                     sync.RWMutex
 }
 
 // Global 全局配置实例
@@ -92,6 +95,9 @@ var Global = &Config{
 	LibraryScanConcurrency:  2,
 	LibraryScanIntervalMs:   500,
 	LibraryScanEpisodeCount: 5,
+	// ✅ Webhook 通知默认值
+	WebhookNotifyToken:        "", // 默认禁用
+	WebhookNotifyDelaySeconds: 15, // 默认延迟 15 秒
 }
 
 // Load 加载配置
@@ -111,7 +117,7 @@ func Load(configPath string) error {
 	viper.SetDefault("target", "http://127.0.0.1:8005")
 	viper.SetDefault("log_level", "info")
 	viper.SetDefault("log_dir", "./logs")
-	viper.SetDefault("cache_ttl", 30)  // 30 分钟（配合智能签名 TTL）
+	viper.SetDefault("cache_ttl", 30) // 30 分钟（配合智能签名 TTL）
 	viper.SetDefault("dashboard_addr", ":28006")
 	viper.SetDefault("dashboard_user", "admin")
 	viper.SetDefault("dashboard_pass", "admin")
@@ -135,6 +141,9 @@ func Load(configPath string) error {
 	viper.SetDefault("library_scan_concurrency", 2)
 	viper.SetDefault("library_scan_interval_ms", 500)
 	viper.SetDefault("library_scan_episode_count", 5)
+	// ✅ Webhook 通知
+	viper.SetDefault("webhook_notify_token", "")
+	viper.SetDefault("webhook_notify_delay_seconds", 15)
 
 	viper.SetEnvPrefix("FNTV")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -208,9 +217,9 @@ func (c *Config) validateStrmPaths() {
 
 // 配置监听停止通道（由 Watch 创建，由 Stop 关闭）
 var (
-	watchStopChan  chan struct{}
-	watchStopOnce  sync.Once
-	watchMutex     sync.Mutex // 保护 watchStopChan 赋值，防止 Watch 并发调用产生竞态
+	watchStopChan chan struct{}
+	watchStopOnce sync.Once
+	watchMutex    sync.Mutex // 保护 watchStopChan 赋值，防止 Watch 并发调用产生竞态
 )
 
 // Watch 监听配置变化
@@ -506,6 +515,28 @@ func (c *Config) GetLibraryScanEpisodeCount() int {
 	return c.LibraryScanEpisodeCount
 }
 
+// GetWebhookNotifyToken 获取 Webhook 通知的预共享密钥
+// 空字符串表示未启用 Webhook 通知端点
+func (c *Config) GetWebhookNotifyToken() string {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c.WebhookNotifyToken
+}
+
+// GetWebhookNotifyDelaySeconds 获取 Webhook 触发后的延迟秒数
+// 默认 15 秒，最小 0 秒，最大 300 秒
+func (c *Config) GetWebhookNotifyDelaySeconds() int {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	if c.WebhookNotifyDelaySeconds < 0 {
+		return 15
+	}
+	if c.WebhookNotifyDelaySeconds > 300 {
+		return 300
+	}
+	return c.WebhookNotifyDelaySeconds
+}
+
 // SetLogLevel 设置日志级别
 func (c *Config) SetLogLevel(level string) {
 	c.mutex.Lock()
@@ -618,42 +649,42 @@ func (c *Config) UpdateConfigWithStatus(updates map[string]interface{}) (bool, e
 				c.MaxCacheItems = maxItems
 			}
 		case "strm_paths":
-		// 类型断言失败时返回错误，不静默跳过（避免配置被意外清空）
-		v, ok := value.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("strm_paths 必须是字符串数组（当前类型: %T）", value)
-		}
-		paths := make([]string, 0, len(v))
-		for _, path := range v {
-			if s, ok := path.(string); ok && s != "" {
-				paths = append(paths, s)
+			// 类型断言失败时返回错误，不静默跳过（避免配置被意外清空）
+			v, ok := value.([]interface{})
+			if !ok {
+				return false, fmt.Errorf("strm_paths 必须是字符串数组（当前类型: %T）", value)
 			}
-		}
-		oldPaths := c.StrmPaths
-		c.StrmPaths = paths
+			paths := make([]string, 0, len(v))
+			for _, path := range v {
+				if s, ok := path.(string); ok && s != "" {
+					paths = append(paths, s)
+				}
+			}
+			oldPaths := c.StrmPaths
+			c.StrmPaths = paths
 
-		if !equalStringSlices(oldPaths, paths) {
-			needsRestart = true
-			log.Println("🔄 检测到STRM路径配置变更...")
-		}
-	case "strm_volumes":
-		// 列表字段：完整替换；类型断言失败时返回错误
-		v, ok := value.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("strm_volumes 必须是字符串数组（当前类型: %T）", value)
-		}
-		volumes := make([]string, 0, len(v))
-		for _, vol := range v {
-			if s, ok := vol.(string); ok && s != "" {
-				volumes = append(volumes, s)
+			if !equalStringSlices(oldPaths, paths) {
+				needsRestart = true
+				log.Println("🔄 检测到STRM路径配置变更...")
 			}
-		}
-		oldVolumes := c.StrmVolumes
-		c.StrmVolumes = volumes
-		if !equalStringSlices(oldVolumes, volumes) {
-			needsRestart = true
-			log.Println("🔄 检测到STRM Volume配置变更...")
-		}
+		case "strm_volumes":
+			// 列表字段：完整替换；类型断言失败时返回错误
+			v, ok := value.([]interface{})
+			if !ok {
+				return false, fmt.Errorf("strm_volumes 必须是字符串数组（当前类型: %T）", value)
+			}
+			volumes := make([]string, 0, len(v))
+			for _, vol := range v {
+				if s, ok := vol.(string); ok && s != "" {
+					volumes = append(volumes, s)
+				}
+			}
+			oldVolumes := c.StrmVolumes
+			c.StrmVolumes = volumes
+			if !equalStringSlices(oldVolumes, volumes) {
+				needsRestart = true
+				log.Println("🔄 检测到STRM Volume配置变更...")
+			}
 		case "stats_token":
 			if v, ok := value.(string); ok {
 				if v == "****" {
@@ -701,57 +732,74 @@ func (c *Config) UpdateConfigWithStatus(updates map[string]interface{}) (bool, e
 				}
 			}
 		case "enable_cdn_warmup":
-		// CDN预热开关（热重载生效）
-		if v, ok := value.(bool); ok {
-			if c.EnableCDNWarmup != v {
-				c.EnableCDNWarmup = v
-				log.Printf("🔄 检测到CDN预热开关变更: %v（热重载生效）", v)
+			// CDN预热开关（热重载生效）
+			if v, ok := value.(bool); ok {
+				if c.EnableCDNWarmup != v {
+					c.EnableCDNWarmup = v
+					log.Printf("🔄 检测到CDN预热开关变更: %v（热重载生效）", v)
+				}
+			}
+		case "enable_poster_prefetch":
+			if v, ok := value.(bool); ok {
+				if c.EnablePosterPrefetch != v {
+					c.EnablePosterPrefetch = v
+					log.Printf("🔄 检测到海报墙预取开关变更: %v（热重载生效）", v)
+				}
+			}
+		case "poster_prefetch_concurrency":
+			if v := toInt(value); v >= 1 && v <= 20 {
+				c.PosterPrefetchConcurrency = v
+			}
+		case "poster_prefetch_max_items":
+			if v := toInt(value); v >= 1 && v <= 500 {
+				c.PosterPrefetchMaxItems = v
+			}
+		case "enable_library_scan":
+			if v, ok := value.(bool); ok {
+				if c.EnableLibraryScan != v {
+					c.EnableLibraryScan = v
+					log.Printf("🔄 检测到全库扫描开关变更: %v（热重载生效）", v)
+				}
+			}
+		case "library_scan_cron":
+			if v, ok := value.(string); ok {
+				c.LibraryScanCron = v
+				log.Printf("🔄 检测到全库扫描定时变更: %s（热重载生效）", v)
+			}
+		case "library_scan_on_start":
+			if v, ok := value.(bool); ok {
+				c.LibraryScanOnStart = v
+			}
+		case "library_scan_concurrency":
+			if v := toInt(value); v >= 1 && v <= 20 {
+				c.LibraryScanConcurrency = v
+			}
+		case "library_scan_interval_ms":
+			if v := toInt(value); v >= 0 && v <= 60000 {
+				c.LibraryScanIntervalMs = v
+			}
+		case "library_scan_episode_count":
+			if v := toInt(value); v >= 1 && v <= 50 {
+				c.LibraryScanEpisodeCount = v
+			}
+		case "webhook_notify_token":
+			if v, ok := value.(string); ok {
+				if v == "****" {
+					continue
+				}
+				if c.WebhookNotifyToken != v {
+					c.WebhookNotifyToken = v
+					log.Printf("🔄 检测到 Webhook token 变更（热重载生效）")
+				}
+			}
+		case "webhook_notify_delay_seconds":
+			if v := toInt(value); v >= 0 && v <= 300 {
+				if c.WebhookNotifyDelaySeconds != v {
+					c.WebhookNotifyDelaySeconds = v
+					log.Printf("🔄 检测到 Webhook 延迟变更: %d 秒（热重载生效）", v)
+				}
 			}
 		}
-	case "enable_poster_prefetch":
-		if v, ok := value.(bool); ok {
-			if c.EnablePosterPrefetch != v {
-				c.EnablePosterPrefetch = v
-				log.Printf("🔄 检测到海报墙预取开关变更: %v（热重载生效）", v)
-			}
-		}
-	case "poster_prefetch_concurrency":
-		if v := toInt(value); v >= 1 && v <= 20 {
-			c.PosterPrefetchConcurrency = v
-		}
-	case "poster_prefetch_max_items":
-		if v := toInt(value); v >= 1 && v <= 500 {
-			c.PosterPrefetchMaxItems = v
-		}
-	case "enable_library_scan":
-		if v, ok := value.(bool); ok {
-			if c.EnableLibraryScan != v {
-				c.EnableLibraryScan = v
-				log.Printf("🔄 检测到全库扫描开关变更: %v（热重载生效）", v)
-			}
-		}
-	case "library_scan_cron":
-		if v, ok := value.(string); ok {
-			c.LibraryScanCron = v
-			log.Printf("🔄 检测到全库扫描定时变更: %s（热重载生效）", v)
-		}
-	case "library_scan_on_start":
-		if v, ok := value.(bool); ok {
-			c.LibraryScanOnStart = v
-		}
-	case "library_scan_concurrency":
-		if v := toInt(value); v >= 1 && v <= 20 {
-			c.LibraryScanConcurrency = v
-		}
-	case "library_scan_interval_ms":
-		if v := toInt(value); v >= 0 && v <= 60000 {
-			c.LibraryScanIntervalMs = v
-		}
-	case "library_scan_episode_count":
-		if v := toInt(value); v >= 1 && v <= 50 {
-			c.LibraryScanEpisodeCount = v
-		}
-	}
 	}
 
 	if err := c.saveConfigLocked(); err != nil {
@@ -830,34 +878,34 @@ func validateConfigUpdates(updates map[string]interface{}) error {
 				}
 			}
 		case "dashboard_addr":
-		if v, ok := value.(string); ok {
-			if err := validateListenAddr(v); err != nil {
-				return fmt.Errorf("dashboard_addr 校验失败: %w", err)
+			if v, ok := value.(string); ok {
+				if err := validateListenAddr(v); err != nil {
+					return fmt.Errorf("dashboard_addr 校验失败: %w", err)
+				}
 			}
+		case "stats_token":
+			// stats_token 基本校验：长度限制，避免过长的 token 拖慢每次请求的比对
+			if v, ok := value.(string); ok {
+				// "****" 视为未修改，跳过校验
+				if v == "****" {
+					continue
+				}
+				if len(v) > 256 {
+					return fmt.Errorf("stats_token 长度不能超过 256 字符（当前: %d）", len(v))
+				}
+			}
+		case "strm_resolve_mode":
+			// STRM 解析模式校验
+			if v, ok := value.(string); ok {
+				mode := strings.ToLower(strings.TrimSpace(v))
+				if mode != "auto" && mode != "passthrough" && mode != "always" {
+					return fmt.Errorf("strm_resolve_mode 必须是 auto/passthrough/always 之一（当前: %s）", v)
+				}
+			}
+		// bool 开关类配置无需额外校验（类型已由 UpdateConfig 的 type assertion 保证）
+		case "enable_lan_strm", "enable_preload", "enable_smart_ttl", "enable_cdn_warmup":
+			// bool 类型，无额外约束
 		}
-	case "stats_token":
-		// stats_token 基本校验：长度限制，避免过长的 token 拖慢每次请求的比对
-		if v, ok := value.(string); ok {
-			// "****" 视为未修改，跳过校验
-			if v == "****" {
-				continue
-			}
-			if len(v) > 256 {
-				return fmt.Errorf("stats_token 长度不能超过 256 字符（当前: %d）", len(v))
-			}
-		}
-	case "strm_resolve_mode":
-		// STRM 解析模式校验
-		if v, ok := value.(string); ok {
-			mode := strings.ToLower(strings.TrimSpace(v))
-			if mode != "auto" && mode != "passthrough" && mode != "always" {
-				return fmt.Errorf("strm_resolve_mode 必须是 auto/passthrough/always 之一（当前: %s）", v)
-			}
-		}
-	// bool 开关类配置无需额外校验（类型已由 UpdateConfig 的 type assertion 保证）
-	case "enable_lan_strm", "enable_preload", "enable_smart_ttl", "enable_cdn_warmup":
-		// bool 类型，无额外约束
-	}
 	}
 	return nil
 }
@@ -945,11 +993,11 @@ func (c *Config) saveConfigLocked() error {
 	viper.Set("strm_paths", c.StrmPaths)
 	viper.Set("strm_volumes", c.StrmVolumes)
 	viper.Set("stats_token", c.StatsToken)
-	viper.Set("strm_resolve_mode", c.StrmResolveMode) //
-	viper.Set("enable_lan_strm", c.EnableLanStrm)      //
-	viper.Set("enable_preload", c.EnablePreload)       //
-	viper.Set("enable_smart_ttl", c.EnableSmartTTL)    //
-	viper.Set("enable_cdn_warmup", c.EnableCDNWarmup)  //
+	viper.Set("strm_resolve_mode", c.StrmResolveMode)
+	viper.Set("enable_lan_strm", c.EnableLanStrm)
+	viper.Set("enable_preload", c.EnablePreload)
+	viper.Set("enable_smart_ttl", c.EnableSmartTTL)
+	viper.Set("enable_cdn_warmup", c.EnableCDNWarmup)
 	// 海报墙预取
 	viper.Set("enable_poster_prefetch", c.EnablePosterPrefetch)
 	viper.Set("poster_prefetch_concurrency", c.PosterPrefetchConcurrency)
@@ -961,6 +1009,9 @@ func (c *Config) saveConfigLocked() error {
 	viper.Set("library_scan_concurrency", c.LibraryScanConcurrency)
 	viper.Set("library_scan_interval_ms", c.LibraryScanIntervalMs)
 	viper.Set("library_scan_episode_count", c.LibraryScanEpisodeCount)
+	// ✅ Webhook 通知
+	viper.Set("webhook_notify_token", c.WebhookNotifyToken)
+	viper.Set("webhook_notify_delay_seconds", c.WebhookNotifyDelaySeconds)
 
 	// 原子写入：先写临时文件（必须保留 .yaml 扩展名，否则 viper 无法识别格式），
 	// 再通过 os.Rename 原子替换原文件
@@ -1018,6 +1069,12 @@ func (c *Config) ToMap() map[string]interface{} {
 		statsTokenMasked = "****"
 	}
 
+	// ✅ webhook_notify_token 同样脱敏
+	webhookTokenMasked := ""
+	if c.WebhookNotifyToken != "" {
+		webhookTokenMasked = "****"
+	}
+
 	return map[string]interface{}{
 		"listen":           c.ListenAddr,
 		"target":           c.TargetAddr,
@@ -1031,22 +1088,25 @@ func (c *Config) ToMap() map[string]interface{} {
 		"strm_paths":       c.StrmPaths,
 		"strm_volumes":     c.StrmVolumes,
 		"stats_token":      statsTokenMasked,
-		"strm_resolve_mode": c.StrmResolveMode, //
-		"enable_lan_strm":  c.EnableLanStrm,    //
-		"enable_preload":   c.EnablePreload,    //
-		"enable_smart_ttl": c.EnableSmartTTL,   //
-		"enable_cdn_warmup": c.EnableCDNWarmup, //
+		"strm_resolve_mode": c.StrmResolveMode,
+		"enable_lan_strm":  c.EnableLanStrm,
+		"enable_preload":   c.EnablePreload,
+		"enable_smart_ttl": c.EnableSmartTTL,
+		"enable_cdn_warmup": c.EnableCDNWarmup,
 		// 海报墙预取
 		"enable_poster_prefetch":      c.EnablePosterPrefetch,
 		"poster_prefetch_concurrency": c.PosterPrefetchConcurrency,
 		"poster_prefetch_max_items":   c.PosterPrefetchMaxItems,
 		// 全库扫描预取
-		"enable_library_scan":       c.EnableLibraryScan,
-		"library_scan_cron":         c.LibraryScanCron,
-		"library_scan_on_start":     c.LibraryScanOnStart,
-		"library_scan_concurrency":  c.LibraryScanConcurrency,
-		"library_scan_interval_ms":  c.LibraryScanIntervalMs,
+		"enable_library_scan":        c.EnableLibraryScan,
+		"library_scan_cron":          c.LibraryScanCron,
+		"library_scan_on_start":      c.LibraryScanOnStart,
+		"library_scan_concurrency":   c.LibraryScanConcurrency,
+		"library_scan_interval_ms":   c.LibraryScanIntervalMs,
 		"library_scan_episode_count": c.LibraryScanEpisodeCount,
+		// ✅ Webhook 通知
+		"webhook_notify_token":         webhookTokenMasked,
+		"webhook_notify_delay_seconds": c.WebhookNotifyDelaySeconds,
 	}
 }
 
@@ -1236,6 +1296,8 @@ library_scan_on_start: false
 library_scan_concurrency: 2
 library_scan_interval_ms: 500
 library_scan_episode_count: 5
+webhook_notify_token: ""
+webhook_notify_delay_seconds: 15
 listen: :28005
 log_dir: ./logs
 log_level: info
