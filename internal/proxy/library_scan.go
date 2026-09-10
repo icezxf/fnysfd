@@ -324,8 +324,8 @@ func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 }
 
 // ============================================================
-// ✅ doRequest：添加 Emby 标准格式的 X-Emby-Authorization 头
-//    同时补充 X-Emby-Token 头（双保险）
+// doRequest：从 authStore 获取认证信息并构造 Emby 请求头
+// （主动登录方案下，authStore 里的 headers 由 Login 方法填充）
 // ============================================================
 func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header, path string) (*http.Response, error) {
 	ls.server.proxyMu.RLock()
@@ -344,7 +344,7 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 		req.Header = authHeaders.Clone()
 	}
 
-	// ✅ 提取 Token
+	// 提取 Token
 	token := ""
 	if authHeaders != nil {
 		if auth := authHeaders.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
@@ -368,11 +368,10 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 		}
 	}
 
-	// ✅ 构造 Emby 标准格式认证头（Client/Device/DeviceId/Version 在前，Token 在最后）
+	// 构造 Emby 标准格式认证头
 	if token != "" {
 		embyAuth := `MediaBrowser Client="fnysfd", Device="fnysfd", DeviceId="fnysfd", Version="3.4.0", Token="` + token + `"`
 		req.Header.Set("X-Emby-Authorization", embyAuth)
-		// 同时带上 X-Emby-Token，双保险
 		req.Header.Set("X-Emby-Token", token)
 		ls.logger.Debug("📤 [Emby请求] 已设置 X-Emby-Authorization 和 X-Emby-Token (Token: %s...)", token[:minInt(8, len(token))])
 	} else {
@@ -432,7 +431,7 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 		return libraries, nil
 	}
 
-	// 再尝试解析为数组（飞牛某些端点返回数组）
+	// 再尝试解析为数组
 	var items []jsonItem
 	if err := json.Unmarshal(body, &items); err != nil {
 		return nil, fmt.Errorf("JSON解析失败: %w, body=%s", err, string(body))
@@ -453,18 +452,10 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 
 // ============================================================
 // queryItems：使用最简路径（模仿 Web 客户端成功请求）
-//
-// ⚠️ 飞牛的 Emby 兼容 API 不支持任何查询参数（ParentId/Recursive/
-// IncludeItemTypes/StartIndex/Limit 都会导致 400）。
-// Web 客户端成功的请求是完全不带参数的 GET /emby/Users/{uid}/Items
-//
-// 参数 parentID/startIndex/limit 保留是为了兼容调用方签名，实际不使用。
 // ============================================================
 func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHeaders http.Header, parentID string, startIndex, limit int) ([]PrefetchItem, int, error) {
-	// 忽略未使用的参数（避免编译器报错）
 	_, _, _ = parentID, startIndex, limit
 
-	// ✅ 不带任何参数（飞牛只认这个格式）
 	path := "/emby/Users/" + userID + "/Items"
 
 	resp, err := ls.doRequest(ctx, authHeaders, path)
@@ -478,13 +469,11 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 		return nil, 0, fmt.Errorf("查询项目失败: status=%d, body=%s", resp.StatusCode, string(body))
 	}
 
-	// 提高读取上限到 50MB（全库可能很大）
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 50*1024*1024))
 	if err != nil {
 		return nil, 0, fmt.Errorf("读取响应体失败: %w", err)
 	}
 
-	// 先尝试标准 Emby 对象格式
 	var listResp jsonListResponse
 	var result []PrefetchItem
 	var totalCount int
@@ -492,7 +481,6 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 	if err := json.Unmarshal(body, &listResp); err == nil && len(listResp.Items) > 0 {
 		totalCount = listResp.TotalRecordCount
 		for _, item := range listResp.Items {
-			// 只处理 Movie 和 Series 类型
 			if item.Id == "" {
 				continue
 			}
@@ -509,7 +497,6 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 		return result, totalCount, nil
 	}
 
-	// 再尝试数组格式（飞牛返回数组的情况）
 	var items []jsonItem
 	if err := json.Unmarshal(body, &items); err != nil {
 		return nil, 0, fmt.Errorf("JSON解析失败: %w, body=%s", err, string(body))
