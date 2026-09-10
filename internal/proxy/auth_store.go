@@ -18,10 +18,11 @@ const authStoreTTL = 6 * time.Hour
 // 🔐 从用户请求中提取并缓存 Emby 认证信息（X-Emby-Token / Authorization），
 // 供后台全库扫描任务复用，避免无认证请求被飞牛拒绝。
 type AuthStore struct {
-	mu        sync.RWMutex
-	headers   http.Header // 缓存 X-Emby-Token、Authorization 等认证头
-	userID    string      // 从 /emby/Users/{uid}/... 路径提取的用户ID
-	updatedAt time.Time   // 最近一次更新时间
+	mu         sync.RWMutex
+	headers    http.Header
+	userID     string
+	loginToken string      // ✅ 主动登录的 Token，优先级最高，被动捕获不能覆盖
+	updatedAt  time.Time
 }
 
 // NewAuthStore 创建认证缓存
@@ -37,8 +38,8 @@ func NewAuthStore() *AuthStore {
 // 只在提取到有效认证信息（至少一个认证头）时才更新缓存，
 // 避免无认证请求覆盖已有有效缓存。
 //
-// ✅ 关键修复：如果请求里没有 X-Emby-Token，但缓存里已有（来自主动登录），
-// 则保留缓存里的 X-Emby-Token，避免被被动捕获的请求覆盖掉。
+// ✅ 关键修复：如果主动登录过（loginToken 非空），则无论被动捕获到什么，
+// 都用 loginToken 覆盖，避免被动捕获的旧 Token 覆盖主动登录的新 Token。
 func (a *AuthStore) CaptureFromRequest(req *http.Request) {
 	if req == nil {
 		return
@@ -71,14 +72,13 @@ func (a *AuthStore) CaptureFromRequest(req *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// ✅ 关键：保留已有的 X-Emby-Token（主动登录获取的），
-	// 避免被动捕获的请求覆盖掉主动登录的 Token
-	if a.headers.Get("X-Emby-Token") != "" && captured.Get("X-Emby-Token") == "" {
-		captured.Set("X-Emby-Token", a.headers.Get("X-Emby-Token"))
+	// ✅ 关键：如果主动登录过，无论被动捕获到什么，都用 loginToken 覆盖
+	if a.loginToken != "" {
+		captured.Set("X-Emby-Token", a.loginToken)
+		captured.Set("X-Emby-Authorization", `MediaBrowser Client="fnysfd", Device="fnysfd", DeviceId="fnysfd", Version="3.4.0", Token="`+a.loginToken+`"`)
 	}
 
 	a.headers = captured
-	// 仅在新请求携带 userID 时更新，避免无 userID 的请求清空已有缓存
 	if userID != "" {
 		a.userID = userID
 	}
@@ -86,23 +86,26 @@ func (a *AuthStore) CaptureFromRequest(req *http.Request) {
 }
 
 // Get 返回缓存的认证信息
-// 🔓 返回 header 的副本（调用方可安全修改）和 userID。
-// expired=true 表示缓存为空或超过 6 小时未更新。
 func (a *AuthStore) Get() (headers http.Header, userID string, expired bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	// 缓存为空或从未更新过
 	if len(a.headers) == 0 || a.updatedAt.IsZero() {
 		return nil, "", true
 	}
 
+	// ✅ 返回副本，并强制用 loginToken 覆盖
+	headersCopy := a.headers.Clone()
+	if a.loginToken != "" {
+		headersCopy.Set("X-Emby-Token", a.loginToken)
+		headersCopy.Set("X-Emby-Authorization", `MediaBrowser Client="fnysfd", Device="fnysfd", DeviceId="fnysfd", Version="3.4.0", Token="`+a.loginToken+`"`)
+	}
+
 	expired = time.Since(a.updatedAt) > authStoreTTL
-	return a.headers.Clone(), a.userID, expired
+	return headersCopy, a.userID, expired
 }
 
-// IsReady 缓存是否就绪（非空且未过期）
-// ✅ 后台全库扫描任务启动前调用此方法判断是否可复用认证信息。
+// IsReady 缓存是否就绪
 func (a *AuthStore) IsReady() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -115,17 +118,14 @@ func (a *AuthStore) IsReady() bool {
 
 // ============================================================
 // ✅ 主动登录：通过 Emby 兼容的认证端点获取 AccessToken
-// 这是解决"fnysfd 启动后 AuthStore 为空，需手动触发"的关键
 // ============================================================
 
 // LoginViaEmby 通过 Emby 兼容的认证端点主动登录，获取 AccessToken
-// 使用飞牛影视的账号密码（注意：不是飞牛系统的账号）
 func (a *AuthStore) LoginViaEmby(username, password, serverURL string) error {
 	if username == "" || password == "" {
 		return fmt.Errorf("用户名或密码为空")
 	}
 
-	// 构造登录请求体（Emby 标准格式）
 	loginData := map[string]string{
 		"Username": username,
 		"Pw":       password,
@@ -135,10 +135,8 @@ func (a *AuthStore) LoginViaEmby(username, password, serverURL string) error {
 		return fmt.Errorf("构造请求体失败: %w", err)
 	}
 
-	// 构造 Emby 认证头
 	embyAuth := `MediaBrowser Client="fnysfd", Device="fnysfd", DeviceId="fnysfd", Version="3.4.0"`
 
-	// 尝试多个可能的端点（不同版本的飞牛可能路径不同）
 	endpoints := []string{
 		"/emby/Users/AuthenticateByName",
 		"/Users/AuthenticateByName",
@@ -172,7 +170,6 @@ func (a *AuthStore) LoginViaEmby(username, password, serverURL string) error {
 			continue
 		}
 
-		// 解析响应
 		var loginResp struct {
 			User struct {
 				Id   string `json:"Id"`
@@ -186,7 +183,7 @@ func (a *AuthStore) LoginViaEmby(username, password, serverURL string) error {
 		}
 
 		if loginResp.AccessToken == "" || loginResp.User.Id == "" {
-			lastErr = fmt.Errorf("%s 响应缺少 AccessToken 或 User.Id, body=%s", endpoint, string(body))
+			lastErr = fmt.Errorf("%s 响应缺少 AccessToken 或 User.Id", endpoint)
 			continue
 		}
 
@@ -197,6 +194,7 @@ func (a *AuthStore) LoginViaEmby(username, password, serverURL string) error {
 		a.headers.Set("X-Emby-Token", loginResp.AccessToken)
 		a.headers.Set("X-Emby-Authorization", `MediaBrowser Client="fnysfd", Device="fnysfd", DeviceId="fnysfd", Version="3.4.0", Token="`+loginResp.AccessToken+`"`)
 		a.userID = loginResp.User.Id
+		a.loginToken = loginResp.AccessToken  // ✅ 保存主动登录的 Token
 		a.updatedAt = time.Now()
 
 		return nil
@@ -206,7 +204,6 @@ func (a *AuthStore) LoginViaEmby(username, password, serverURL string) error {
 }
 
 // extractUserIDFromPath 从 URL 路径提取 userID
-// 路径格式：/emby/Users/{uid}/Items/...
 func extractUserIDFromPath(path string) string {
 	trimmed := strings.TrimPrefix(path, "/")
 	if strings.HasPrefix(strings.ToLower(trimmed), "emby/") {
