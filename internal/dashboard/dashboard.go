@@ -131,7 +131,8 @@ func (d *Dashboard) Start() error {
 	mux.HandleFunc("/api/logs", d.authMiddleware(d.handleLogs))
 	mux.HandleFunc("/api/scan/trigger", d.authMiddleware(d.csrfMiddleware(d.handleScanTrigger)))
 	mux.HandleFunc("/api/scan/status", d.authMiddleware(d.handleScanStatus))
-
+    mux.HandleFunc("/api/scan/notify", d.handleScanNotify) // ✅ 新增：Webhook 通知端点（不走 session 认证，用 token 认证）
+	
 	mux.HandleFunc("/", d.authMiddleware(d.handleIndex))
 
 	d.server = &http.Server{
@@ -992,4 +993,68 @@ func (d *Dashboard) handleScanStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: d.libraryScanner.GetStatus()})
+}
+
+// handleScanNotify Webhook 端点：接收外部通知触发全库扫描
+//
+// 用途：QMS 完成 strm 生成后，通过 Webhook 通知 fnysfd 立即触发扫描
+// 认证：通过 X-Notify-Token header 或 ?token=xxx 传入预共享密钥
+// 特性：
+//  1. 立即返回 200，扫描在后台异步执行，不阻塞 QMS
+//  2. 延迟 delay_seconds 秒后再触发，给飞牛时间扫到新文件
+//  3. 延迟期间收到新通知会合并（只保留最后一次）
+func (d *Dashboard) handleScanNotify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
+		return
+	}
+
+	// 1. 检查是否配置了 token
+	expectedToken := d.config.GetWebhookNotifyToken()
+	if expectedToken == "" {
+		d.logger.Warn("📚 [Webhook] 未配置 webhook_notify_token，拒绝请求")
+		d.writeJSON(w, http.StatusForbidden, APIResponse{Code: 403, Message: "服务端未配置 webhook_notify_token"})
+		return
+	}
+
+	// 2. 从 header 或 query 取 token
+	token := r.Header.Get("X-Notify-Token")
+	if token == "" {
+		token = r.URL.Query().Get("token")
+	}
+	if token == "" {
+		d.writeJSON(w, http.StatusUnauthorized, APIResponse{Code: 401, Message: "缺少 token"})
+		return
+	}
+
+	// 3. 常量时间比较，防止时序攻击
+	if subtle.ConstantTimeCompare([]byte(token), []byte(expectedToken)) != 1 {
+		d.logger.Warn("📚 [Webhook] token 校验失败，来自 %s", r.RemoteAddr)
+		d.writeJSON(w, http.StatusUnauthorized, APIResponse{Code: 401, Message: "token 无效"})
+		return
+	}
+
+	// 4. 检查扫描器
+	if d.libraryScanner == nil {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 500, Message: "全库扫描器未初始化"})
+		return
+	}
+
+	// 5. 延迟触发扫描（给飞牛时间识别新文件）
+	delaySeconds := d.config.GetWebhookNotifyDelaySeconds()
+	d.logger.Info("📚 [Webhook] 收到通知，%d 秒后触发全库扫描", delaySeconds)
+
+	go func() {
+		time.Sleep(time.Duration(delaySeconds) * time.Second)
+		if err := d.libraryScanner.TriggerScan(); err != nil {
+			d.logger.Warn("📚 [Webhook] 延迟触发失败: %v", err)
+		} else {
+			d.logger.Info("📚 [Webhook] 已触发全库扫描")
+		}
+	}()
+
+	d.writeJSON(w, http.StatusOK, APIResponse{
+		Code:    200,
+		Message: fmt.Sprintf("已接受，%d 秒后触发扫描", delaySeconds),
+	})
 }
