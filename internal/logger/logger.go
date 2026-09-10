@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	maxLogFileSize    = 10 * 1024 * 1024 // 单个日志文件最大10MB
-	maxLogFiles       = 7                 // 最多保留7天日志
+	maxLogFileSize     = 10 * 1024 * 1024 // 单个日志文件最大10MB
+	maxLogFiles        = 7                // 最多保留7天日志
 	logCleanupInterval = 24 * time.Hour   // 每24小时清理一次
 )
 
@@ -31,22 +31,22 @@ const (
 
 // Logger 日志记录器
 type Logger struct {
-	level           atomic.Int32
-	logDir          string
-	consoleLog      bool // 是否输出到控制台
-	fileLog         bool // 是否输出到文件
-	mutex           sync.Mutex
+	level      atomic.Int32
+	logDir     string
+	consoleLog bool // 是否输出到控制台
+	fileLog    bool // 是否输出到文件
+	mutex      sync.Mutex
 
 	fileHandle      *os.File
 	bufWriter       *bufio.Writer
 	currentDate     string
-	currentFileSize int64            // 当前文件大小
+	currentFileSize int64 // 当前文件大小
 	logChan         chan logEntry
 	shutdown        chan struct{}
 	wg              sync.WaitGroup
 
-	closeOnce sync.Once    // 保证 Close 只执行一次（防 close of closed channel panic）
-	closed    atomic.Bool  // 标记是否已关闭，log() 检查后直接 return 避免 drain 后继续入队丢日志
+	closeOnce sync.Once   // 保证 Close 只执行一次（防 close of closed channel panic）
+	closed    atomic.Bool // 标记是否已关闭，log() 检查后直接 return 避免 drain 后继续入队丢日志
 }
 
 type logEntry struct {
@@ -267,9 +267,11 @@ func (l *Logger) writeToFile(entry logEntry) {
 		l.initLogFileLocked()
 	}
 
+	// ✅ 所有级别都立即 Flush，保证日志实时可见
+	// Flush 只是把 Go bufWriter 写入 OS page cache，开销极小；
+	// Sync 才是真正的强制落盘，只对 ERROR/WARN 做。
+	l.bufWriter.Flush()
 	if entry.level == "ERROR" || entry.level == "WARN" {
-		l.bufWriter.Flush()
-		// 关键日志强制 fsync，降低异常退出时丢失风险
 		if l.fileHandle != nil {
 			l.fileHandle.Sync()
 		}
