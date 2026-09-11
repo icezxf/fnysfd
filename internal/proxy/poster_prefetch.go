@@ -16,10 +16,12 @@ import (
 
 // PosterPrefetcher 海报墙预取器
 //
-// 拦截列表 API 响应，提取 ItemID 批量预取 PlaybackInfo。
-// 用户浏览海报墙时，客户端会请求 /emby/Users/{uid}/Items?IncludeItemTypes=Movie，
-// 此时反代拦截响应，提取所有 Movie 的 ItemID，异步批量预取 PlaybackInfo。
-// 用户进入详情页时直链已就绪，点击播放直接命中缓存。
+// 支持两种 API 风格：
+//  1. Emby 兼容 API（爆米花/Vidhub/Infuse 等第三方客户端）
+//  2. FNOS 原生 API（飞牛 Web 客户端 / 飞牛影视客户端）
+//
+// ✅ 方案 A：海报墙只预取 Movie
+//   电视剧交给全库扫描（Webhook 触发时后台跑），避免浏览海报墙时展开大量剧集阻塞
 type PosterPrefetcher struct {
 	server    *Server
 	batch     *BatchPrefetcher
@@ -39,35 +41,38 @@ func NewPosterPrefetcher(s *Server, b *BatchPrefetcher, auth *AuthStore) *Poster
 
 // IsItemListRequest 判断是否是海报墙列表请求
 //
-// 匹配规则：
-//   - GET 方法
-//   - 路径以 /emby/Users/{uid}/Items 结尾（最后一段是 Items）
-//     或 /emby/Users/{uid}/Items/Latest
-//   - query 含 IncludeItemTypes=Movie 或 Series（排除仅含 Episode 的请求）
-//   - 排除路径以 /Items/{guid} 结尾的详情页请求
-//
-// 返回 (userID, ok)
+// 匹配两种风格：
+//  1. Emby: GET /emby/Users/{uid}/Items[/Latest]
+//  2. FNOS 原生: POST /v/api/v1/item/list
 func (p *PosterPrefetcher) IsItemListRequest(req *http.Request) (userID string, ok bool) {
 	if req == nil {
 		return "", false
 	}
+
+	pathLower := strings.ToLower(req.URL.Path)
+
+	// ✅ FNOS 原生 API：POST /v/api/v1/item/list
+	if req.Method == "POST" {
+		trimmed := strings.TrimPrefix(pathLower, "/")
+		if trimmed == "v/api/v1/item/list" {
+			return "", true
+		}
+		return "", false
+	}
+
+	// 原有 Emby 兼容 API：GET
 	if req.Method != "GET" {
 		return "", false
 	}
 
-	// 统一路径：移除 /emby 前缀，转小写，去首尾斜杠
-	path := req.URL.Path
-	pathLower := strings.ToLower(path)
 	pathLower = strings.TrimPrefix(pathLower, "/emby")
 	pathLower = strings.Trim(pathLower, "/")
 
 	parts := strings.Split(pathLower, "/")
-	// 期望最少: users/{uid}/items
 	if len(parts) < 3 {
 		return "", false
 	}
 
-	// 查找 items 段的位置
 	itemsIdx := -1
 	for i, seg := range parts {
 		if seg == "items" {
@@ -79,37 +84,27 @@ func (p *PosterPrefetcher) IsItemListRequest(req *http.Request) (userID string, 
 		return "", false
 	}
 
-	// items 前面必须是 users/{uid}
 	if itemsIdx < 2 || parts[itemsIdx-2] != "users" {
 		return "", false
 	}
 	userID = parts[itemsIdx-1]
-	// UserID 应像 GUID（飞牛的 UserID 是 32 位十六进制）
 	if len(userID) < 16 || !util.IsGUIDLikeLoose(userID) {
 		return "", false
 	}
 
-	// items 后面的段：允许空（/Items 结尾）或 "latest"（/Items/Latest）
-	// 其他情况（如 /Items/{guid} 详情页、/Items/{guid}/Images 子资源）排除
 	remaining := parts[itemsIdx+1:]
 	switch len(remaining) {
 	case 0:
-		// /Items 结尾，是列表请求
 	case 1:
-		// /Items/Latest，也是列表请求
 		if remaining[0] != "latest" {
 			return "", false
 		}
 	default:
-		// /Items/Latest/xxx 或 /Items/{guid}/xxx，排除
 		return "", false
 	}
 
-	// 检查 query 含 IncludeItemTypes=Movie 或 Series
 	types := req.URL.Query().Get("IncludeItemTypes")
 	if types == "" {
-		// ✅ 放宽：如果路径是 /Items/Latest，允许不带 IncludeItemTypes
-		// 飞牛 Web 客户端的 /Items/Latest 通常不带这个参数
 		if len(remaining) == 1 && remaining[0] == "latest" {
 			return userID, true
 		}
@@ -126,7 +121,6 @@ func (p *PosterPrefetcher) IsItemListRequest(req *http.Request) (userID string, 
 			hasSeries = true
 		}
 	}
-	// 必须含 Movie 或 Series（排除仅含 Episode 的请求）
 	if !hasMovie && !hasSeries {
 		return "", false
 	}
@@ -134,22 +128,19 @@ func (p *PosterPrefetcher) IsItemListRequest(req *http.Request) (userID string, 
 	return userID, true
 }
 
-// HandleListResponse 解析列表响应，提取 ItemID，调用 batch.PrefetchBatch
+// HandleListResponse 解析列表响应，提取 Movie 的 ItemID，批量预取
 //
-// 流程：
-//  1. 从 resp.Request 捕获认证信息到 authStore（供全库扫描使用）
-//  2. 检查功能开关
-//  3. 解析 JSON 列表（✅ 兼容飞牛的数组格式和标准 Emby 对象格式）
-//  4. 只取 Type="Movie" 的项目（Series 留给详情页预取链路）
-//  5. 受 GetPosterPrefetchMaxItems 限制
-//  6. ✅ 分块预取（每批 3 个）+ 批次间延迟 1s + 失败重试，避免飞牛 probe 拥堵
+// 支持三种 JSON 格式：
+//  1. Emby 对象: {"Items":[{"Id":"xxx","Type":"Movie"},...]}
+//  2. Emby 数组: [{"Id":"xxx","Type":"Movie"},...]
+//  3. FNOS 原生: {"code":0,"data":{"list":[{"guid":"xxx","type":"Movie"},...]}}
+//
+// ✅ 方案 A：只处理 Movie，Series/TV 跳过（交给全库扫描）
 func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, userID string) {
-	// 1. 捕获认证信息（无论功能是否开启，都需为全库扫描积累认证）
 	if resp != nil && resp.Request != nil {
 		p.authStore.CaptureFromRequest(resp.Request)
 	}
 
-	// 2. 检查功能开关
 	if !config.Global.GetEnablePosterPrefetch() {
 		return
 	}
@@ -159,7 +150,6 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 		return
 	}
 
-	// 处理可能的 gzip 压缩
 	data := body
 	if resp != nil && strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
 		if decompressed := decompressGzipBody(body); decompressed != nil {
@@ -167,69 +157,68 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 		}
 	}
 
-	// ✅ 3. 兼容两种格式解析：
-	//    - 标准 Emby 对象: {"Items": [{"Id":"xxx","Type":"Movie"}, ...]}
-	//    - 飞牛数组:       [{"Id":"xxx","Type":"Movie"}, ...]
-	var rawItems []jsonItem
-
-	var listResp jsonListResponse
-	if err := json.Unmarshal(data, &listResp); err == nil && len(listResp.Items) > 0 {
-		// 标准 Emby 对象格式
-		rawItems = listResp.Items
-	} else {
-		// 尝试数组格式（飞牛某些端点直接返回数组）
-		if err := json.Unmarshal(data, &rawItems); err != nil {
-			p.logger.Warn("🖼️ [海报墙预取] JSON解析失败: %v, bodyLen=%d", err, len(data))
-			return
-		}
-	}
-
+	rawItems, formatName := parseListResponse(data)
 	if len(rawItems) == 0 {
-		p.logger.Debug("🖼️ [海报墙预取] 列表为空，跳过")
+		p.logger.Debug("🖼️ [海报墙预取] 列表为空或格式未知，跳过 (bodyLen=%d)", len(data))
 		return
 	}
 
-	// 4. 只取 Type="Movie" 的项目（Series 留给详情页预取链路）
-	// 5. 受 GetPosterPrefetchMaxItems 限制
+	p.logger.Debug("🖼️ [海报墙预取] 解析到 %d 项 (格式=%s)", len(rawItems), formatName)
+
+	if userID == "" {
+		_, userID, _ = p.authStore.Get()
+	}
+
+	// ✅ 方案 A：只收集 Movie，跳过 Series/TV
 	maxItems := config.Global.GetPosterPrefetchMaxItems()
 	var items []PrefetchItem
+	skippedSeries := 0
+
 	for _, item := range rawItems {
-		if item.Type != "Movie" {
-			continue
-		}
 		if item.Id == "" {
 			continue
 		}
-		items = append(items, PrefetchItem{
-			ItemID: item.Id,
-			UserID: userID,
-			Name:   item.Name,
-			Type:   item.Type,
-		})
+
+		switch item.Type {
+		case "Movie", "Video":
+			items = append(items, PrefetchItem{
+				ItemID: item.Id,
+				UserID: userID,
+				Name:   item.Name,
+				Type:   "Movie",
+			})
+		case "Series":
+			// ✅ 跳过剧集，交给全库扫描处理
+			skippedSeries++
+			continue
+		default:
+			continue
+		}
+
 		if maxItems > 0 && len(items) >= maxItems {
+			p.logger.Debug("🖼️ [海报墙预取] 达到单次上限 %d，停止收集", maxItems)
 			break
 		}
 	}
 
 	if len(items) == 0 {
-		p.logger.Debug("🖼️ [海报墙预取] 无 Movie 类型项目 (列表共 %d 项)", len(rawItems))
+		if skippedSeries > 0 {
+			p.logger.Debug("🖼️ [海报墙预取] 无 Movie 项目，跳过 %d 部剧集（交由全库扫描处理）", skippedSeries)
+		} else {
+			p.logger.Debug("🖼️ [海报墙预取] 无 Movie 类型项目 (列表共 %d 项)", len(rawItems))
+		}
 		return
 	}
 
-	p.logger.Info("🖼️ [海报墙预取] 提取到 %d 部电影（列表共 %d 项），开始批量预取",
-		len(items), len(rawItems))
+	p.logger.Info("🖼️ [海报墙预取] 提取到 %d 部电影（列表共 %d 项，跳过 %d 部剧集），开始批量预取",
+		len(items), len(rawItems), skippedSeries)
 
-	// 6. ✅ 异步执行分块预取（每批 3 个）+ 批次间延迟 + 失败重试
-	// 避免一次性把全部丢给飞牛，probe 互相竞争导致超时
 	authHeaders, _, _ := p.authStore.Get()
 	go func() {
 		const chunkSize = 3
 		totalStats := BatchStats{Total: len(items)}
-
-		// 收集失败项
 		var failedItems []PrefetchItem
 
-		// 第一批：分块预取
 		for i := 0; i < len(items); i += chunkSize {
 			end := i + chunkSize
 			if end > len(items) {
@@ -242,14 +231,12 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 			totalStats.Skipped += stats.Skipped
 			totalStats.Failed += stats.Failed
 
-			// 收集失败项（Failed > 0 说明有超时的）
 			if stats.Failed > 0 {
 				for _, item := range chunk {
 					failedItems = append(failedItems, item)
 				}
 			}
 
-			// 批次之间延迟 1 秒，给飞牛 probe 喘息时间
 			if i+chunkSize < len(items) {
 				time.Sleep(1 * time.Second)
 			}
@@ -258,7 +245,6 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 		p.logger.Info("🖼️ [海报墙预取] 首批完成: 成功=%d 跳过=%d 失败=%d",
 			totalStats.Success, totalStats.Skipped, totalStats.Failed)
 
-		// ✅ 重试失败项（每批 2 个，间隔 2 秒）
 		if len(failedItems) > 0 {
 			p.logger.Info("🖼️ [海报墙预取] 重试 %d 个失败项", len(failedItems))
 
@@ -283,7 +269,6 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 				}
 			}
 
-			// 更新最终统计（重试成功后成功数增加，失败数用重试后的结果）
 			totalStats.Success += retrySuccess
 			totalStats.Skipped += retrySkipped
 			totalStats.Failed = retryFailed
@@ -292,6 +277,56 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 		p.logger.Info("🖼️ [海报墙预取] 最终完成: 成功=%d 跳过=%d 失败=%d",
 			totalStats.Success, totalStats.Skipped, totalStats.Failed)
 	}()
+}
+
+// parseListResponse 尝试解析三种 JSON 格式，返回统一的 []jsonItem
+func parseListResponse(data []byte) ([]jsonItem, string) {
+	// 格式 1：Emby 对象 {"Items": [...]}
+	var embyObj jsonListResponse
+	if err := json.Unmarshal(data, &embyObj); err == nil && len(embyObj.Items) > 0 {
+		return embyObj.Items, "emby-object"
+	}
+
+	// 格式 2：Emby 数组 [{"Id":...,"Name":...,"Type":...}]
+	var embyArr []jsonItem
+	if err := json.Unmarshal(data, &embyArr); err == nil && len(embyArr) > 0 {
+		return embyArr, "emby-array"
+	}
+
+	// 格式 3：FNOS 原生 {"code":0,"data":{"list":[...]}}
+	var fnosResp struct {
+		Code int `json:"code"`
+		Data struct {
+			List []struct {
+				GUID  string `json:"guid"`
+				Title string `json:"title"`
+				Type  string `json:"type"`
+			} `json:"list"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &fnosResp); err == nil && len(fnosResp.Data.List) > 0 {
+		items := make([]jsonItem, 0, len(fnosResp.Data.List))
+		for _, it := range fnosResp.Data.List {
+			if it.GUID == "" {
+				continue
+			}
+			normalizedType := it.Type
+			switch it.Type {
+			case "TV":
+				normalizedType = "Series"
+			case "Video":
+				normalizedType = "Movie"
+			}
+			items = append(items, jsonItem{
+				Id:   it.GUID,
+				Name: it.Title,
+				Type: normalizedType,
+			})
+		}
+		return items, "fnos-native"
+	}
+
+	return nil, "unknown"
 }
 
 // decompressGzipBody 解压 gzip 压缩的响应体
