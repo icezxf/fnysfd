@@ -489,7 +489,7 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 }
 
 // ============================================================
-// ✅ queryItems：支持电影 + 电视剧（Series 自动展开到 Episode）
+// ✅ queryItems：支持电影 + 电视剧 + 其他（Video/Episode）
 // ============================================================
 func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHeaders http.Header, parentID string, startIndex, limit int) ([]PrefetchItem, int, error) {
 	_ = startIndex
@@ -559,6 +559,19 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 			}
 			result = append(result, episodes...)
 			ls.logger.Debug("📚 [全库扫描] 剧集 %s 展开为 %d 集", item.Name, len(episodes))
+
+		case "Video", "Episode":
+			// ✅ 单个视频/单集：直接加入预取列表（"其他"分类里的视频文件、B站视频等）
+			result = append(result, PrefetchItem{
+				ItemID: item.Id,
+				UserID: userID,
+				Name:   item.Name,
+				Type:   item.Type,
+			})
+
+		default:
+			// 其他未识别类型，跳过并打日志方便排查
+			ls.logger.Debug("📚 [全库扫描] 跳过未识别类型: %s (%s)", item.Name, item.Type)
 		}
 	}
 	return result, listResp.TotalRecordCount, nil
