@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"fnysfd/internal/config"
 	"fnysfd/internal/logger"
 	"fnysfd/internal/util"
@@ -20,21 +21,18 @@ import (
 // 支持两种 API 风格：
 //  1. Emby 兼容 API（爆米花/Vidhub/Infuse）→ 精确预取
 //  2. FNOS 原生 API（飞牛 Web/客户端）→ 触发单库扫描
-//
-// FNOS guid ≠ Emby ItemId（已实测验证），所以 FNOS 请求走"触发单库扫描"路径。
 type PosterPrefetcher struct {
 	server    *Server
 	batch     *BatchPrefetcher
 	logger    *logger.Logger
 	authStore *AuthStore
 
-	// ✅ 媒体库映射缓存（FNOS guid → Emby libId）
+	// 媒体库映射缓存
 	mu       sync.RWMutex
-	fnosLibs map[string]string // FNOS guid → FNOS title
-	embyLibs map[string]string // Emby name → Emby libId
+	fnosLibs map[string]string // FNOS guid → title
+	embyLibs map[string]string // Emby name → libId
 }
 
-// NewPosterPrefetcher 创建海报墙预取器
 func NewPosterPrefetcher(s *Server, b *BatchPrefetcher, auth *AuthStore) *PosterPrefetcher {
 	return &PosterPrefetcher{
 		server:    s,
@@ -47,10 +45,10 @@ func NewPosterPrefetcher(s *Server, b *BatchPrefetcher, auth *AuthStore) *Poster
 }
 
 // ============================================================
-// 媒体库列表缓存（供 FNOS guid → Emby libId 映射）
+// 媒体库列表缓存
 // ============================================================
 
-// CacheEmbyLibraries 缓存 Emby 媒体库列表（拦截 /emby/Users/{uid}/Views 响应）
+// CacheEmbyLibraries 拦截 /emby/Users/{uid}/Views 响应时调用
 func (p *PosterPrefetcher) CacheEmbyLibraries(body []byte) {
 	var resp struct {
 		Items []struct {
@@ -65,15 +63,14 @@ func (p *PosterPrefetcher) CacheEmbyLibraries(body []byte) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, item := range resp.Items {
-		if item.Id == "" || item.Name == "" {
-			continue
+		if item.Id != "" && item.Name != "" {
+			p.embyLibs[item.Name] = item.Id
 		}
-		p.embyLibs[item.Name] = item.Id
 	}
 	p.logger.Debug("🖼️ [海报墙预取] 缓存 Emby 媒体库: %d 个", len(p.embyLibs))
 }
 
-// CacheFnosLibraries 缓存 FNOS 媒体库列表（拦截 /v/api/v1/mediadb/list 响应）
+// CacheFnosLibraries 拦截 /v/api/v1/mediadb/list 响应时调用
 func (p *PosterPrefetcher) CacheFnosLibraries(body []byte) {
 	var resp struct {
 		Code int `json:"code"`
@@ -89,15 +86,14 @@ func (p *PosterPrefetcher) CacheFnosLibraries(body []byte) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, item := range resp.Data {
-		if item.GUID == "" || item.Title == "" {
-			continue
+		if item.GUID != "" && item.Title != "" {
+			p.fnosLibs[item.GUID] = item.Title
 		}
-		p.fnosLibs[item.GUID] = item.Title
 	}
 	p.logger.Debug("🖼️ [海报墙预取] 缓存 FNOS 媒体库: %d 个", len(p.fnosLibs))
 }
 
-// mapFnosToEmby 通过媒体库名称匹配，把 FNOS guid 映射到 Emby libId
+// mapFnosToEmby 通过名称匹配 FNOS guid → Emby libId
 func (p *PosterPrefetcher) mapFnosToEmby(fnosGUID string) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -109,14 +105,13 @@ func (p *PosterPrefetcher) mapFnosToEmby(fnosGUID string) string {
 }
 
 // ============================================================
-// FNOS 原生请求处理（供 server.go Director 调用）
+// FNOS 原生请求处理
 // ============================================================
 
 // HandleFnosListRequest 处理 FNOS 原生海报墙请求
 //
-// 从请求体拿 ancestor_guid（FNOS 媒体库 ID），映射到 Emby libId，
-// 触发单库扫描。映射不到则 fallback 全库扫描。
-// 30 秒去重避免飞牛客户端快速翻页触发多次。
+// 策略：拿到 ancestor_guid → 映射到 Emby libId → 触发单库扫描
+// 映射不到 → 主动刷新一次映射表再试，仍失败则跳过
 func (p *PosterPrefetcher) HandleFnosListRequest(reqBody []byte) {
 	if !config.Global.GetEnablePosterPrefetch() {
 		return
@@ -134,23 +129,22 @@ func (p *PosterPrefetcher) HandleFnosListRequest(reqBody []byte) {
 
 	embyLibID := p.mapFnosToEmby(req.AncestorGUID)
 
+	// 映射不到：主动刷新一次映射表
 	if embyLibID == "" {
-		// 映射不到 → fallback 全库扫描
-		if p.server.shouldSkipPrefetch("fnos-poster-trigger", 30, "FNOS海报墙触发") {
-			return
+		p.logger.Debug("🖼️ [海报墙预取] FNOS 媒体库 %s 未映射，尝试刷新映射表", req.AncestorGUID)
+		if p.refreshMapping() {
+			embyLibID = p.mapFnosToEmby(req.AncestorGUID)
 		}
-		p.logger.Debug("🖼️ [海报墙预取] FNOS 媒体库 %s 未映射，fallback 全库扫描", req.AncestorGUID)
-		if p.server.libraryScanner != nil {
-			go func() {
-				_ = p.server.libraryScanner.TriggerScan()
-			}()
-		}
+	}
+
+	if embyLibID == "" {
+		p.logger.Debug("🖼️ [海报墙预取] FNOS 媒体库 %s 仍未映射，跳过", req.AncestorGUID)
 		return
 	}
 
-	// 单库扫描，30 秒去重
+	// 120 秒去重
 	key := "fnos-poster-trigger:" + embyLibID
-	if p.server.shouldSkipPrefetch(key, 30, "FNOS海报墙触发") {
+	if p.server.shouldSkipPrefetch(key, 120, "FNOS海报墙触发") {
 		return
 	}
 
@@ -164,13 +158,139 @@ func (p *PosterPrefetcher) HandleFnosListRequest(reqBody []byte) {
 	}
 }
 
+// refreshMapping 主动刷新媒体库映射表
+func (p *PosterPrefetcher) refreshMapping() bool {
+	authHeaders, userID, expired := p.authStore.Get()
+	if expired || authHeaders == nil || userID == "" {
+		p.logger.Debug("🖼️ [海报墙预取] 刷新映射失败：认证未就绪")
+		return false
+	}
+
+	fnosLibs, err := p.fetchFnosLibraries(authHeaders)
+	if err != nil {
+		p.logger.Debug("🖼️ [海报墙预取] 拉取 FNOS 媒体库失败: %v", err)
+		return false
+	}
+
+	embyLibs, err := p.fetchEmbyLibraries(authHeaders, userID)
+	if err != nil {
+		p.logger.Debug("🖼️ [海报墙预取] 拉取 Emby 媒体库失败: %v", err)
+		return false
+	}
+
+	p.mu.Lock()
+	p.fnosLibs = fnosLibs
+	p.embyLibs = embyLibs
+	p.mu.Unlock()
+
+	p.logger.Info("🖼️ [海报墙预取] 映射表已刷新: FNOS %d 个, Emby %d 个",
+		len(fnosLibs), len(embyLibs))
+
+	return len(fnosLibs) > 0 && len(embyLibs) > 0
+}
+
+// fetchFnosLibraries 拉取 FNOS 原生媒体库列表
+func (p *PosterPrefetcher) fetchFnosLibraries(authHeaders http.Header) (map[string]string, error) {
+	p.server.proxyMu.RLock()
+	targetURL := p.server.targetURL
+	p.server.proxyMu.RUnlock()
+
+	req, err := http.NewRequestWithContext(context.Background(), "GET",
+		targetURL.Scheme+"://"+targetURL.Host+"/v/api/v1/mediadb/list", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = authHeaders.Clone()
+	req.Host = targetURL.Host
+
+	resp, err := p.server.retryClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status=%d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
+	if err != nil {
+		return nil, err
+	}
+
+	var fnosResp struct {
+		Code int `json:"code"`
+		Data []struct {
+			GUID  string `json:"guid"`
+			Title string `json:"title"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &fnosResp); err != nil {
+		return nil, err
+	}
+
+	libs := make(map[string]string, len(fnosResp.Data))
+	for _, item := range fnosResp.Data {
+		if item.GUID != "" && item.Title != "" {
+			libs[item.GUID] = item.Title
+		}
+	}
+	return libs, nil
+}
+
+// fetchEmbyLibraries 拉取 Emby 兼容媒体库列表
+func (p *PosterPrefetcher) fetchEmbyLibraries(authHeaders http.Header, userID string) (map[string]string, error) {
+	p.server.proxyMu.RLock()
+	targetURL := p.server.targetURL
+	p.server.proxyMu.RUnlock()
+
+	req, err := http.NewRequestWithContext(context.Background(), "GET",
+		targetURL.Scheme+"://"+targetURL.Host+"/emby/Users/"+userID+"/Views", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = authHeaders.Clone()
+	req.Host = targetURL.Host
+
+	resp, err := p.server.retryClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status=%d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
+	if err != nil {
+		return nil, err
+	}
+
+	var embyResp struct {
+		Items []struct {
+			Id   string `json:"Id"`
+			Name string `json:"Name"`
+		} `json:"Items"`
+	}
+	if err := json.Unmarshal(body, &embyResp); err != nil {
+		return nil, err
+	}
+
+	libs := make(map[string]string, len(embyResp.Items))
+	for _, item := range embyResp.Items {
+		if item.Id != "" && item.Name != "" {
+			libs[item.Name] = item.Id
+		}
+	}
+	return libs, nil
+}
+
 // ============================================================
 // Emby 兼容 API 处理（爆米花/Vidhub/Infuse）
 // ============================================================
 
 // IsItemListRequest 判断是否是 Emby 兼容 API 的海报墙列表请求
-//
-// 注意：只认 Emby 风格（FNOS 原生请求由 server.go Director 直接拦截）
 func (p *PosterPrefetcher) IsItemListRequest(req *http.Request) (string, bool) {
 	if req == nil || req.Method != "GET" {
 		return "", false
@@ -236,11 +356,10 @@ func (p *PosterPrefetcher) IsItemListRequest(req *http.Request) (string, bool) {
 	if !hasMovie && !hasSeries {
 		return "", false
 	}
-
 	return userID, true
 }
 
-// HandleListResponse 处理 Emby 兼容 API 的海报墙响应
+// HandleListResponse 处理 Emby 兼容 API 响应
 func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, userID string) {
 	if resp != nil && resp.Request != nil {
 		p.authStore.CaptureFromRequest(resp.Request)
@@ -249,7 +368,6 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 	if !config.Global.GetEnablePosterPrefetch() {
 		return
 	}
-
 	if len(body) == 0 {
 		return
 	}
@@ -265,7 +383,6 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 	if len(rawItems) == 0 {
 		return
 	}
-
 	p.logger.Debug("🖼️ [海报墙预取] 解析到 %d 项 (格式=%s)", len(rawItems), formatName)
 
 	if userID == "" {
@@ -310,7 +427,6 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 	go p.runBatchPrefetch(items, authHeaders)
 }
 
-// runBatchPrefetch 分块预取 + 失败重试
 func (p *PosterPrefetcher) runBatchPrefetch(items []PrefetchItem, authHeaders http.Header) {
 	const chunkSize = 3
 	totalStats := BatchStats{Total: len(items)}
@@ -333,7 +449,6 @@ func (p *PosterPrefetcher) runBatchPrefetch(items []PrefetchItem, authHeaders ht
 				failedItems = append(failedItems, item)
 			}
 		}
-
 		if i+chunkSize < len(items) {
 			time.Sleep(1 * time.Second)
 		}
@@ -368,7 +483,6 @@ func (p *PosterPrefetcher) runBatchPrefetch(items []PrefetchItem, authHeaders ht
 		totalStats.Success, totalStats.Skipped, totalStats.Failed)
 }
 
-// parseListResponse 解析 Emby 两种 JSON 格式
 func parseListResponse(data []byte) ([]jsonItem, string) {
 	var embyObj jsonListResponse
 	if err := json.Unmarshal(data, &embyObj); err == nil && len(embyObj.Items) > 0 {
