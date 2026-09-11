@@ -1,3 +1,4 @@
+
 package proxy
 
 import (
@@ -109,48 +110,42 @@ func (p *PosterPrefetcher) mapFnosToEmby(fnosGUID string) string {
 
 // HandleFnosListRequest 处理 FNOS 原生海报墙请求
 //
-// 策略：拿到 ancestor_guid → 映射到 Emby libId → 触发单库扫描
-// 映射不到 → 主动刷新一次映射表再试，仍失败则跳过
+// ✅ 终极修复：既然 FNOS 的 API 需要复杂签名，我们直接放弃映射！
+// 飞牛客户端请求海报墙时，必然属于某个库，我们直接触发所有 Emby 库的扫描。
 func (p *PosterPrefetcher) HandleFnosListRequest(reqBody []byte) {
 	if !config.Global.GetEnablePosterPrefetch() {
 		return
 	}
-	var req struct {
-		AncestorGUID string `json:"ancestor_guid"`
-	}
-	if err := json.Unmarshal(reqBody, &req); err != nil {
-		return
-	}
-	if req.AncestorGUID == "" {
-		return
-	}
 
-	embyLibID := p.mapFnosToEmby(req.AncestorGUID)
-
-	// 映射不到：主动刷新一次映射表
-	if embyLibID == "" {
-		p.logger.Debug("🖼️ [海报墙预取] FNOS 媒体库 %s 未映射，尝试刷新映射表", req.AncestorGUID)
-		if p.refreshMapping() {
-			embyLibID = p.mapFnosToEmby(req.AncestorGUID)
-		}
-	}
-
-	if embyLibID == "" {
-		p.logger.Debug("🖼️ [海报墙预取] FNOS 媒体库 %s 仍未映射，跳过", req.AncestorGUID)
-		return
-	}
-
-	// 120 秒去重
-	key := "fnos-poster-trigger:" + embyLibID
+	// 120 秒全局去重，避免飞牛客户端频繁请求导致重复扫描
+	key := "fnos-poster-trigger-global"
 	if p.server.shouldSkipPrefetch(key, 120, "FNOS海报墙触发") {
 		return
 	}
 
-	p.logger.Info("🖼️ [海报墙预取] FNOS 媒体库 %s → Emby %s，触发单库扫描", req.AncestorGUID, embyLibID)
+	p.logger.Info("🖼️ [海报墙预取] 捕获 FNOS 海报墙请求，跳过 FNOS 映射，直接触发 Emby 全库预取")
+
+	// 直接从缓存中获取所有 Emby 媒体库
+	p.mu.RLock()
+	embyLibs := make(map[string]string, len(p.embyLibs))
+	for k, v := range p.embyLibs {
+		embyLibs[k] = v
+	}
+	p.mu.RUnlock()
+
+	if len(embyLibs) == 0 {
+		p.logger.Warn("🖼️ [海报墙预取] Emby 媒体库缓存为空，无法触发预取")
+		return
+	}
+
+	// 遍历所有 Emby 库，触发扫描
 	if p.server.libraryScanner != nil {
-		go func() {
-			_ = p.server.libraryScanner.ScanLibraryOnce(context.Background(), embyLibID)
-		}()
+		for name, libID := range embyLibs {
+			p.logger.Info("🖼️ [海报墙预取] 触发 Emby 库扫描: %s (%s)", name, libID)
+			go func(id string) {
+				_ = p.server.libraryScanner.ScanLibraryOnce(context.Background(), id)
+			}(libID)
+		}
 	}
 }
 
