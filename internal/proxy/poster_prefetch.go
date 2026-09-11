@@ -6,25 +6,26 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"fnysfd/internal/config"
-	"fnysfd/internal/logger"
-	"fnysfd/internal/util"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"fnysfd/internal/config"
+	"fnysfd/internal/logger"
+	"fnysfd/internal/util"
 )
 
 // PosterPrefetcher 海报墙预取器
 //
 // 支持两种 API 风格：
-//  1. Emby 兼容 API（爆米花/Vidhub/Infuse）→ 精确预取
-//  2. FNOS 原生 API（飞牛 Web/客户端）→ 触发单库扫描
+// 1. Emby 兼容 API（爆米花/Vidhub/Infuse）→ 精确预取
+// 2. FNOS 原生 API（飞牛 Web/客户端）→ 触发单库扫描
 type PosterPrefetcher struct {
-	server    *Server
-	batch     *BatchPrefetcher
-	logger    *logger.Logger
+	server *Server
+	batch  *BatchPrefetcher
+	logger *logger.Logger
 	authStore *AuthStore
 
 	// 媒体库映射缓存
@@ -59,7 +60,6 @@ func (p *PosterPrefetcher) CacheEmbyLibraries(body []byte) {
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return
 	}
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, item := range resp.Items {
@@ -82,7 +82,6 @@ func (p *PosterPrefetcher) CacheFnosLibraries(body []byte) {
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return
 	}
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, item := range resp.Data {
@@ -116,7 +115,6 @@ func (p *PosterPrefetcher) HandleFnosListRequest(reqBody []byte) {
 	if !config.Global.GetEnablePosterPrefetch() {
 		return
 	}
-
 	var req struct {
 		AncestorGUID string `json:"ancestor_guid"`
 	}
@@ -148,9 +146,7 @@ func (p *PosterPrefetcher) HandleFnosListRequest(reqBody []byte) {
 		return
 	}
 
-	p.logger.Info("🖼️ [海报墙预取] FNOS 媒体库 %s → Emby %s，触发单库扫描",
-		req.AncestorGUID, embyLibID)
-
+	p.logger.Info("🖼️ [海报墙预取] FNOS 媒体库 %s → Emby %s，触发单库扫描", req.AncestorGUID, embyLibID)
 	if p.server.libraryScanner != nil {
 		go func() {
 			_ = p.server.libraryScanner.ScanLibraryOnce(context.Background(), embyLibID)
@@ -183,9 +179,7 @@ func (p *PosterPrefetcher) refreshMapping() bool {
 	p.embyLibs = embyLibs
 	p.mu.Unlock()
 
-	p.logger.Info("🖼️ [海报墙预取] 映射表已刷新: FNOS %d 个, Emby %d 个",
-		len(fnosLibs), len(embyLibs))
-
+	p.logger.Info("🖼️ [海报墙预取] 映射表已刷新: FNOS %d 个, Emby %d 个", len(fnosLibs), len(embyLibs))
 	return len(fnosLibs) > 0 && len(embyLibs) > 0
 }
 
@@ -195,12 +189,13 @@ func (p *PosterPrefetcher) fetchFnosLibraries(authHeaders http.Header) (map[stri
 	targetURL := p.server.targetURL
 	p.server.proxyMu.RUnlock()
 
-	req, err := http.NewRequestWithContext(context.Background(), "GET",
-		targetURL.Scheme+"://"+targetURL.Host+"/v/api/v1/mediadb/list", nil)
+	req, err := http.NewRequestWithContext(context.Background(), "GET", targetURL.Scheme+"://"+targetURL.Host+"/v/api/v1/mediadb/list", nil)
 	if err != nil {
 		return nil, err
 	}
+
 	req.Header = authHeaders.Clone()
+	// ✅ 关键修改：手动设置 Host 头，确保 FNOS 服务器能正确识别请求
 	req.Host = targetURL.Host
 
 	resp, err := p.server.retryClient.Do(req)
@@ -244,11 +239,11 @@ func (p *PosterPrefetcher) fetchEmbyLibraries(authHeaders http.Header, userID st
 	targetURL := p.server.targetURL
 	p.server.proxyMu.RUnlock()
 
-	req, err := http.NewRequestWithContext(context.Background(), "GET",
-		targetURL.Scheme+"://"+targetURL.Host+"/emby/Users/"+userID+"/Views", nil)
+	req, err := http.NewRequestWithContext(context.Background(), "GET", targetURL.Scheme+"://"+targetURL.Host+"/emby/Users/"+userID+"/Views", nil)
 	if err != nil {
 		return nil, err
 	}
+
 	req.Header = authHeaders.Clone()
 	req.Host = targetURL.Host
 
@@ -295,16 +290,13 @@ func (p *PosterPrefetcher) IsItemListRequest(req *http.Request) (string, bool) {
 	if req == nil || req.Method != "GET" {
 		return "", false
 	}
-
 	pathLower := strings.ToLower(req.URL.Path)
 	pathLower = strings.TrimPrefix(pathLower, "/emby")
 	pathLower = strings.Trim(pathLower, "/")
-
 	parts := strings.Split(pathLower, "/")
 	if len(parts) < 3 {
 		return "", false
 	}
-
 	itemsIdx := -1
 	for i, seg := range parts {
 		if seg == "items" {
@@ -315,7 +307,6 @@ func (p *PosterPrefetcher) IsItemListRequest(req *http.Request) (string, bool) {
 	if itemsIdx < 0 {
 		return "", false
 	}
-
 	if itemsIdx < 2 || parts[itemsIdx-2] != "users" {
 		return "", false
 	}
@@ -323,7 +314,6 @@ func (p *PosterPrefetcher) IsItemListRequest(req *http.Request) (string, bool) {
 	if len(userID) < 16 || !util.IsGUIDLikeLoose(userID) {
 		return "", false
 	}
-
 	remaining := parts[itemsIdx+1:]
 	switch len(remaining) {
 	case 0:
@@ -334,7 +324,6 @@ func (p *PosterPrefetcher) IsItemListRequest(req *http.Request) (string, bool) {
 	default:
 		return "", false
 	}
-
 	types := req.URL.Query().Get("IncludeItemTypes")
 	if types == "" {
 		if len(remaining) == 1 && remaining[0] == "latest" {
@@ -342,7 +331,6 @@ func (p *PosterPrefetcher) IsItemListRequest(req *http.Request) (string, bool) {
 		}
 		return "", false
 	}
-
 	hasMovie := false
 	hasSeries := false
 	for _, t := range strings.Split(types, ",") {
@@ -364,7 +352,6 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 	if resp != nil && resp.Request != nil {
 		p.authStore.CaptureFromRequest(resp.Request)
 	}
-
 	if !config.Global.GetEnablePosterPrefetch() {
 		return
 	}
@@ -383,6 +370,7 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 	if len(rawItems) == 0 {
 		return
 	}
+
 	p.logger.Debug("🖼️ [海报墙预取] 解析到 %d 项 (格式=%s)", len(rawItems), formatName)
 
 	if userID == "" {
@@ -392,7 +380,6 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 	maxItems := config.Global.GetPosterPrefetchMaxItems()
 	var items []PrefetchItem
 	skippedSeries := 0
-
 	for _, item := range rawItems {
 		if item.Id == "" {
 			continue
@@ -415,13 +402,10 @@ func (p *PosterPrefetcher) HandleListResponse(resp *http.Response, body []byte, 
 			break
 		}
 	}
-
 	if len(items) == 0 {
 		return
 	}
-
-	p.logger.Info("🖼️ [海报墙预取] 提取到 %d 部电影（列表 %d 项，跳过 %d 剧集），开始预取",
-		len(items), len(rawItems), skippedSeries)
+	p.logger.Info("🖼️ [海报墙预取] 提取到 %d 部电影（列表 %d 项，跳过 %d 剧集），开始预取", len(items), len(rawItems), skippedSeries)
 
 	authHeaders, _, _ := p.authStore.Get()
 	go p.runBatchPrefetch(items, authHeaders)
@@ -438,12 +422,10 @@ func (p *PosterPrefetcher) runBatchPrefetch(items []PrefetchItem, authHeaders ht
 			end = len(items)
 		}
 		chunk := items[i:end]
-
 		stats := p.batch.PrefetchBatch(context.Background(), chunk, authHeaders, "poster", 600, "海报墙预取")
 		totalStats.Success += stats.Success
 		totalStats.Skipped += stats.Skipped
 		totalStats.Failed += stats.Failed
-
 		if stats.Failed > 0 {
 			for _, item := range chunk {
 				failedItems = append(failedItems, item)
@@ -454,8 +436,7 @@ func (p *PosterPrefetcher) runBatchPrefetch(items []PrefetchItem, authHeaders ht
 		}
 	}
 
-	p.logger.Info("🖼️ [海报墙预取] 首批完成: 成功=%d 跳过=%d 失败=%d",
-		totalStats.Success, totalStats.Skipped, totalStats.Failed)
+	p.logger.Info("🖼️ [海报墙预取] 首批完成: 成功=%d 跳过=%d 失败=%d", totalStats.Success, totalStats.Skipped, totalStats.Failed)
 
 	if len(failedItems) > 0 {
 		p.logger.Info("🖼️ [海报墙预取] 重试 %d 个失败项", len(failedItems))
@@ -479,8 +460,7 @@ func (p *PosterPrefetcher) runBatchPrefetch(items []PrefetchItem, authHeaders ht
 		totalStats.Failed = retryFailed
 	}
 
-	p.logger.Info("🖼️ [海报墙预取] 最终完成: 成功=%d 跳过=%d 失败=%d",
-		totalStats.Success, totalStats.Skipped, totalStats.Failed)
+	p.logger.Info("🖼️ [海报墙预取] 最终完成: 成功=%d 跳过=%d 失败=%d", totalStats.Success, totalStats.Skipped, totalStats.Failed)
 }
 
 func parseListResponse(data []byte) ([]jsonItem, string) {
