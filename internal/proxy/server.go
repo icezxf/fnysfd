@@ -1,3 +1,4 @@
+
 package proxy
 
 import (
@@ -222,7 +223,7 @@ func (s *Server) setupProxy(targetURL *url.URL) {
 		}
 
 		// ✅ 拦截 FNOS 原生海报墙请求，触发单库扫描
-		if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/v/api/v1/mediadb/list") {
+		if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/v/api/v1/item/list") {
 			body, err := io.ReadAll(req.Body)
 			if err == nil && len(body) > 0 {
 				req.Body.Close()
@@ -336,7 +337,7 @@ func (s *Server) Reload() {
 			}
 
 			// ✅ FNOS 海报墙拦截（Reload 后同样生效）
-			if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/v/api/v1/mediadb/list") {
+			if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/v/api/v1/item/list") {
 				body, err := io.ReadAll(req.Body)
 				if err == nil && len(body) > 0 {
 					req.Body.Close()
