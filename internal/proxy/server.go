@@ -216,10 +216,25 @@ func (s *Server) setupProxy(targetURL *url.URL) {
 			return
 		}
 
-		// 兜底：点击播放时的主动预请求
+		// 兜底：点击播放时（PlaybackInfo 请求）的主动预请求
 		if s.isPlaybackInfoRequest(req) && req.Method == "GET" {
 			go s.proactivePlaybackInfo(req)
 		}
+
+		// ✅ 拦截 FNOS 原生海报墙请求，触发单库扫描
+		if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/v/api/v1/item/list") {
+			body, err := io.ReadAll(req.Body)
+			if err == nil && len(body) > 0 {
+				req.Body.Close()
+				req.Body = io.NopCloser(bytes.NewReader(body))
+				req.ContentLength = int64(len(body))
+				req.Header.Set("Content-Length", strconv.Itoa(len(body)))
+				if s.posterPrefetch != nil {
+					go s.posterPrefetch.HandleFnosListRequest(body)
+				}
+			}
+		}
+	}		
 
 		// ✅ 拦截 FNOS 原生海报墙请求，触发单库扫描
 		if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/v/api/v1/item/list") {
