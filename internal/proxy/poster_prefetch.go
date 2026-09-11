@@ -23,9 +23,9 @@ import (
 // 1. Emby 兼容 API（爆米花/Vidhub/Infuse）→ 精确预取
 // 2. FNOS 原生 API（飞牛 Web/客户端）→ 触发单库扫描
 type PosterPrefetcher struct {
-	server *Server
-	batch  *BatchPrefetcher
-	logger *logger.Logger
+	server    *Server
+	batch     *BatchPrefetcher
+	logger    *logger.Logger
 	authStore *AuthStore
 
 	// 媒体库映射缓存
@@ -161,6 +161,10 @@ func (p *PosterPrefetcher) refreshMapping() bool {
 		p.logger.Debug("🖼️ [海报墙预取] 刷新映射失败：认证未就绪")
 		return false
 	}
+
+	// ✅ 核心修复：不管刚才飞牛客户端发了什么乱七八糟的 Token，
+	// 这里强制洗回全库扫描用的那个长效 Token！
+	authHeaders = p.forceUseLoginToken(authHeaders)
 
 	fnosLibs, err := p.fetchFnosLibraries(authHeaders)
 	if err != nil {
@@ -486,4 +490,30 @@ func decompressGzipBody(body []byte) []byte {
 		return nil
 	}
 	return decompressed
+}
+
+// ============================================================
+// ✅ 新增：强制洗白 Token 方法
+// ============================================================
+
+// forceUseLoginToken 强制使用主动登录的长效 Token
+// 如果 AuthStore 中存有主动登录的 Token，则用它覆盖当前的请求头
+func (p *PosterPrefetcher) forceUseLoginToken(headers http.Header) http.Header {
+	// 1. 先通过 Get() 拿到 AuthStore 里的信息
+	currentHeaders, _, expired := p.authStore.Get()
+	if expired || currentHeaders == nil {
+		return headers // 如果当前已过期，直接返回原 headers
+	}
+
+	// 2. 检查 AuthStore 里是否带有主动登录的 Token 特征
+	// 因为主动登录的 Token 会被自动拼接到 X-Emby-Authorization 中
+	if auth := currentHeaders.Get("X-Emby-Authorization"); auth != "" {
+		// 如果包含 Token=，说明 AuthStore 里有长效 Token
+		// 我们直接把这个长效的 Authorization 强制塞进当前的 headers 里
+		headers.Set("X-Emby-Authorization", auth)
+		if token := currentHeaders.Get("X-Emby-Token"); token != "" {
+			headers.Set("X-Emby-Token", token)
+		}
+	}
+	return headers
 }
