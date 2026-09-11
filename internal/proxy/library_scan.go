@@ -692,3 +692,77 @@ func (ls *LibraryScanner) querySeasonEpisodes(ctx context.Context, userID string
 	}
 	return episodes, nil
 }
+
+// ============================================================
+// ✅ ScanLibraryOnce：只扫描指定媒体库（用于海报墙预取触发）
+//
+// 与 scanOnce（全库）的区别：
+//   - 只查询一个媒体库的 Items
+//   - 复用 queryItems（含 Movie/TV/Video 处理）
+//   - 复用 PrefetchBatch（含去重、缓存跳过）
+//   - 无失败重试（海报墙是尽力而为，不做重试）
+// ============================================================
+func (ls *LibraryScanner) ScanLibraryOnce(ctx context.Context, libID string) error {
+	if !ls.running.CompareAndSwap(false, true) {
+		return fmt.Errorf("已有扫描在进行中")
+	}
+	defer ls.running.Store(false)
+
+	startTime := time.Now()
+
+	userID, authHeaders, ok := ls.waitForAuth(ctx)
+	if !ok {
+		return fmt.Errorf("认证未就绪")
+	}
+
+	ls.logger.Info("📚 [单库扫描] 开始 (库=%s)", libID)
+
+	items, total, err := ls.queryItems(ctx, userID, authHeaders, libID, 0, 500)
+	if err != nil {
+		return fmt.Errorf("查询项目失败: %w", err)
+	}
+
+	ls.logger.Info("📚 [单库扫描] 获取到 %d 个项目 (total=%d)", len(items), total)
+
+	if len(items) == 0 {
+		ls.logger.Info("📚 [单库扫描] 完成: 无项目")
+		return nil
+	}
+
+	var allStats BatchStats
+	var pending []PrefetchItem
+
+	for _, item := range items {
+		pending = append(pending, item)
+		if len(pending) >= batchFlushSize {
+			stats := ls.batch.PrefetchBatch(ctx, pending, authHeaders, "library_single", 3600, "单库扫描")
+			allStats.Total += stats.Total
+			allStats.Success += stats.Success
+			allStats.Skipped += stats.Skipped
+			allStats.Failed += stats.Failed
+			pending = pending[:0]
+
+			select {
+			case <-time.After(800 * time.Millisecond):
+			case <-ls.stopCh:
+				return nil
+			case <-ctx.Done():
+				return nil
+			}
+		}
+	}
+
+	// 处理剩余
+	if len(pending) > 0 {
+		stats := ls.batch.PrefetchBatch(ctx, pending, authHeaders, "library_single", 3600, "单库扫描")
+		allStats.Total += stats.Total
+		allStats.Success += stats.Success
+		allStats.Skipped += stats.Skipped
+		allStats.Failed += stats.Failed
+	}
+
+	ls.logger.Info("📚 [单库扫描] 完成: 总计=%d 成功=%d 跳过=%d 失败=%d 耗时=%v",
+		allStats.Total, allStats.Success, allStats.Skipped, allStats.Failed, time.Since(startTime))
+
+	return nil
+}
