@@ -19,25 +19,21 @@ import (
 
 // ========== 辅助结构体 ==========
 
-// libraryInfo 媒体库信息
 type libraryInfo struct {
 	ID   string
 	Name string
 }
 
-// seasonInfo 季信息
 type seasonInfo struct {
 	ID   string
 	Name string
 }
 
-// jsonListResponse Emby 列表 API 通用响应结构
 type jsonListResponse struct {
 	Items            []jsonItem `json:"Items"`
 	TotalRecordCount int        `json:"TotalRecordCount"`
 }
 
-// jsonItem Emby Item 通用结构
 type jsonItem struct {
 	Id   string `json:"Id"`
 	Name string `json:"Name"`
@@ -204,8 +200,6 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 	var allStats BatchStats
 	totalItems := 0
 	var pending []PrefetchItem
-
-	// ✅ 失败的 item 收集起来，一轮扫完后重试
 	var failedItems []PrefetchItem
 
 	flushBatch := func() {
@@ -218,7 +212,6 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 		allStats.Skipped += stats.Skipped
 		allStats.Failed += stats.Failed
 
-		// ✅ 收集失败项
 		if stats.Failed > 0 {
 			for _, item := range pending {
 				failedItems = append(failedItems, item)
@@ -229,7 +222,6 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 		pending = pending[:0]
 		ls.checkMemoryAndYield(ctx)
 
-		// ✅ 批次之间强制延迟，给飞牛 probe 喘息时间
 		select {
 		case <-time.After(800 * time.Millisecond):
 		case <-ls.stopCh:
@@ -237,7 +229,6 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 		}
 	}
 
-	// ✅ 重试所有失败项
 	retryFailed := func() {
 		if len(failedItems) == 0 {
 			return
@@ -275,7 +266,6 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 
 	finishScan := func(reason string) {
 		flushBatch()
-		// ✅ 先重试失败项，再统计最终结果
 		retryFailed()
 		ls.lastScanTime = time.Now()
 		ls.lastScanStats = allStats
@@ -366,9 +356,7 @@ func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 	}
 }
 
-// ============================================================
-// ✅ doRequest：支持从 X-Emby-Authorization 解析 Token
-// ============================================================
+// doRequest：支持从 X-Emby-Authorization 解析 Token
 func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header, path string) (*http.Response, error) {
 	ls.server.proxyMu.RLock()
 	targetURL := ls.server.targetURL
@@ -381,25 +369,20 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 		return nil, err
 	}
 
-	// 克隆认证头
 	if authHeaders != nil {
 		req.Header = authHeaders.Clone()
 	}
 
-	// ✅ 提取 Token 的辅助函数（支持 4 种格式）
 	extractToken := func(h http.Header) string {
 		if h == nil {
 			return ""
 		}
-		// 格式1: Authorization: Bearer xxx
 		if auth := h.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 			return strings.TrimPrefix(auth, "Bearer ")
 		}
-		// 格式2: X-Emby-Token: xxx
 		if token := h.Get("X-Emby-Token"); token != "" {
 			return token
 		}
-		// 格式3: X-Emby-Authorization: MediaBrowser Client="...", Token="xxx"
 		if embyAuth := h.Get("X-Emby-Authorization"); embyAuth != "" {
 			if idx := strings.Index(embyAuth, `Token="`); idx >= 0 {
 				rest := embyAuth[idx+7:]
@@ -408,7 +391,6 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 				}
 			}
 		}
-		// 格式4: Authorization: xxx（无 Bearer 前缀，飞牛原生格式）
 		if auth := h.Get("Authorization"); auth != "" {
 			return auth
 		}
@@ -421,7 +403,6 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 		token = extractToken(storedHeaders)
 	}
 
-	// 补全 Emby 客户端头
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
 
@@ -442,13 +423,11 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 	return ls.server.retryClient.Do(req)
 }
 
-// getUserID 获取缓存的 UserID
 func (ls *LibraryScanner) getUserID() string {
 	_, userID, _ := ls.authStore.Get()
 	return userID
 }
 
-// minInt 辅助函数
 func minInt(a, b int) int {
 	if a < b {
 		return a
@@ -456,9 +435,7 @@ func minInt(a, b int) int {
 	return b
 }
 
-// ============================================================
-// queryViews：查询媒体库列表
-// ============================================================
+// queryViews 查询媒体库列表
 func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHeaders http.Header) ([]libraryInfo, error) {
 	path := "/emby/Users/" + userID + "/Views"
 
@@ -478,7 +455,6 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 		return nil, fmt.Errorf("读取响应体失败: %w", err)
 	}
 
-	// 先尝试解析为标准 Emby 对象格式
 	var listResp jsonListResponse
 	if err := json.Unmarshal(body, &listResp); err == nil && len(listResp.Items) > 0 {
 		libraries := make([]libraryInfo, 0, len(listResp.Items))
@@ -494,7 +470,6 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 		return libraries, nil
 	}
 
-	// 再尝试解析为数组
 	var items []jsonItem
 	if err := json.Unmarshal(body, &items); err != nil {
 		return nil, fmt.Errorf("JSON解析失败: %w, body=%s", err, string(body))
@@ -514,11 +489,10 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 }
 
 // ============================================================
-// ✅ queryItems：使用已验证成功的参数组合
-//    ParentId + Fields=Path,MediaSources + Limit
+// ✅ queryItems：支持电影 + 电视剧（Series 自动展开到 Episode）
 // ============================================================
 func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHeaders http.Header, parentID string, startIndex, limit int) ([]PrefetchItem, int, error) {
-	_ = startIndex // 不使用（StartIndex 会导致返回空）
+	_ = startIndex
 
 	if limit <= 0 {
 		limit = 500
@@ -557,31 +531,50 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 		if item.Id == "" {
 			continue
 		}
-		// 只处理 Movie 类型（Series 暂不展开）
-		if item.Type != "Movie" {
-			continue
+
+		switch item.Type {
+		case "Movie":
+			// 电影直接加入预取列表
+			result = append(result, PrefetchItem{
+				ItemID: item.Id,
+				UserID: userID,
+				Name:   item.Name,
+				Type:   item.Type,
+			})
+
+		case "Series":
+			// ✅ 剧集：展开到 Episode
+			select {
+			case <-ls.stopCh:
+				return result, listResp.TotalRecordCount, nil
+			case <-ctx.Done():
+				return result, listResp.TotalRecordCount, nil
+			default:
+			}
+
+			episodes, err := ls.querySeriesEpisodes(ctx, userID, authHeaders, item.Id, item.Name)
+			if err != nil {
+				ls.logger.Warn("📚 [全库扫描] 展开剧集失败: %s err=%v", item.Name, err)
+				continue
+			}
+			result = append(result, episodes...)
+			ls.logger.Debug("📚 [全库扫描] 剧集 %s 展开为 %d 集", item.Name, len(episodes))
 		}
-		result = append(result, PrefetchItem{
-			ItemID: item.Id,
-			UserID: userID,
-			Name:   item.Name,
-			Type:   item.Type,
-		})
 	}
 	return result, listResp.TotalRecordCount, nil
 }
 
 // ============================================================
-// querySeasons / queryEpisodes（暂未使用，保留代码）
+// ✅ querySeriesEpisodes：把整部剧展开为所有季的所有集
+//    流程：Series → Seasons → 每季查 Episodes
 // ============================================================
-
-// querySeasons 查询季列表
-func (ls *LibraryScanner) querySeasons(ctx context.Context, userID string, authHeaders http.Header, seriesID string) ([]seasonInfo, error) {
+func (ls *LibraryScanner) querySeriesEpisodes(ctx context.Context, userID string, authHeaders http.Header, seriesID string, seriesName string) ([]PrefetchItem, error) {
+	// 1. 查季列表
 	path := "/emby/Shows/" + seriesID + "/Seasons"
 
 	resp, err := ls.doRequest(ctx, authHeaders, path)
 	if err != nil {
-		return nil, fmt.Errorf("请求失败: %w", err)
+		return nil, fmt.Errorf("查询季列表请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -591,34 +584,66 @@ func (ls *LibraryScanner) querySeasons(ctx context.Context, userID string, authH
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
 	if err != nil {
-		return nil, fmt.Errorf("读取响应体失败: %w", err)
+		return nil, fmt.Errorf("读取季列表失败: %w", err)
 	}
 
-	var listResp jsonListResponse
-	if err := json.Unmarshal(body, &listResp); err != nil {
-		return nil, fmt.Errorf("JSON解析失败: %w", err)
+	var seasonsResp jsonListResponse
+	if err := json.Unmarshal(body, &seasonsResp); err != nil {
+		return nil, fmt.Errorf("解析季列表失败: %w", err)
 	}
 
-	seasons := make([]seasonInfo, 0, len(listResp.Items))
-	for _, item := range listResp.Items {
-		if item.Id == "" {
+	if len(seasonsResp.Items) == 0 {
+		ls.logger.Debug("📚 [全库扫描] 剧集 %s 无季", seriesName)
+		return nil, nil
+	}
+
+	// 2. 遍历每季，查该季所有 Episode
+	var allEpisodes []PrefetchItem
+	for _, season := range seasonsResp.Items {
+		if season.Id == "" {
 			continue
 		}
-		seasons = append(seasons, seasonInfo{
-			ID:   item.Id,
-			Name: item.Name,
-		})
+
+		select {
+		case <-ls.stopCh:
+			return allEpisodes, nil
+		case <-ctx.Done():
+			return allEpisodes, nil
+		default:
+		}
+
+		episodes, err := ls.querySeasonEpisodes(ctx, userID, authHeaders, seriesID, season.Id)
+		if err != nil {
+			ls.logger.Warn("📚 [全库扫描] 查询季 %s 的集失败: %v", season.Name, err)
+			continue
+		}
+		allEpisodes = append(allEpisodes, episodes...)
+
+		// 每季之间小延迟，避免请求过密
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-ls.stopCh:
+			return allEpisodes, nil
+		case <-ctx.Done():
+			return allEpisodes, nil
+		}
 	}
-	return seasons, nil
+
+	return allEpisodes, nil
 }
 
-// queryEpisodes 查询集列表
-func (ls *LibraryScanner) queryEpisodes(ctx context.Context, userID string, authHeaders http.Header, seriesID, seasonID string) ([]PrefetchItem, error) {
+// ============================================================
+// ✅ querySeasonEpisodes：查询某一季下所有集
+//    端点：/emby/Shows/{seriesId}/Episodes?SeasonId={seasonId}
+//    （已通过 curl 测试验证飞牛支持）
+// ============================================================
+func (ls *LibraryScanner) querySeasonEpisodes(ctx context.Context, userID string, authHeaders http.Header, seriesID, seasonID string) ([]PrefetchItem, error) {
 	query := url.Values{}
-	query.Set("ParentId", seasonID)
+	query.Set("SeasonId", seasonID)
 	query.Set("Fields", "Path,MediaSources")
 	query.Set("Limit", "500")
-	path := "/emby/Users/" + userID + "/Items?" + query.Encode()
+
+	path := "/emby/Shows/" + seriesID + "/Episodes?" + query.Encode()
 
 	resp, err := ls.doRequest(ctx, authHeaders, path)
 	if err != nil {
@@ -649,7 +674,7 @@ func (ls *LibraryScanner) queryEpisodes(ctx context.Context, userID string, auth
 			ItemID: item.Id,
 			UserID: userID,
 			Name:   item.Name,
-			Type:   item.Type,
+			Type:   item.Type, // "Episode"
 		})
 	}
 	return episodes, nil
