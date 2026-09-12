@@ -452,6 +452,11 @@ body.sidebar-open .sidebar-overlay{display:block}
 <div class="hint">每部电视剧预取前 N 集（建议 3-10，避免预取过多占用资源）</div>
 </div>
 <div class="form-item">
+<label>增量扫描间隔（分钟）</label>
+<input type="number" id="cfgLibraryScanIncrementalMinutes" min="1" max="1440" placeholder="5">
+<div class="hint">每 N 分钟拉一次每个库的"最新 200 项"，只预取飞牛未 probe 的项（1-1440，建议 5-30）。修改后需重启生效。</div>
+</div>
+<div class="form-item">
 <label>手动扫描</label>
 <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
 <button class="btn btn-primary" id="triggerScanBtn">立即扫描</button>
@@ -705,6 +710,7 @@ $('cfgLibraryScanOnStart').checked = data.library_scan_on_start === true;
 $('cfgLibraryScanConcurrency').value = data.library_scan_concurrency || 2;
 $('cfgLibraryScanIntervalMs').value = data.library_scan_interval_ms != null ? data.library_scan_interval_ms : 500;
 $('cfgLibraryScanEpisodeCount').value = data.library_scan_episode_count || 5;
+$('cfgLibraryScanIncrementalMinutes').value = data.library_scan_incremental_minutes || 5;
 // 扫描状态
 loadScanStatus();
 });
@@ -741,7 +747,8 @@ library_scan_cron:$('cfgLibraryScanCron').value.trim(),
 library_scan_on_start:$('cfgLibraryScanOnStart').checked,
 library_scan_concurrency:parseInt($('cfgLibraryScanConcurrency').value.trim(),10)||2,
 library_scan_interval_ms:parseInt($('cfgLibraryScanIntervalMs').value.trim(),10)||500,
-library_scan_episode_count:parseInt($('cfgLibraryScanEpisodeCount').value.trim(),10)||5
+library_scan_episode_count:parseInt($('cfgLibraryScanEpisodeCount').value.trim(),10)||5,
+library_scan_incremental_minutes:parseInt($('cfgLibraryScanIncrementalMinutes').value.trim(),10)||5
 };
 // 仅当用户输入了非占位符的新密码时才提交
 if(pass&&pass!==''&&pass!=='****'){data.dashboard_pass=pass}
