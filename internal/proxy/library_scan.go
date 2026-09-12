@@ -79,8 +79,10 @@ func (item jsonItem) alreadyProbed() bool {
 const maxScanItems = 10000
 const batchFlushSize = 3
 const memSafetyThresholdMB = 400
-const incrementalInterval = 5 * time.Minute
 const incrementalLimit = 200
+
+// ✅ 删除：const incrementalInterval = 5 * time.Minute
+//    改为从 config.Global.GetLibraryScanIncrementalMinutes() 读取
 
 // LibraryScanner 全库扫描预取器
 type LibraryScanner struct {
@@ -144,12 +146,16 @@ func (ls *LibraryScanner) Start() {
 		}()
 	}
 
+	// ✅ 增量扫描间隔从配置读取（面板可配 + 热重载）
+	intervalMinutes := config.Global.GetLibraryScanIncrementalMinutes()
+	interval := time.Duration(intervalMinutes) * time.Minute
+
 	ls.wg.Add(1)
 	go func() {
 		defer ls.wg.Done()
-		ls.incrementalScheduler(incrementalInterval)
+		ls.incrementalScheduler(interval)
 	}()
-	ls.logger.Info("📚 [增量扫描] 定时任务已启动: 每 %v 一次 (Limit=%d)", incrementalInterval, incrementalLimit)
+	ls.logger.Info("📚 [增量扫描] 定时任务已启动: 每 %v 一次 (Limit=%d)", interval, incrementalLimit)
 }
 
 // Stop 停止扫描并等待所有 goroutine 退出
@@ -492,9 +498,13 @@ func (ls *LibraryScanner) IsRunning() bool {
 }
 
 func (ls *LibraryScanner) GetStatus() map[string]interface{} {
+	// ✅ 实时读取配置的增量间隔
+	intervalMinutes := config.Global.GetLibraryScanIncrementalMinutes()
+
 	status := map[string]interface{}{
 		"running":             ls.running.Load(),
-		"incrementalInterval": incrementalInterval.String(),
+		"incrementalInterval": (time.Duration(intervalMinutes) * time.Minute).String(),
+		"incrementalMinutes":  intervalMinutes,
 		"incrementalLimit":    incrementalLimit,
 		"lastScanStats": map[string]interface{}{
 			"total":     ls.lastScanStats.Total,
