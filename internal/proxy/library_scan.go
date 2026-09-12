@@ -411,7 +411,7 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 		embyAuth := `MediaBrowser UserId="` + userID + `", Client="Emby Web", Device="Chrome", DeviceId="fnysfd-scanner", Version="4.7.0.0", Token="` + token + `"`
 		req.Header.Set("X-Emby-Authorization", embyAuth)
 		req.Header.Set("X-Emby-Token", token)
-		ls.logger.Debug("📤 [Emby请求] 已设置认证头 (Token: %s...)", token[:minInt(8, len(token))])
+		ls.logger.Debug("📤 [Emby请求] 已设置认证头 (Token: %s)", token)
 	} else {
 		ls.logger.Warn("⚠️ [Emby请求] 未找到 Token")
 	}
