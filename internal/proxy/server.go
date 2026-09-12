@@ -41,6 +41,7 @@ type Server struct {
 	httpServer      *http.Server
 	stopOnce        sync.Once
 	retryClient     *http.Client
+	prefetchClient  *http.Client // ✅ 新增：批量预取专用（长超时）
 	targetURL       *url.URL
 	prefetchRecent  map[string]int64
 	prefetchMu      sync.Mutex
@@ -78,7 +79,7 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 
-	// 主动重试客户端
+	// 主动重试客户端（实时路径用：详情页/主动预请求/MediaSource兜底）
 	retryTransport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second,
@@ -99,6 +100,29 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		Transport: retryTransport,
 	}
 
+	// ✅ 批量预取专用客户端（长超时）
+	// 飞牛"实时 probe 未探测的媒体"需要几十秒（向网盘请求 + 生成响应），
+	// 用独立的 90s/120s 超时 client，避免影响其他实时路径（stream/detail）
+	prefetchTransport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          20,
+		MaxIdleConnsPerHost:   5,
+		MaxConnsPerHost:       10,
+		IdleConnTimeout:       120 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 90 * time.Second, // 关键：等飞牛慢慢 probe
+		DisableKeepAlives:     false,
+		ForceAttemptHTTP2:     true,
+	}
+	prefetchClient := &http.Client{
+		Timeout:   120 * time.Second, // 整个请求最长 120s
+		Transport: prefetchTransport,
+	}
+
 	// ✅ 服务级 context
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 
@@ -111,6 +135,7 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		proxy:           proxy,
 		currentTarget:   cfg.GetTargetAddr(),
 		retryClient:     retryClient,
+		prefetchClient:  prefetchClient, // ✅ 新增
 		targetURL:       targetURL,
 		prefetchRecent:  make(map[string]int64),
 		version:         version,
