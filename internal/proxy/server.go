@@ -401,22 +401,22 @@ func (s *Server) handleResponse(resp *http.Response) error {
 	}
 
 	// 海报墙列表响应拦截：提取 ItemID 批量预取 Movie PlaybackInfo
-	if s.posterPrefetch != nil && resp.StatusCode == http.StatusOK {
-		if userID, ok := s.posterPrefetch.IsItemListRequest(resp.Request); ok {
-			body, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
-			if err != nil {
-				s.logger.Warn("🖼️ [海报墙预取] 读取响应体失败: %v", err)
-				return err
-			}
-			resp.Body.Close()
-			resp.Body = io.NopCloser(bytes.NewBuffer(body))
-			resp.ContentLength = int64(len(body))
-			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
-			resp.Header.Del("Transfer-Encoding")
-			go s.posterPrefetch.HandleListResponse(resp, body, userID)
-			return nil
-		}
-	}
+//	if s.posterPrefetch != nil && resp.StatusCode == http.StatusOK {
+//		if userID, ok := s.posterPrefetch.IsItemListRequest(resp.Request); ok {
+//			body, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
+//			if err != nil {
+//				s.logger.Warn("🖼️ [海报墙预取] 读取响应体失败: %v", err)
+//				return err
+//			}
+//			resp.Body.Close()
+//			resp.Body = io.NopCloser(bytes.NewBuffer(body))
+//			resp.ContentLength = int64(len(body))
+//			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+//			resp.Header.Del("Transfer-Encoding")
+//			go s.posterPrefetch.HandleListResponse(resp, body, userID)
+//			return nil
+//		}
+//	}
 
 	if !s.isPlaybackInfoRequest(resp.Request) {
 		return nil
