@@ -62,8 +62,8 @@ type jsonItem struct {
 // alreadyProbed 判断飞牛是否已真正 probe
 //
 // 判断依据：MediaStreams 中任意一条流的 Codec 非空。
-// - 未 probe：飞牛只识别了文件，MediaStreams 里 Codec=""
-// - 已 probe：飞牛完成 ffprobe，MediaStreams 里有具体编码（h264/aac 等）
+//   - 未 probe：飞牛只识别了文件，MediaStreams 里 Codec=""
+//   - 已 probe：飞牛完成 ffprobe，MediaStreams 里有具体编码（h264/aac 等）
 func (item jsonItem) alreadyProbed() bool {
 	for _, ms := range item.MediaSources {
 		for _, s := range ms.MediaStreams {
@@ -101,6 +101,7 @@ type LibraryScanner struct {
 	lastGCTime atomic.Int64
 }
 
+// NewLibraryScanner 创建全库扫描器
 func NewLibraryScanner(s *Server, b *BatchPrefetcher, auth *AuthStore) *LibraryScanner {
 	return &LibraryScanner{
 		server:    s,
@@ -115,6 +116,7 @@ func NewLibraryScanner(s *Server, b *BatchPrefetcher, auth *AuthStore) *LibraryS
 // 启动 / 停止
 // ============================================================
 
+// Start 启动定时扫描
 func (ls *LibraryScanner) Start() {
 	if !config.Global.GetEnableLibraryScan() {
 		ls.logger.Info("📚 [全库扫描] 功能未开启，跳过启动")
@@ -150,6 +152,7 @@ func (ls *LibraryScanner) Start() {
 	ls.logger.Info("📚 [增量扫描] 定时任务已启动: 每 %v 一次 (Limit=%d)", incrementalInterval, incrementalLimit)
 }
 
+// Stop 停止扫描并等待所有 goroutine 退出
 func (ls *LibraryScanner) Stop() {
 	ls.stopOnce.Do(func() {
 		close(ls.stopCh)
@@ -232,7 +235,9 @@ func (ls *LibraryScanner) scanIncremental(ctx context.Context) {
 	defer ls.running.Store(false)
 
 	startTime := time.Now()
+	ls.logger.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	ls.logger.Info("📚 [增量扫描] 开始")
+	ls.logger.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 	userID, authHeaders, ok := ls.waitForAuth(ctx)
 	if !ok {
@@ -254,6 +259,7 @@ func (ls *LibraryScanner) scanIncremental(ctx context.Context) {
 
 	var allStats BatchStats
 	totalFetched := 0
+	totalSkippedCached := 0
 	totalSkippedProbed := 0
 	totalCandidates := 0
 	libCount := 0
@@ -268,6 +274,9 @@ func (ls *LibraryScanner) scanIncremental(ctx context.Context) {
 		default:
 		}
 
+		ls.logger.Info("────────────────────────────────────────")
+		ls.logger.Info("📂 [增量扫描] 处理媒体库: %s (ID=%s)", lib.Name, lib.ID)
+
 		items, err := ls.queryLatestItems(ctx, userID, authHeaders, lib.ID, incrementalLimit)
 		if err != nil {
 			ls.logger.Warn("📚 [增量扫描] 库 %s 拉最新项失败: %v", lib.Name, err)
@@ -277,48 +286,56 @@ func (ls *LibraryScanner) scanIncremental(ctx context.Context) {
 		totalFetched += len(items)
 
 		if len(items) == 0 {
-			ls.logger.Debug("📚 [增量扫描] 库 %s 无最新项", lib.Name)
+			ls.logger.Info("📂 [增量扫描] 库 %s: 无最新项", lib.Name)
 			continue
 		}
 
-		// ===== 过滤：缓存命中 + 飞牛已 probe =====
+		ls.logger.Info("📂 [增量扫描] 库 %s: 拉到 %d 项，开始逐项判断", lib.Name, len(items))
+
+		// ===== 逐项判断：缓存命中 + 飞牛是否已 probe =====
 		var candidates []PrefetchItem
+		skippedCached := 0
 		skippedProbed := 0
-		for _, item := range items {
+
+		for i, item := range items {
 			// 第一层：我们自己缓存命中
+			cacheHit := false
 			if source, found := ls.server.cache.GetByItemID(item.ItemID); found {
 				if _, urlFound := ls.server.cache.GetStreamURL(source.ID); urlFound {
-					continue
+					cacheHit = true
 				}
 			}
 
-			// 第二层：飞牛已 probe（Codec 非空）→ 跳过
-			if item.AlreadyProbed {
+			switch {
+			case cacheHit:
+				skippedCached++
+				ls.logger.Info("   [%2d/%d] %s (%s) | 缓存=命中 | 判断=跳过(已缓存)",
+					i+1, len(items), item.Name, item.Type)
+			case item.AlreadyProbed:
 				skippedProbed++
-				ls.logger.Debug("⏭️ [增量扫描] 飞牛已 probe，跳过: %s (%s)", item.Name, item.Type)
-				continue
+				ls.logger.Info("   [%2d/%d] %s (%s) | 缓存=miss | probe=已probe | 判断=跳过(飞牛已探测)",
+					i+1, len(items), item.Name, item.Type)
+			default:
+				candidates = append(candidates, item)
+				ls.logger.Info("   [%2d/%d] %s (%s) | 缓存=miss | probe=未probe | 判断=加入预取 ✅",
+					i+1, len(items), item.Name, item.Type)
 			}
-
-			candidates = append(candidates, item)
 		}
+
+		totalSkippedCached += skippedCached
 		totalSkippedProbed += skippedProbed
 
-		if len(candidates) == 0 {
-			ls.logger.Info("📚 [增量扫描] 库 %s: 拉到 %d 项，待预取 0 项（已 probe %d）",
-				lib.Name, len(items), skippedProbed)
-			continue
-		}
+		ls.logger.Info("📂 [增量扫描] 库 %s 判断完成: 待预取=%d 缓存命中=%d 已probe跳过=%d",
+			lib.Name, len(candidates), skippedCached, skippedProbed)
 
-		// ===== 打印待预取清单 =====
-		ls.logger.Info("📚 [增量扫描] 库 %s: 拉到 %d 项，待预取 %d 项（已 probe 跳过 %d）",
-			lib.Name, len(items), len(candidates), skippedProbed)
-		for _, c := range candidates {
-			ls.logger.Info("     └─ %s (%s)", c.Name, c.Type)
+		if len(candidates) == 0 {
+			continue
 		}
 
 		totalCandidates += len(candidates)
 
 		// ===== 逐个并发预取 =====
+		ls.logger.Info("🚀 [增量扫描] 库 %s 开始预取 %d 项...", lib.Name, len(candidates))
 		var wg sync.WaitGroup
 		var mu sync.Mutex
 		for _, c := range candidates {
@@ -336,16 +353,16 @@ func (ls *LibraryScanner) scanIncremental(ctx context.Context) {
 				switch {
 				case hit:
 					allStats.Skipped++
-					ls.logger.Debug("⏭️ [增量扫描] 缓存命中: %s", c.Name)
+					ls.logger.Info("   ⏭️ 预取结果: %s (%s) → 缓存命中(过程中被其他请求预取)", c.Name, c.Type)
 				case deduped:
 					allStats.Deduped++
-					ls.logger.Debug("⏭️ [增量扫描] 去重跳过: %s", c.Name)
+					ls.logger.Info("   ⏭️ 预取结果: %s (%s) → 去重跳过(TTL内已请求)", c.Name, c.Type)
 				case prefetched:
 					allStats.Success++
-					ls.logger.Info("✅ [增量扫描] 已预取: %s (%s)", c.Name, c.Type)
+					ls.logger.Info("   ✅ 预取结果: %s (%s) → 成功", c.Name, c.Type)
 				default:
 					allStats.Failed++
-					ls.logger.Warn("⚠️ [增量扫描] 预取失败: %s (%s)", c.Name, c.Type)
+					ls.logger.Warn("   ⚠️ 预取结果: %s (%s) → 失败", c.Name, c.Type)
 				}
 				mu.Unlock()
 			}()
@@ -365,17 +382,20 @@ func (ls *LibraryScanner) scanIncremental(ctx context.Context) {
 	ls.lastIncScanTime = time.Now()
 	ls.lastIncScanStats = allStats
 
-	if totalCandidates == 0 {
-		ls.logger.Info("📚 [增量扫描] 完成: 无新项 (库=%d 拉到=%d 已probe=%d 耗时=%v)",
-			libCount, totalFetched, totalSkippedProbed, elapsed)
-	} else {
-		ls.logger.Info("📚 [增量扫描] 完成: 库=%d 拉到=%d 待预取=%d 成功=%d 跳过=%d 去重=%d 失败=%d 耗时=%v",
-			libCount, totalFetched, totalCandidates,
-			allStats.Success, allStats.Skipped, allStats.Deduped, allStats.Failed, elapsed)
-	}
+	ls.logger.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	ls.logger.Info("📚 [增量扫描] 完成")
+	ls.logger.Info("   库数: %d | 拉到: %d 项", libCount, totalFetched)
+	ls.logger.Info("   判断: 缓存命中跳过=%d, 已probe跳过=%d, 待预取=%d",
+		totalSkippedCached, totalSkippedProbed, totalCandidates)
+	ls.logger.Info("   预取: 成功=%d, 跳过=%d, 去重=%d, 失败=%d",
+		allStats.Success, allStats.Skipped, allStats.Deduped, allStats.Failed)
+	ls.logger.Info("   耗时: %v", elapsed)
+	ls.logger.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 }
 
-// queryLatestItems 拉某个库的最新 N 项
+// queryLatestItems 拉某个库的最新 N 项（用 Items/Latest 端点）
+//
+// 飞牛的 Items/Latest 返回裸数组（不是 {Items:[]}），已 curl 验证。
 func (ls *LibraryScanner) queryLatestItems(ctx context.Context, userID string, authHeaders http.Header, parentID string, limit int) ([]PrefetchItem, error) {
 	if limit <= 0 {
 		limit = incrementalLimit
@@ -427,7 +447,7 @@ func (ls *LibraryScanner) expandItems(ctx context.Context, userID string, authHe
 				UserID:        userID,
 				Name:          item.Name,
 				Type:          item.Type,
-				AlreadyProbed: item.alreadyProbed(), // ✅
+				AlreadyProbed: item.alreadyProbed(),
 			})
 		case "Series":
 			select {
@@ -516,8 +536,10 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 }
 
 func (ls *LibraryScanner) scanOnceLocked(ctx context.Context) {
-	ls.logger.Info("📚 [全库扫描] 开始")
 	startTime := time.Now()
+	ls.logger.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	ls.logger.Info("📚 [全库扫描] 开始")
+	ls.logger.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 	userID, authHeaders, ok := ls.waitForAuth(ctx)
 	if !ok {
@@ -539,7 +561,8 @@ func (ls *LibraryScanner) scanOnceLocked(ctx context.Context) {
 
 	var allStats BatchStats
 	totalItems := 0
-	skippedProbed := 0
+	totalSkippedCached := 0
+	totalSkippedProbed := 0
 	var pending []PrefetchItem
 	var failedItems []PrefetchItem
 
@@ -559,7 +582,6 @@ func (ls *LibraryScanner) scanOnceLocked(ctx context.Context) {
 			for _, item := range pending {
 				failedItems = append(failedItems, item)
 			}
-			ls.logger.Debug("📚 [全库扫描] 本批 %d 个，失败 %d 个，加入重试队列", len(pending), stats.Failed)
 		}
 
 		pending = pending[:0]
@@ -616,13 +638,21 @@ func (ls *LibraryScanner) scanOnceLocked(ctx context.Context) {
 		retryFailed()
 		ls.lastScanTime = time.Now()
 		ls.lastScanStats = allStats
-		label := "完成"
+
+		ls.logger.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 		if reason != "" {
-			label = "结束(" + reason + ")"
+			ls.logger.Info("📚 [全库扫描] 结束 (%s)", reason)
+		} else {
+			ls.logger.Info("📚 [全库扫描] 完成")
 		}
-		ls.logger.Info("📚 [全库扫描] %s: 总计=%d 已probe跳过=%d 成功=%d 跳过=%d 去重=%d 失败=%d 取消=%d 耗时=%v",
-			label, allStats.Total, skippedProbed, allStats.Success, allStats.Skipped,
-			allStats.Deduped, allStats.Failed, allStats.Cancelled, time.Since(startTime))
+		ls.logger.Info("   遍历项数: %d", totalItems)
+		ls.logger.Info("   判断: 缓存命中跳过=%d, 已probe跳过=%d",
+			totalSkippedCached, totalSkippedProbed)
+		ls.logger.Info("   预取: 总计=%d 成功=%d 跳过=%d 去重=%d 失败=%d 取消=%d",
+			allStats.Total, allStats.Success, allStats.Skipped,
+			allStats.Deduped, allStats.Failed, allStats.Cancelled)
+		ls.logger.Info("   耗时: %v", time.Since(startTime))
+		ls.logger.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	}
 
 	for _, lib := range libraries {
@@ -634,16 +664,19 @@ func (ls *LibraryScanner) scanOnceLocked(ctx context.Context) {
 		default:
 		}
 
-		ls.logger.Info("📚 [全库扫描] 扫描媒体库: %s (ID=%s)", lib.Name, lib.ID)
+		ls.logger.Info("────────────────────────────────────────")
+		ls.logger.Info("📂 [全库扫描] 处理媒体库: %s (ID=%s)", lib.Name, lib.ID)
 
 		items, total, err := ls.queryAllItems(ctx, userID, authHeaders, lib.ID)
 		if err != nil {
 			ls.logger.Warn("📚 [全库扫描] 查询项目失败: 库=%s err=%v", lib.Name, err)
 			continue
 		}
-		ls.logger.Info("📚 [全库扫描] 库 %s 获取到 %d 个项目 (total=%d)", lib.Name, len(items), total)
+		ls.logger.Info("📂 [全库扫描] 库 %s: 获取到 %d 个项目 (total=%d)，开始逐项判断",
+			lib.Name, len(items), total)
 
-		for _, item := range items {
+		libCached, libProbed, libPending := 0, 0, 0
+		for i, item := range items {
 			totalItems++
 			if totalItems > maxScanItems {
 				ls.logger.Warn("📚 [全库扫描] 达到安全阀上限 %d，停止扫描", maxScanItems)
@@ -651,18 +684,38 @@ func (ls *LibraryScanner) scanOnceLocked(ctx context.Context) {
 				return
 			}
 
-			// ✅ 飞牛已 probe → 跳过
-			if item.AlreadyProbed {
-				skippedProbed++
-				ls.logger.Debug("⏭️ [全库扫描] 飞牛已 probe，跳过: %s (%s)", item.Name, item.Type)
-				continue
+			// 第一层：缓存命中
+			cacheHit := false
+			if source, found := ls.server.cache.GetByItemID(item.ItemID); found {
+				if _, urlFound := ls.server.cache.GetStreamURL(source.ID); urlFound {
+					cacheHit = true
+				}
 			}
 
-			pending = append(pending, item)
-			if len(pending) >= batchFlushSize {
-				flushBatch()
+			switch {
+			case cacheHit:
+				totalSkippedCached++
+				libCached++
+				ls.logger.Info("   [%3d/%d] %s (%s) | 缓存=命中 | 判断=跳过(已缓存)",
+					i+1, len(items), item.Name, item.Type)
+			case item.AlreadyProbed:
+				totalSkippedProbed++
+				libProbed++
+				ls.logger.Info("   [%3d/%d] %s (%s) | 缓存=miss | probe=已probe | 判断=跳过(飞牛已探测)",
+					i+1, len(items), item.Name, item.Type)
+			default:
+				libPending++
+				ls.logger.Info("   [%3d/%d] %s (%s) | 缓存=miss | probe=未probe | 判断=加入预取 ✅",
+					i+1, len(items), item.Name, item.Type)
+				pending = append(pending, item)
+				if len(pending) >= batchFlushSize {
+					flushBatch()
+				}
 			}
 		}
+
+		ls.logger.Info("📂 [全库扫描] 库 %s 判断完成: 待预取=%d 缓存命中=%d 已probe跳过=%d",
+			lib.Name, libPending, libCached, libProbed)
 	}
 
 	finishScan("")
@@ -990,7 +1043,7 @@ func (ls *LibraryScanner) querySeasonEpisodes(ctx context.Context, userID string
 			UserID:        userID,
 			Name:          item.Name,
 			Type:          item.Type,
-			AlreadyProbed: item.alreadyProbed(), // ✅
+			AlreadyProbed: item.alreadyProbed(),
 		})
 	}
 	return episodes, nil
@@ -1015,14 +1068,16 @@ func (ls *LibraryScanner) ScanLibraryOnce(ctx context.Context, libID string) err
 		return fmt.Errorf("认证未就绪")
 	}
 
+	ls.logger.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	ls.logger.Info("📚 [单库扫描] 开始 (库=%s)", libID)
+	ls.logger.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 	items, total, err := ls.queryAllItems(ctx, userID, authHeaders, libID)
 	if err != nil {
 		return fmt.Errorf("查询项目失败: %w", err)
 	}
 
-	ls.logger.Info("📚 [单库扫描] 获取到 %d 个项目 (total=%d)", len(items), total)
+	ls.logger.Info("📚 [单库扫描] 获取到 %d 个项目 (total=%d)，开始逐项判断", len(items), total)
 
 	if len(items) == 0 {
 		ls.logger.Info("📚 [单库扫描] 完成: 无项目")
@@ -1030,27 +1085,55 @@ func (ls *LibraryScanner) ScanLibraryOnce(ctx context.Context, libID string) err
 	}
 
 	var allStats BatchStats
+	skippedCached := 0
 	skippedProbed := 0
 	var pending []PrefetchItem
 
-	for _, item := range items {
-		// ✅ 飞牛已 probe → 跳过
-		if item.AlreadyProbed {
-			skippedProbed++
-			ls.logger.Debug("⏭️ [单库扫描] 飞牛已 probe，跳过: %s (%s)", item.Name, item.Type)
-			continue
+	// ===== 逐项判断 =====
+	for i, item := range items {
+		cacheHit := false
+		if source, found := ls.server.cache.GetByItemID(item.ItemID); found {
+			if _, urlFound := ls.server.cache.GetStreamURL(source.ID); urlFound {
+				cacheHit = true
+			}
 		}
 
-		pending = append(pending, item)
-		if len(pending) >= batchFlushSize {
-			stats := ls.batch.PrefetchBatch(ctx, pending, authHeaders, "library_single", 3600, "单库扫描")
+		switch {
+		case cacheHit:
+			skippedCached++
+			ls.logger.Info("   [%3d/%d] %s (%s) | 缓存=命中 | 判断=跳过(已缓存)",
+				i+1, len(items), item.Name, item.Type)
+		case item.AlreadyProbed:
+			skippedProbed++
+			ls.logger.Info("   [%3d/%d] %s (%s) | 缓存=miss | probe=已probe | 判断=跳过(飞牛已探测)",
+				i+1, len(items), item.Name, item.Type)
+		default:
+			ls.logger.Info("   [%3d/%d] %s (%s) | 缓存=miss | probe=未probe | 判断=加入预取 ✅",
+				i+1, len(items), item.Name, item.Type)
+			pending = append(pending, item)
+		}
+	}
+
+	ls.logger.Info("📚 [单库扫描] 判断完成: 待预取=%d 缓存命中=%d 已probe跳过=%d",
+		len(pending), skippedCached, skippedProbed)
+
+	if len(pending) > 0 {
+		ls.logger.Info("🚀 [单库扫描] 开始预取 %d 项...", len(pending))
+	}
+
+	// ===== 批量预取 =====
+	var batch []PrefetchItem
+	for _, item := range pending {
+		batch = append(batch, item)
+		if len(batch) >= batchFlushSize {
+			stats := ls.batch.PrefetchBatch(ctx, batch, authHeaders, "library_single", 3600, "单库扫描")
 			allStats.Total += stats.Total
 			allStats.Success += stats.Success
 			allStats.Skipped += stats.Skipped
 			allStats.Deduped += stats.Deduped
 			allStats.Failed += stats.Failed
 			allStats.Cancelled += stats.Cancelled
-			pending = pending[:0]
+			batch = batch[:0]
 
 			select {
 			case <-time.After(800 * time.Millisecond):
@@ -1062,8 +1145,8 @@ func (ls *LibraryScanner) ScanLibraryOnce(ctx context.Context, libID string) err
 		}
 	}
 
-	if len(pending) > 0 {
-		stats := ls.batch.PrefetchBatch(ctx, pending, authHeaders, "library_single", 3600, "单库扫描")
+	if len(batch) > 0 {
+		stats := ls.batch.PrefetchBatch(ctx, batch, authHeaders, "library_single", 3600, "单库扫描")
 		allStats.Total += stats.Total
 		allStats.Success += stats.Success
 		allStats.Skipped += stats.Skipped
@@ -1072,9 +1155,15 @@ func (ls *LibraryScanner) ScanLibraryOnce(ctx context.Context, libID string) err
 		allStats.Cancelled += stats.Cancelled
 	}
 
-	ls.logger.Info("📚 [单库扫描] 完成: 已probe跳过=%d 总计=%d 成功=%d 跳过=%d 去重=%d 失败=%d 取消=%d 耗时=%v",
-		skippedProbed, allStats.Total, allStats.Success, allStats.Skipped, allStats.Deduped,
-		allStats.Failed, allStats.Cancelled, time.Since(startTime))
+	ls.logger.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	ls.logger.Info("📚 [单库扫描] 完成")
+	ls.logger.Info("   遍历: %d 项 | 缓存跳过=%d | 已probe跳过=%d | 待预取=%d",
+		len(items), skippedCached, skippedProbed, len(pending))
+	ls.logger.Info("   预取: 总计=%d 成功=%d 跳过=%d 去重=%d 失败=%d 取消=%d",
+		allStats.Total, allStats.Success, allStats.Skipped,
+		allStats.Deduped, allStats.Failed, allStats.Cancelled)
+	ls.logger.Info("   耗时: %v", time.Since(startTime))
+	ls.logger.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 	return nil
 }
