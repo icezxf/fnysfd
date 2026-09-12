@@ -18,6 +18,8 @@ import (
 	"time"
 )
 
+// ========== 辅助结构体 ==========
+
 type libraryInfo struct {
 	ID   string
 	Name string
@@ -40,9 +42,12 @@ type jsonItem struct {
 	DateCreated string `json:"DateCreated"`
 }
 
+// 常量
 const maxScanItems = 10000
 const batchFlushSize = 3
 const memSafetyThresholdMB = 400
+const incrementalInterval = 5 * time.Minute
+const incrementalLimit = 200
 
 // LibraryScanner 全库扫描预取器
 type LibraryScanner struct {
@@ -57,9 +62,14 @@ type LibraryScanner struct {
 	lastScanTime  time.Time
 	lastScanStats BatchStats
 
+	// 增量扫描最近一次统计（用于 /stats 显示）
+	lastIncScanTime  time.Time
+	lastIncScanStats BatchStats
+
 	lastGCTime atomic.Int64
 }
 
+// NewLibraryScanner 创建全库扫描器
 func NewLibraryScanner(s *Server, b *BatchPrefetcher, auth *AuthStore) *LibraryScanner {
 	return &LibraryScanner{
 		server:    s,
@@ -70,12 +80,18 @@ func NewLibraryScanner(s *Server, b *BatchPrefetcher, auth *AuthStore) *LibraryS
 	}
 }
 
+// ============================================================
+// 启动 / 停止
+// ============================================================
+
 // Start 启动定时扫描
 func (ls *LibraryScanner) Start() {
 	if !config.Global.GetEnableLibraryScan() {
 		ls.logger.Info("📚 [全库扫描] 功能未开启，跳过启动")
 		return
 	}
+
+	// 1. 全库定时扫描（每日 cron）
 	cron := config.Global.GetLibraryScanCron()
 	if cron != "" {
 		ls.wg.Add(1)
@@ -83,10 +99,12 @@ func (ls *LibraryScanner) Start() {
 			defer ls.wg.Done()
 			ls.cronScheduler(cron)
 		}()
-		ls.logger.Info("📚 [全库扫描] 定时任务已启动: %s", cron)
+		ls.logger.Info("📚 [全库扫描] 定时任务已启动: 每日 %s", cron)
 	} else {
 		ls.logger.Info("📚 [全库扫描] 未配置定时任务 (library_scan_cron 为空)")
 	}
+
+	// 2. 启动后立即全量扫一次（可选）
 	if config.Global.GetLibraryScanOnStart() {
 		ls.wg.Add(1)
 		go func() {
@@ -95,6 +113,14 @@ func (ls *LibraryScanner) Start() {
 			ls.scanOnce(context.Background())
 		}()
 	}
+
+	// 3. 增量扫描调度器（每 5 分钟）
+	ls.wg.Add(1)
+	go func() {
+		defer ls.wg.Done()
+		ls.incrementalScheduler(incrementalInterval)
+	}()
+	ls.logger.Info("📚 [增量扫描] 定时任务已启动: 每 %v 一次 (Limit=%d)", incrementalInterval, incrementalLimit)
 }
 
 // Stop 停止扫描并等待所有 goroutine 退出
@@ -105,6 +131,11 @@ func (ls *LibraryScanner) Stop() {
 	ls.wg.Wait()
 }
 
+// ============================================================
+// 全库扫描调度
+// ============================================================
+
+// cronScheduler 每日定时全库扫描
 func (ls *LibraryScanner) cronScheduler(cron string) {
 	for {
 		nextDelay, err := ls.calcNextDelay(cron)
@@ -122,6 +153,7 @@ func (ls *LibraryScanner) cronScheduler(cron string) {
 	}
 }
 
+// calcNextDelay 计算 cron 到下次触发的时间间隔
 func (ls *LibraryScanner) calcNextDelay(cron string) (time.Duration, error) {
 	parts := strings.Split(cron, ":")
 	if len(parts) != 2 {
@@ -143,7 +175,252 @@ func (ls *LibraryScanner) calcNextDelay(cron string) (time.Duration, error) {
 	return next.Sub(now), nil
 }
 
-// TriggerScan 手动触发（CAS 前置，避免并发双跑）
+// ============================================================
+// 增量扫描调度
+// ============================================================
+
+// incrementalScheduler 增量扫描定时器
+//
+// 启动后先等 30 秒再首次执行，避免与启动即全扫冲突
+func (ls *LibraryScanner) incrementalScheduler(interval time.Duration) {
+	select {
+	case <-time.After(30 * time.Second):
+	case <-ls.stopCh:
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			ls.scanIncremental(context.Background())
+		case <-ls.stopCh:
+			return
+		}
+	}
+}
+
+// scanIncremental 增量扫描：拉每个库的最新 N 项
+//
+// 依赖 Items/Latest 端点（已 curl 验证飞牛支持，返回裸数组，按时间倒序）。
+// 逐个调用 PrefetchItem（而非 PrefetchBatch），以便对每一项打日志显示媒体名称。
+// 并发由 BatchPrefetcher.sem 信号量自动控制。
+func (ls *LibraryScanner) scanIncremental(ctx context.Context) {
+	if !ls.running.CompareAndSwap(false, true) {
+		ls.logger.Debug("📚 [增量扫描] 已有扫描在进行中，跳过本次")
+		return
+	}
+	defer ls.running.Store(false)
+
+	startTime := time.Now()
+	ls.logger.Info("📚 [增量扫描] 开始")
+
+	userID, authHeaders, ok := ls.waitForAuth(ctx)
+	if !ok {
+		ls.logger.Warn("📚 [增量扫描] 认证未就绪，跳过")
+		return
+	}
+
+	libraries, err := ls.queryViews(ctx, userID, authHeaders)
+	if err != nil {
+		ls.logger.Warn("📚 [增量扫描] 查询媒体库失败: %v", err)
+		return
+	}
+	if len(libraries) == 0 {
+		ls.logger.Info("📚 [增量扫描] 无媒体库，结束")
+		return
+	}
+
+	ls.logger.Info("📚 [增量扫描] 发现 %d 个媒体库，逐个拉最新 %d 项", len(libraries), incrementalLimit)
+
+	var allStats BatchStats
+	totalFetched := 0
+	totalCandidates := 0
+	libCount := 0
+
+	for _, lib := range libraries {
+		select {
+		case <-ls.stopCh:
+			ls.logger.Info("📚 [增量扫描] 收到停止信号，中止")
+			return
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		items, err := ls.queryLatestItems(ctx, userID, authHeaders, lib.ID, incrementalLimit)
+		if err != nil {
+			ls.logger.Warn("📚 [增量扫描] 库 %s 拉最新项失败: %v", lib.Name, err)
+			continue
+		}
+		libCount++
+		totalFetched += len(items)
+
+		if len(items) == 0 {
+			ls.logger.Debug("📚 [增量扫描] 库 %s 无最新项", lib.Name)
+			continue
+		}
+
+		// ===== 过滤缓存命中的项，得到真正需要预取的候选 =====
+		var candidates []PrefetchItem
+		for _, item := range items {
+			if source, found := ls.server.cache.GetByItemID(item.ItemID); found {
+				if _, urlFound := ls.server.cache.GetStreamURL(source.ID); urlFound {
+					continue // 已缓存且直链已解析，跳过
+				}
+			}
+			candidates = append(candidates, item)
+		}
+
+		if len(candidates) == 0 {
+			ls.logger.Info("📚 [增量扫描] 库 %s: 拉到 %d 项，全部已缓存", lib.Name, len(items))
+			continue
+		}
+
+		// ===== 打印本库待预取的媒体清单 =====
+		ls.logger.Info("📚 [增量扫描] 库 %s: 拉到 %d 项，待预取 %d 项", lib.Name, len(items), len(candidates))
+		for _, c := range candidates {
+			ls.logger.Info("     └─ %s (%s)", c.Name, c.Type)
+		}
+
+		totalCandidates += len(candidates)
+
+		// ===== 逐个并发预取（PrefetchItem 内部受 bp.sem 控制并发度） =====
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		for _, c := range candidates {
+			c := c // 循环变量拷贝
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				hit, deduped, prefetched := ls.batch.PrefetchItem(
+					ctx, c.ItemID, c.UserID, authHeaders, "library_inc", 3600,
+				)
+
+				mu.Lock()
+				allStats.Total++
+				switch {
+				case hit:
+					allStats.Skipped++
+					ls.logger.Debug("⏭️ [增量扫描] 缓存命中: %s", c.Name)
+				case deduped:
+					allStats.Deduped++
+					ls.logger.Debug("⏭️ [增量扫描] 去重跳过: %s", c.Name)
+				case prefetched:
+					allStats.Success++
+					ls.logger.Info("✅ [增量扫描] 已预取: %s (%s)", c.Name, c.Type)
+				default:
+					allStats.Failed++
+					ls.logger.Warn("⚠️ [增量扫描] 预取失败: %s (%s)", c.Name, c.Type)
+				}
+				mu.Unlock()
+			}()
+		}
+		wg.Wait()
+
+		// 库之间小延迟，避免请求过密
+		select {
+		case <-time.After(300 * time.Millisecond):
+		case <-ls.stopCh:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	elapsed := time.Since(startTime)
+	ls.lastIncScanTime = time.Now()
+	ls.lastIncScanStats = allStats
+
+	// ===== 结束日志：区分"无新项"和"有新项" =====
+	if totalCandidates == 0 {
+		ls.logger.Info("📚 [增量扫描] 完成: 无新项 (库=%d 拉到=%d 耗时=%v)",
+			libCount, totalFetched, elapsed)
+	} else {
+		ls.logger.Info("📚 [增量扫描] 完成: 库=%d 拉到=%d 待预取=%d 成功=%d 跳过=%d 去重=%d 失败=%d 耗时=%v",
+			libCount, totalFetched, totalCandidates,
+			allStats.Success, allStats.Skipped, allStats.Deduped, allStats.Failed, elapsed)
+	}
+}
+
+// queryLatestItems 拉某个库的最新 N 项（用 Items/Latest 端点）
+//
+// 飞牛的 Items/Latest 返回裸数组（不是 {Items:[]}），已 curl 验证。
+func (ls *LibraryScanner) queryLatestItems(ctx context.Context, userID string, authHeaders http.Header, parentID string, limit int) ([]PrefetchItem, error) {
+	if limit <= 0 {
+		limit = incrementalLimit
+	}
+
+	query := url.Values{}
+	query.Set("ParentId", parentID)
+	query.Set("Limit", strconv.Itoa(limit))
+	query.Set("Fields", "Path,MediaSources")
+
+	path := "/emby/Users/" + userID + "/Items/Latest?" + query.Encode()
+
+	resp, err := ls.doRequest(ctx, authHeaders, path)
+	if err != nil {
+		return nil, fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("查询最新项失败: status=%d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
+	if err != nil {
+		return nil, fmt.Errorf("读取响应体失败: %w", err)
+	}
+
+	// Items/Latest 返回裸数组
+	var items []jsonItem
+	if err := json.Unmarshal(body, &items); err != nil {
+		return nil, fmt.Errorf("JSON解析失败: %w", err)
+	}
+
+	var result []PrefetchItem
+	for _, item := range items {
+		if item.Id == "" {
+			continue
+		}
+		switch item.Type {
+		case "Movie", "Video", "Episode":
+			result = append(result, PrefetchItem{
+				ItemID: item.Id,
+				UserID: userID,
+				Name:   item.Name,
+				Type:   item.Type,
+			})
+		case "Series":
+			select {
+			case <-ls.stopCh:
+				return result, nil
+			case <-ctx.Done():
+				return result, nil
+			default:
+			}
+			episodes, err := ls.querySeriesEpisodes(ctx, userID, authHeaders, item.Id, item.Name)
+			if err != nil {
+				ls.logger.Debug("📚 [增量扫描] 展开剧集失败: %s err=%v", item.Name, err)
+				continue
+			}
+			result = append(result, episodes...)
+		default:
+			// 其他类型跳过
+		}
+	}
+	return result, nil
+}
+
+// ============================================================
+// 状态查询
+// ============================================================
+
+// TriggerScan 手动触发全库扫描（CAS 前置，避免并发双跑）
 func (ls *LibraryScanner) TriggerScan() error {
 	if !ls.running.CompareAndSwap(false, true) {
 		return fmt.Errorf("扫描正在进行中，请稍后再试")
@@ -157,13 +434,17 @@ func (ls *LibraryScanner) TriggerScan() error {
 	return nil
 }
 
+// IsRunning 是否正在扫描
 func (ls *LibraryScanner) IsRunning() bool {
 	return ls.running.Load()
 }
 
+// GetStatus 获取扫描状态
 func (ls *LibraryScanner) GetStatus() map[string]interface{} {
 	status := map[string]interface{}{
-		"running": ls.running.Load(),
+		"running":             ls.running.Load(),
+		"incrementalInterval": incrementalInterval.String(),
+		"incrementalLimit":    incrementalLimit,
 		"lastScanStats": map[string]interface{}{
 			"total":     ls.lastScanStats.Total,
 			"success":   ls.lastScanStats.Success,
@@ -172,12 +453,27 @@ func (ls *LibraryScanner) GetStatus() map[string]interface{} {
 			"failed":    ls.lastScanStats.Failed,
 			"cancelled": ls.lastScanStats.Cancelled,
 		},
+		"lastIncScanStats": map[string]interface{}{
+			"total":     ls.lastIncScanStats.Total,
+			"success":   ls.lastIncScanStats.Success,
+			"skipped":   ls.lastIncScanStats.Skipped,
+			"deduped":   ls.lastIncScanStats.Deduped,
+			"failed":    ls.lastIncScanStats.Failed,
+			"cancelled": ls.lastIncScanStats.Cancelled,
+		},
 	}
 	if !ls.lastScanTime.IsZero() {
 		status["lastScanTime"] = ls.lastScanTime.Format("2006-01-02 15:04:05")
 	}
+	if !ls.lastIncScanTime.IsZero() {
+		status["lastIncScanTime"] = ls.lastIncScanTime.Format("2006-01-02 15:04:05")
+	}
 	return status
 }
+
+// ============================================================
+// 全库扫描主体
+// ============================================================
 
 // scanOnce 定时/启动触发入口（自持 running）
 func (ls *LibraryScanner) scanOnce(ctx context.Context) {
@@ -334,6 +630,10 @@ func (ls *LibraryScanner) scanOnceLocked(ctx context.Context) {
 	finishScan("")
 }
 
+// ============================================================
+// 认证 / 内存
+// ============================================================
+
 // waitForAuth 等待认证（去掉 IsReady 双重检查，避免竞态）
 func (ls *LibraryScanner) waitForAuth(ctx context.Context) (string, http.Header, bool) {
 	const maxWait = 10 * time.Minute
@@ -348,7 +648,7 @@ func (ls *LibraryScanner) waitForAuth(ctx context.Context) (string, http.Header,
 		if time.Now().After(deadline) {
 			return "", nil, false
 		}
-		ls.logger.Warn("📚 [全库扫描] 认证信息未就绪，等待 %v 后重试...", checkInterval)
+		ls.logger.Warn("📚 [扫描] 认证信息未就绪，等待 %v 后重试...", checkInterval)
 		select {
 		case <-time.After(checkInterval):
 		case <-ls.stopCh:
@@ -374,7 +674,7 @@ func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 	}
 	ls.lastGCTime.Store(now)
 
-	ls.logger.Warn("📚 [全库扫描] 内存过高 (%.1fMB/%dMB)，暂停扫描并触发GC", memMB, memSafetyThresholdMB)
+	ls.logger.Warn("📚 [扫描] 内存过高 (%.1fMB/%dMB)，暂停扫描并触发GC", memMB, memSafetyThresholdMB)
 	runtime.GC()
 	debug.FreeOSMemory()
 	select {
@@ -384,7 +684,11 @@ func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 	}
 }
 
-// doRequest 保持原样
+// ============================================================
+// HTTP 请求
+// ============================================================
+
+// doRequest 发起带认证的请求
 func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header, path string) (*http.Response, error) {
 	ls.server.proxyMu.RLock()
 	targetURL := ls.server.targetURL
@@ -455,7 +759,11 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 	return ls.server.retryClient.Do(req)
 }
 
-// queryViews 空列表 fallback 简化
+// ============================================================
+// 媒体库 / 项目查询
+// ============================================================
+
+// queryViews 查询媒体库列表（空列表 fallback 简化）
 func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHeaders http.Header) ([]libraryInfo, error) {
 	path := "/emby/Users/" + userID + "/Views"
 
@@ -589,7 +897,7 @@ func (ls *LibraryScanner) queryAllItems(ctx context.Context, userID string, auth
 	}
 }
 
-// querySeriesEpisodes 展开剧集（去掉固定 200ms sleep，交给 PrefetchBatch 节流）
+// querySeriesEpisodes 展开剧集
 func (ls *LibraryScanner) querySeriesEpisodes(ctx context.Context, userID string, authHeaders http.Header, seriesID string, seriesName string) ([]PrefetchItem, error) {
 	path := "/emby/Shows/" + seriesID + "/Seasons"
 
@@ -631,7 +939,7 @@ func (ls *LibraryScanner) querySeriesEpisodes(ctx context.Context, userID string
 		}
 		episodes, err := ls.querySeasonEpisodes(ctx, userID, authHeaders, seriesID, season.Id)
 		if err != nil {
-			ls.logger.Warn("📚 [全库扫描] 查询季 %s 的集失败: %v", season.Name, err)
+			ls.logger.Warn("📚 [扫描] 查询季 %s 的集失败: %v", season.Name, err)
 			continue
 		}
 		allEpisodes = append(allEpisodes, episodes...)
@@ -639,6 +947,7 @@ func (ls *LibraryScanner) querySeriesEpisodes(ctx context.Context, userID string
 	return allEpisodes, nil
 }
 
+// querySeasonEpisodes 查询某一季下所有集
 func (ls *LibraryScanner) querySeasonEpisodes(ctx context.Context, userID string, authHeaders http.Header, seriesID, seasonID string) ([]PrefetchItem, error) {
 	query := url.Values{}
 	query.Set("SeasonId", seasonID)
@@ -682,7 +991,11 @@ func (ls *LibraryScanner) querySeasonEpisodes(ctx context.Context, userID string
 	return episodes, nil
 }
 
-// ScanLibraryOnce 单库扫描（CAS 前置 + ctx.Err）
+// ============================================================
+// 单库扫描
+// ============================================================
+
+// ScanLibraryOnce 单库扫描
 func (ls *LibraryScanner) ScanLibraryOnce(ctx context.Context, libID string) error {
 	if !ls.running.CompareAndSwap(false, true) {
 		return fmt.Errorf("已有扫描在进行中")
@@ -708,6 +1021,7 @@ func (ls *LibraryScanner) ScanLibraryOnce(ctx context.Context, libID string) err
 	ls.logger.Info("📚 [单库扫描] 获取到 %d 个项目 (total=%d)", len(items), total)
 
 	if len(items) == 0 {
+		ls.logger.Info("📚 [单库扫描] 完成: 无项目")
 		return nil
 	}
 
