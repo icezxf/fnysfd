@@ -17,6 +17,7 @@ type PrefetchItem struct {
 	UserID string // 用户 UserId（用于构造 PlaybackInfo 请求，可为空）
 	Name   string // 媒体名称（仅用于日志展示）
 	Type   string // 媒体类型（Movie/Episode/Series 等，仅用于日志展示）
+	AlreadyProbed bool   // ✅ 新增：飞牛是否已真正 probe（Codec 非空）
 }
 
 // BatchStats 批量预取统计
