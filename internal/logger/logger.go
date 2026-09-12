@@ -6,7 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,8 +14,8 @@ import (
 
 const (
 	maxLogFileSize     = 10 * 1024 * 1024 // 单个日志文件最大10MB
-	maxLogFiles        = 7                // 最多保留7天日志
-	logCleanupInterval = 24 * time.Hour   // 每24小时清理一次
+	logRetentionDays   = 1                // ✅ 日志保留天数（只保留当天）
+	logCleanupInterval = 6 * time.Hour    // ✅ 每6小时清理一次
 )
 
 // Level 日志级别
@@ -92,8 +92,17 @@ func New(level, logDir string) *Logger {
 }
 
 // cleanupOldLogs 定期清理旧日志
+//
+// ✅ 改进：
+//  1. 启动时先执行一次清理（避免刚重启时旧日志堆积）
+//  2. 清理间隔从 24h 改为 6h（更及时）
+//  3. 清理逻辑从"按修改时间"改为"按文件名日期"（更精确）
 func (l *Logger) cleanupOldLogs() {
 	defer l.wg.Done()
+
+	// ✅ 启动时先执行一次清理
+	l.doCleanup()
+
 	ticker := time.NewTicker(logCleanupInterval)
 	defer ticker.Stop()
 
@@ -108,46 +117,52 @@ func (l *Logger) cleanupOldLogs() {
 }
 
 // doCleanup 执行清理操作
+//
+// ✅ 改为按文件名日期过滤：只保留今天的日志（含轮转 _1/_2/_3）
+// 避免"修改时间"因文件复制/系统时间调整导致的误删/误留
 func (l *Logger) doCleanup() {
 	if l.logDir == "" {
 		return
 	}
 
-	files, err := filepath.Glob(filepath.Join(l.logDir, "*.log"))
+	entries, err := os.ReadDir(l.logDir)
 	if err != nil {
 		return
 	}
 
-	if len(files) <= maxLogFiles {
-		return
-	}
+	// 计算保留的最早日期（今天 - (retentionDays-1)）
+	today := time.Now()
+	cutoffDay := today.AddDate(0, 0, -(logRetentionDays - 1)).Format("20060102")
 
-	// 预计算每个文件的修改时间，stat 失败的视为最旧（zero time），避免排序乱序
-	type fileMeta struct {
-		path    string
-		modTime time.Time
-	}
-	metas := make([]fileMeta, 0, len(files))
-	for _, f := range files {
-		info, err := os.Stat(f)
-		if err != nil {
-			metas = append(metas, fileMeta{path: f, modTime: time.Time{}})
+	removed := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
 			continue
 		}
-		metas = append(metas, fileMeta{path: f, modTime: info.ModTime()})
-	}
-	// 按修改时间降序（最新在前），stat 失败的文件（zero time）会排到末尾被优先删除
-	sort.Slice(metas, func(i, j int) bool {
-		return metas[i].modTime.After(metas[j].modTime)
-	})
-	// 把排序后的路径写回 files
-	for i := range files {
-		files[i] = metas[i].path
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".log") {
+			continue
+		}
+		// 解析文件名开头的日期部分（格式 YYYYMMDD）
+		datePart := name
+		if idx := strings.Index(name, "_"); idx > 0 {
+			datePart = name[:idx]
+		}
+		datePart = strings.TrimSuffix(datePart, ".log")
+		if len(datePart) != 8 {
+			continue
+		}
+		// 文件名日期 < 保留截止日期 → 删除
+		if datePart < cutoffDay {
+			path := filepath.Join(l.logDir, name)
+			if err := os.Remove(path); err == nil {
+				removed++
+			}
+		}
 	}
 
-	toDelete := files[maxLogFiles:]
-	for _, file := range toDelete {
-		os.Remove(file)
+	if removed > 0 {
+		log.Printf("🧹 [日志清理] 已删除 %d 个超过 %d 天的日志文件", removed, logRetentionDays)
 	}
 }
 
