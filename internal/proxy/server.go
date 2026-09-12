@@ -1,4 +1,3 @@
-
 package proxy
 
 import (
@@ -51,6 +50,10 @@ type Server struct {
 	batchPrefetcher *BatchPrefetcher
 	posterPrefetch  *PosterPrefetcher
 	libraryScanner  *LibraryScanner
+
+	// 服务级 context：Stop 时取消，用于中断内部长任务
+	serverCtx    context.Context
+	serverCancel context.CancelFunc
 }
 
 // NewServer 创建代理服务器
@@ -96,6 +99,9 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		Transport: retryTransport,
 	}
 
+	// ✅ 服务级 context
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+
 	s := &Server{
 		config:          cfg,
 		logger:          log,
@@ -108,6 +114,8 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		targetURL:       targetURL,
 		prefetchRecent:  make(map[string]int64),
 		version:         version,
+		serverCtx:       serverCtx,
+		serverCancel:    serverCancel,
 	}
 
 	// 下一集预取回调绑定
@@ -125,7 +133,11 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 			return
 		}
 		log.Debug("⏭️ [下一集预取] STRM缓存回调触发: 当前=%s", itemID)
-		go s.prefetchNextEpisodesBestEffort(resp.Request, itemID, resp.Request.URL.Query().Get("UserId"))
+
+		// ✅ 克隆请求再传给 goroutine，避免跨 goroutine 使用同一 *http.Request
+		reqCopy := resp.Request.Clone(context.Background())
+		userID := reqCopy.URL.Query().Get("UserId")
+		go s.prefetchNextEpisodesBestEffort(reqCopy, itemID, userID)
 	})
 	log.Info("⏭️ [下一集预取] STRM缓存回调已绑定，详情页成功后将显式触发下一集预取")
 
@@ -147,7 +159,9 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		if err := s.authStore.LoginViaEmby(fnosUser, fnosPass, serverAddr); err != nil {
 			log.Warn("⚠️ [主动登录] 飞牛影视登录失败，将依赖被动捕获: %v", err)
 		} else {
-			log.Info("✅ [主动登录] 飞牛影视登录成功，UserID=%s", s.authStore.userID)
+			// ✅ 走 Get() 避免直接读字段造成竞态
+			_, uid, _ := s.authStore.Get()
+			log.Info("✅ [主动登录] 飞牛影视登录成功，UserID=%s", uid)
 		}
 	} else {
 		log.Info("ℹ️ [主动登录] 未配置 FNOS_USERNAME/FNOS_PASSWORD，依赖被动捕获")
@@ -199,10 +213,12 @@ func (s *Server) Start() error {
 	return s.httpServer.ListenAndServe()
 }
 
-// setupProxy 配置反向代理的Director和ModifyResponse
-func (s *Server) setupProxy(targetURL *url.URL) {
-	originalDirector := s.proxy.Director
-	s.proxy.Director = func(req *http.Request) {
+// applyProxyHandlers 给 proxy 挂上 Director / ModifyResponse / ErrorHandler
+//
+// setupProxy 与 Reload 共用，避免 Reload 时遗漏 ErrorHandler 等。
+func (s *Server) applyProxyHandlers(p *httputil.ReverseProxy, targetURL *url.URL) {
+	originalDirector := p.Director
+	p.Director = func(req *http.Request) {
 		originalDirector(req)
 		req.Host = targetURL.Host
 
@@ -213,31 +229,38 @@ func (s *Server) setupProxy(targetURL *url.URL) {
 
 		// 进入详情页就主动预请求 PlaybackInfo
 		if itemID, userID, ok := s.isItemDetailRequest(req); ok {
-			go s.prefetchForDetailPage(req, itemID, userID)
+			// ✅ 克隆请求再传入 goroutine，避免跨 goroutine 使用同一 *http.Request
+			reqCopy := req.Clone(context.Background())
+			go s.prefetchForDetailPage(reqCopy, itemID, userID)
 			return
 		}
 
 		// 兜底：点击播放时的主动预请求
 		if s.isPlaybackInfoRequest(req) && req.Method == "GET" {
-			go s.proactivePlaybackInfo(req)
+			reqCopy := req.Clone(context.Background())
+			go s.proactivePlaybackInfo(reqCopy)
 		}
 
-		// ✅ 拦截 FNOS 原生海报墙请求，触发单库扫描
+		// 拦截 FNOS 原生海报墙请求
+		// ⚠️ 海报墙预取触发已临时禁用（方案 A），此处只做 body 读取的防御性限制
 		if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/v/api/v1/item/list") {
-			body, err := io.ReadAll(req.Body)
+			// ✅ 1MB 上限，防止恶意大 body 打满内存
+			body, err := io.ReadAll(io.LimitReader(req.Body, 1*1024*1024))
 			if err == nil && len(body) > 0 {
 				req.Body.Close()
 				req.Body = io.NopCloser(bytes.NewReader(body))
 				req.ContentLength = int64(len(body))
 				req.Header.Set("Content-Length", strconv.Itoa(len(body)))
 				if s.posterPrefetch != nil {
+					// ⚠️ HandleFnosListRequest 内部已立即 return（方案 A），
+					// 保留调用以便恢复时只删函数首行
 					go s.posterPrefetch.HandleFnosListRequest(body)
 				}
 			}
 		}
 	}
-	s.proxy.ModifyResponse = s.handleResponse
-	s.proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+	p.ModifyResponse = s.handleResponse
+	p.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 		if errors.Is(err, context.Canceled) {
 			s.logger.Debug("🔌 [客户端断开] %s %s: %v", req.Method, req.URL.Path, err)
 			http.Error(rw, "Client closed request", 499)
@@ -256,6 +279,11 @@ func (s *Server) setupProxy(targetURL *url.URL) {
 	}
 }
 
+// setupProxy 配置反向代理的Director和ModifyResponse
+func (s *Server) setupProxy(targetURL *url.URL) {
+	s.applyProxyHandlers(s.proxy, targetURL)
+}
+
 // handleProxy 加锁读取代理实例并转发请求
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	s.proxyMu.RLock()
@@ -265,11 +293,26 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 // Stop 停止服务器
+//
+// 顺序：取消 serverCtx → 停 httpServer → 停后台任务 → 关 cache/logger
 func (s *Server) Stop() error {
 	var err error
 	s.stopOnce.Do(func() {
 		s.logger.Info("🛑 正在关闭服务...")
 
+		// 0. 取消服务级 context，中断内部长任务
+		if s.serverCancel != nil {
+			s.serverCancel()
+		}
+
+		// 1. 先停止接收新请求
+		if s.httpServer != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err = s.httpServer.Shutdown(ctx)
+			cancel()
+		}
+
+		// 2. 停止后台任务
 		if s.libraryScanner != nil {
 			s.libraryScanner.Stop()
 		}
@@ -279,11 +322,8 @@ func (s *Server) Stop() error {
 		if s.streamHandler != nil {
 			s.streamHandler.Stop()
 		}
-		if s.httpServer != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			err = s.httpServer.Shutdown(ctx)
-			cancel()
-		}
+
+		// 3. 最后关 cache 和 logger
 		if s.cache != nil {
 			s.cache.Stop()
 		}
@@ -293,10 +333,10 @@ func (s *Server) Stop() error {
 	return err
 }
 
-func (s *Server) GetCache() *cache.Cache                    { return s.cache }
-func (s *Server) GetLogger() *logger.Logger                  { return s.logger }
-func (s *Server) GetStreamHandler() *handler.StreamHandler   { return s.streamHandler }
-func (s *Server) GetLibraryScanner() *LibraryScanner         { return s.libraryScanner }
+func (s *Server) GetCache() *cache.Cache                  { return s.cache }
+func (s *Server) GetLogger() *logger.Logger                { return s.logger }
+func (s *Server) GetStreamHandler() *handler.StreamHandler { return s.streamHandler }
+func (s *Server) GetLibraryScanner() *LibraryScanner       { return s.libraryScanner }
 
 // Reload 重新加载配置
 func (s *Server) Reload() {
@@ -319,38 +359,8 @@ func (s *Server) Reload() {
 		}
 
 		newProxy := httputil.NewSingleHostReverseProxy(targetURL)
-		originalDirector := newProxy.Director
-		newProxy.Director = func(req *http.Request) {
-			originalDirector(req)
-			req.Host = targetURL.Host
-
-			if s.authStore != nil {
-				s.authStore.CaptureFromRequest(req)
-			}
-
-			if itemID, userID, ok := s.isItemDetailRequest(req); ok {
-				go s.prefetchForDetailPage(req, itemID, userID)
-				return
-			}
-			if s.isPlaybackInfoRequest(req) && req.Method == "GET" {
-				go s.proactivePlaybackInfo(req)
-			}
-
-			// ✅ FNOS 海报墙拦截（Reload 后同样生效）
-			if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/v/api/v1/item/list") {
-				body, err := io.ReadAll(req.Body)
-				if err == nil && len(body) > 0 {
-					req.Body.Close()
-					req.Body = io.NopCloser(bytes.NewReader(body))
-					req.ContentLength = int64(len(body))
-					req.Header.Set("Content-Length", strconv.Itoa(len(body)))
-					if s.posterPrefetch != nil {
-						go s.posterPrefetch.HandleFnosListRequest(body)
-					}
-				}
-			}
-		}
-		newProxy.ModifyResponse = s.handleResponse
+		// ✅ 复用公共挂载逻辑，避免遗漏 ErrorHandler / Director 拦截
+		s.applyProxyHandlers(newProxy, targetURL)
 
 		s.proxyMu.Lock()
 		s.proxy = newProxy
@@ -400,24 +410,30 @@ func (s *Server) handleResponse(resp *http.Response) error {
 		return nil
 	}
 
-	// 海报墙列表响应拦截：提取 ItemID 批量预取 Movie PlaybackInfo
-//	if s.posterPrefetch != nil && resp.StatusCode == http.StatusOK {
-//		if userID, ok := s.posterPrefetch.IsItemListRequest(resp.Request); ok {
-//			body, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
-//			if err != nil {
-//				s.logger.Warn("🖼️ [海报墙预取] 读取响应体失败: %v", err)
-//				return err
-//			}
-//			resp.Body.Close()
-//			resp.Body = io.NopCloser(bytes.NewBuffer(body))
-//			resp.ContentLength = int64(len(body))
-//			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
-//			resp.Header.Del("Transfer-Encoding")
-//			go s.posterPrefetch.HandleListResponse(resp, body, userID)
-//			return nil
-//		}
-//	}
+	// ⚠️ 海报墙预取触发已临时禁用（方案 A）
+	// 恢复时取消注释即可
+	// // 海报墙列表响应拦截：提取 ItemID 批量预取 Movie PlaybackInfo
+	// if s.posterPrefetch != nil && resp.StatusCode == http.StatusOK {
+	// 	if userID, ok := s.posterPrefetch.IsItemListRequest(resp.Request); ok {
+	// 		body, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
+	// 		if err != nil {
+	// 			s.logger.Warn("🖼️ [海报墙预取] 读取响应体失败: %v", err)
+	// 			return err
+	// 		}
+	// 		resp.Body.Close()
+	// 		resp.Body = io.NopCloser(bytes.NewBuffer(body))
+	// 		resp.ContentLength = int64(len(body))
+	// 		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	// 		resp.Header.Del("Transfer-Encoding")
+	// 		go s.posterPrefetch.HandleListResponse(resp, body, userID)
+	// 		return nil
+	// 	}
+	// }
 
+	// ✅ 防御：resp.Request 为 nil 时直接返回
+	if resp.Request == nil {
+		return nil
+	}
 	if !s.isPlaybackInfoRequest(resp.Request) {
 		return nil
 	}
@@ -460,6 +476,8 @@ func (s *Server) handleResponse(resp *http.Response) error {
 }
 
 // retryPlaybackInfo 主动重试 PlaybackInfo 请求
+//
+// 用 serverCtx 派生，服务关闭时能中断
 func (s *Server) retryPlaybackInfo(originalReq *http.Request) {
 	s.proxyMu.RLock()
 	targetURL := s.targetURL
@@ -480,9 +498,12 @@ func (s *Server) retryPlaybackInfo(originalReq *http.Request) {
 
 	s.logger.Info("🔄 [重试] 开始: %s", reqPath)
 
+	overallCtx, overallCancel := context.WithTimeout(s.serverCtx, 60*time.Second)
+	defer overallCancel()
+
 	const maxAttempts = 5
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		req, err := http.NewRequestWithContext(context.Background(), reqMethod, reqURL, nil)
+		req, err := http.NewRequestWithContext(overallCtx, reqMethod, reqURL, nil)
 		if err != nil {
 			s.logger.Warn("❌ [重试] 创建请求失败: %v", err)
 			return
@@ -492,6 +513,10 @@ func (s *Server) retryPlaybackInfo(originalReq *http.Request) {
 
 		resp, err := s.retryClient.Do(req)
 		if err != nil {
+			if s.serverCtx.Err() != nil {
+				s.logger.Debug("🛑 [重试] 服务关闭，中止重试: %s", reqPath)
+				return
+			}
 			s.logger.Debug("⚠️ [重试] 第%d次请求失败: %v", attempt, err)
 			if attempt < maxAttempts {
 				time.Sleep(playbackProbeRetryInterval(attempt))
@@ -567,7 +592,9 @@ func (s *Server) proactivePlaybackInfo(originalReq *http.Request) {
 
 	s.logger.Info("🚀 [主动] 开始: %s", reqPath)
 
-	req, err := http.NewRequestWithContext(context.Background(), reqMethod, reqURL, nil)
+	reqCtx, reqCancel := context.WithTimeout(s.serverCtx, 20*time.Second)
+	defer reqCancel()
+	req, err := http.NewRequestWithContext(reqCtx, reqMethod, reqURL, nil)
 	if err != nil {
 		s.logger.Warn("❌ [主动] 创建请求失败: %v", err)
 		return
@@ -578,6 +605,9 @@ func (s *Server) proactivePlaybackInfo(originalReq *http.Request) {
 
 	resp, err := s.retryClient.Do(req)
 	if err != nil {
+		if s.serverCtx.Err() != nil {
+			return
+		}
 		s.logger.Debug("⚠️ [主动] 请求失败: %v", err)
 		return
 	}
@@ -679,9 +709,12 @@ func (s *Server) prefetchForDetailPage(originalReq *http.Request, itemID string,
 
 	s.logger.Info("🎬 [详情页] 开始: %s", itemID)
 
+	overallCtx, overallCancel := context.WithTimeout(s.serverCtx, 60*time.Second)
+	defer overallCancel()
+
 	const maxAttempts = 30
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		req, err := http.NewRequestWithContext(context.Background(), "GET", fullURL, nil)
+		req, err := http.NewRequestWithContext(overallCtx, "GET", fullURL, nil)
 		if err != nil {
 			s.logger.Warn("❌ [详情页] 创建请求失败: %v", err)
 			return
@@ -691,6 +724,10 @@ func (s *Server) prefetchForDetailPage(originalReq *http.Request, itemID string,
 
 		resp, err := s.retryClient.Do(req)
 		if err != nil {
+			if s.serverCtx.Err() != nil {
+				s.logger.Debug("🛑 [详情页] 服务关闭，中止: %s", itemID)
+				return
+			}
 			s.logger.Debug("⚠️ [详情页] 第%d次请求失败: %v", attempt, err)
 			if attempt < maxAttempts {
 				time.Sleep(playbackProbeRetryInterval(attempt))
@@ -766,9 +803,12 @@ func (s *Server) prefetchForMediaSourceMiss(originalReq *http.Request, itemID st
 
 	s.logger.Info("🧩 [MediaSource兜底] 轮询PlaybackInfo: ItemId=%s, MS=%s", itemID, mediaSourceID)
 
+	overallCtx, overallCancel := context.WithTimeout(s.serverCtx, 60*time.Second)
+	defer overallCancel()
+
 	const maxAttempts = 18
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		req, err := http.NewRequestWithContext(context.Background(), "GET", fullURL, nil)
+		req, err := http.NewRequestWithContext(overallCtx, "GET", fullURL, nil)
 		if err != nil {
 			s.logger.Warn("❌ [MediaSource兜底] 创建请求失败: %v", err)
 			return false
@@ -778,6 +818,9 @@ func (s *Server) prefetchForMediaSourceMiss(originalReq *http.Request, itemID st
 
 		resp, err := s.retryClient.Do(req)
 		if err != nil {
+			if s.serverCtx.Err() != nil {
+				return false
+			}
 			s.logger.Debug("⚠️ [MediaSource兜底] 第%d次请求失败: %v", attempt, err)
 			if attempt < maxAttempts {
 				time.Sleep(mediaSourceMissRetryInterval(attempt))
@@ -885,6 +928,9 @@ func (s *Server) prefetchNextEpisodesBestEffort(originalReq *http.Request, itemI
 	reqHeaders.Set("Accept", "application/json")
 	reqHost := targetURL.Host
 
+	overallCtx, overallCancel := context.WithTimeout(s.serverCtx, 60*time.Second)
+	defer overallCancel()
+
 	var detailURL string
 	query := originalReq.URL.Query()
 	if userID != "" {
@@ -899,7 +945,7 @@ func (s *Server) prefetchNextEpisodesBestEffort(originalReq *http.Request, itemI
 		}
 	}
 
-	req, err := http.NewRequestWithContext(context.Background(), "GET", detailURL, nil)
+	req, err := http.NewRequestWithContext(overallCtx, "GET", detailURL, nil)
 	if err != nil {
 		s.logger.Warn("⏭️ [下一集预取] 创建详情请求失败: %v itemID=%s", err, itemID)
 		return
@@ -999,7 +1045,7 @@ func (s *Server) prefetchNextEpisodesBestEffort(originalReq *http.Request, itemI
 	}
 
 	for _, listURL := range listURLs {
-		req, err = http.NewRequestWithContext(context.Background(), "GET", listURL, nil)
+		req, err = http.NewRequestWithContext(overallCtx, "GET", listURL, nil)
 		if err != nil {
 			continue
 		}
@@ -1374,6 +1420,11 @@ func (s *Server) statsHandler(w http.ResponseWriter, r *http.Request) {
 	if s.streamHandler != nil {
 		streamStats := s.streamHandler.GetStats()
 		stats["stream"] = streamStats
+	}
+
+	// ✅ 全库扫描状态
+	if s.libraryScanner != nil {
+		stats["libraryScan"] = s.libraryScanner.GetStatus()
 	}
 
 	jsonBytes, _ := json.Marshal(stats)
