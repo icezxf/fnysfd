@@ -109,8 +109,12 @@ func (p *PosterPrefetcher) mapFnosToEmby(fnosGUID string) string {
 
 // HandleFnosListRequest 处理 FNOS 原生海报墙请求
 //
+// ⚠️ 海报墙预取触发已临时禁用（方案 A）
+// 恢复时删除函数首行的 return 即可
 // ✅ 终极修复：主动拉取 Emby 媒体库列表，不再依赖被动缓存
 func (p *PosterPrefetcher) HandleFnosListRequest(reqBody []byte) {
+	return // ⚠️ 临时禁用：直接返回，不触发任何库扫描
+
 	if !config.Global.GetEnablePosterPrefetch() {
 		return
 	}
@@ -335,8 +339,12 @@ func (p *PosterPrefetcher) forceUseLoginToken(currentHeaders http.Header) http.H
 
 // HandleEmbyItemsRequest 处理 Emby 兼容的海报墙请求
 //
+// ⚠️ 海报墙预取触发已临时禁用（方案 A）
+// 恢复时删除函数首行的 return 即可
 // 策略：拦截 /Items 请求，解析 ParentId → 触发单库扫描
 func (p *PosterPrefetcher) HandleEmbyItemsRequest(r *http.Request) {
+	return // ⚠️ 临时禁用：直接返回，不触发任何库扫描
+
 	if !config.Global.GetEnablePosterPrefetch() {
 		return
 	}
