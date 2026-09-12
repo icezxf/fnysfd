@@ -16,23 +16,23 @@ import (
 
 // Config 配置结构
 type Config struct {
-	ListenAddr     string        `mapstructure:"listen"`        // 反代监听地址
-	TargetAddr     string        `mapstructure:"target"`        // 目标服务地址
-	LogLevel       string        `mapstructure:"log_level"`     // 日志级别
-	LogDir         string        `mapstructure:"log_dir"`       // 日志目录
-	CacheTTL       time.Duration `mapstructure:"cache_ttl"`      // 缓存TTL（分钟）
-	DashboardAddr  string        `mapstructure:"dashboard_addr"` // 管理面板地址
-	DashboardUser  string        `mapstructure:"dashboard_user"` // 面板用户名
-	DashboardPass  string        `mapstructure:"dashboard_pass"` // 面板密码
-	MaxCacheItems  int           `mapstructure:"max_cache_items"` // 最大缓存条目数
-	StrmPaths      []string      `mapstructure:"strm_paths"`    // STRM文件路径列表（容器内路径，用于扫描）
-	StrmVolumes    []string      `mapstructure:"strm_volumes"`  // Docker Volume映射（完整格式：/host:/container:ro）
-	StatsToken     string        `mapstructure:"stats_token"`   // /stats 端点访问令牌（空=公开，向后兼容）
+	ListenAddr     string        `mapstructure:"listen"`          // 反代监听地址
+	TargetAddr     string        `mapstructure:"target"`          // 目标服务地址
+	LogLevel       string        `mapstructure:"log_level"`       // 日志级别
+	LogDir         string        `mapstructure:"log_dir"`         // 日志目录
+	CacheTTL       time.Duration `mapstructure:"cache_ttl"`        // 缓存TTL（分钟）
+	DashboardAddr  string        `mapstructure:"dashboard_addr"`   // 管理面板地址
+	DashboardUser  string        `mapstructure:"dashboard_user"`   // 面板用户名
+	DashboardPass  string        `mapstructure:"dashboard_pass"`   // 面板密码
+	MaxCacheItems  int           `mapstructure:"max_cache_items"`  // 最大缓存条目数
+	StrmPaths      []string      `mapstructure:"strm_paths"`      // STRM文件路径列表（容器内路径，用于扫描）
+	StrmVolumes    []string      `mapstructure:"strm_volumes"`    // Docker Volume映射（完整格式：/host:/container:ro）
+	StatsToken     string        `mapstructure:"stats_token"`     // /stats 端点访问令牌（空=公开，向后兼容）
 	// STRM 解析模式
 	//   - "auto"        智能模式（默认）：自动识别 302 直链/strm 工具 URL 跳过解析，其他走 HTTP 解析
 	//   - "passthrough" 透传模式：所有 strm 直接把内容给播放器，不做任何解析/预热/预连接（适合全部 302 strm 场景）
 	//   - "always"      始终解析模式：强制所有 strm 走 HTTP 解析
-	StrmResolveMode string      `mapstructure:"strm_resolve_mode"`
+	StrmResolveMode string `mapstructure:"strm_resolve_mode"`
 	// 是否支持内网 strm 地址（默认 true）
 	//   - true：反代解析内网地址 strm（需要容器能访问内网，建议用 host 网络模式）
 	//   - false：跳过内网地址 strm，不解析（适合 bridge 网络模式且 strm 都是公网地址的场景）
@@ -60,6 +60,10 @@ type Config struct {
 	LibraryScanConcurrency  int    `mapstructure:"library_scan_concurrency"`   // 扫描并发数
 	LibraryScanIntervalMs   int    `mapstructure:"library_scan_interval_ms"`  // 每页间隔（毫秒）
 	LibraryScanEpisodeCount int    `mapstructure:"library_scan_episode_count"` // 每季预取前N集
+	// ✅ 新增：增量扫描间隔（分钟）
+	//   - 每 N 分钟拉一次每个媒体库的"最新 200 项"，只预取飞牛未 probe 的项
+	//   - 默认 5 分钟，最小 1 分钟，最大 1440 分钟（24 小时）
+	LibraryScanIncrementalMinutes int `mapstructure:"library_scan_incremental_minutes"`
 	// ✅ Webhook 通知配置（QMS 联动）
 	WebhookNotifyToken        string `mapstructure:"webhook_notify_token"`         // 预共享密钥（空=禁用）
 	WebhookNotifyDelaySeconds int    `mapstructure:"webhook_notify_delay_seconds"` // 延迟秒数（默认15）
@@ -83,7 +87,7 @@ var Global = &Config{
 	EnableLanStrm:  true,    // 默认支持内网 strm
 	EnablePreload:  true,    // 默认启用预加载
 	EnableSmartTTL: true,    // 默认启用智能签名 TTL
-	EnableCDNWarmup: true,  // 默认启用 CDN 预热
+	EnableCDNWarmup: true,   // 默认启用 CDN 预热
 	// 海报墙预取默认关闭（需用户确认后开启，避免意外流量）
 	EnablePosterPrefetch:      false,
 	PosterPrefetchConcurrency: 4,
@@ -95,6 +99,8 @@ var Global = &Config{
 	LibraryScanConcurrency:  2,
 	LibraryScanIntervalMs:   500,
 	LibraryScanEpisodeCount: 5,
+	// ✅ 增量扫描间隔默认 5 分钟
+	LibraryScanIncrementalMinutes: 5,
 	// ✅ Webhook 通知默认值
 	WebhookNotifyToken:        "", // 默认禁用
 	WebhookNotifyDelaySeconds: 15, // 默认延迟 15 秒
@@ -141,6 +147,8 @@ func Load(configPath string) error {
 	viper.SetDefault("library_scan_concurrency", 2)
 	viper.SetDefault("library_scan_interval_ms", 500)
 	viper.SetDefault("library_scan_episode_count", 5)
+	// ✅ 增量扫描间隔
+	viper.SetDefault("library_scan_incremental_minutes", 5)
 	// ✅ Webhook 通知
 	viper.SetDefault("webhook_notify_token", "")
 	viper.SetDefault("webhook_notify_delay_seconds", 15)
@@ -515,6 +523,20 @@ func (c *Config) GetLibraryScanEpisodeCount() int {
 	return c.LibraryScanEpisodeCount
 }
 
+// ✅ 新增：GetLibraryScanIncrementalMinutes 获取增量扫描间隔（分钟）
+// 默认 5 分钟，最小 1 分钟，最大 1440 分钟（24 小时）
+func (c *Config) GetLibraryScanIncrementalMinutes() int {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	if c.LibraryScanIncrementalMinutes < 1 {
+		return 5
+	}
+	if c.LibraryScanIncrementalMinutes > 1440 {
+		return 1440
+	}
+	return c.LibraryScanIncrementalMinutes
+}
+
 // GetWebhookNotifyToken 获取 Webhook 通知的预共享密钥
 // 空字符串表示未启用 Webhook 通知端点
 func (c *Config) GetWebhookNotifyToken() string {
@@ -782,6 +804,16 @@ func (c *Config) UpdateConfigWithStatus(updates map[string]interface{}) (bool, e
 			if v := toInt(value); v >= 1 && v <= 50 {
 				c.LibraryScanEpisodeCount = v
 			}
+		// ✅ 新增：增量扫描间隔
+		case "library_scan_incremental_minutes":
+			if v := toInt(value); v >= 1 && v <= 1440 {
+				if c.LibraryScanIncrementalMinutes != v {
+					c.LibraryScanIncrementalMinutes = v
+					// ⚠️ 增量扫描器在 Start() 时创建 ticker，改配置后需要重启生效
+					needsRestart = true
+					log.Printf("🔄 检测到增量扫描间隔变更: %d 分钟（重启后生效）", v)
+				}
+			}
 		case "webhook_notify_token":
 			if v, ok := value.(string); ok {
 				if v == "****" {
@@ -902,6 +934,11 @@ func validateConfigUpdates(updates map[string]interface{}) error {
 					return fmt.Errorf("strm_resolve_mode 必须是 auto/passthrough/always 之一（当前: %s）", v)
 				}
 			}
+		// ✅ 新增：增量扫描间隔校验
+		case "library_scan_incremental_minutes":
+			if v := toInt(value); v < 1 || v > 1440 {
+				return fmt.Errorf("library_scan_incremental_minutes 必须在 1-1440 分钟之间（当前: %d）", v)
+			}
 		// bool 开关类配置无需额外校验（类型已由 UpdateConfig 的 type assertion 保证）
 		case "enable_lan_strm", "enable_preload", "enable_smart_ttl", "enable_cdn_warmup":
 			// bool 类型，无额外约束
@@ -1009,6 +1046,8 @@ func (c *Config) saveConfigLocked() error {
 	viper.Set("library_scan_concurrency", c.LibraryScanConcurrency)
 	viper.Set("library_scan_interval_ms", c.LibraryScanIntervalMs)
 	viper.Set("library_scan_episode_count", c.LibraryScanEpisodeCount)
+	// ✅ 增量扫描间隔
+	viper.Set("library_scan_incremental_minutes", c.LibraryScanIncrementalMinutes)
 	// ✅ Webhook 通知
 	viper.Set("webhook_notify_token", c.WebhookNotifyToken)
 	viper.Set("webhook_notify_delay_seconds", c.WebhookNotifyDelaySeconds)
@@ -1076,22 +1115,22 @@ func (c *Config) ToMap() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"listen":           c.ListenAddr,
-		"target":           c.TargetAddr,
-		"log_level":        c.LogLevel,
-		"log_dir":          c.LogDir,
-		"cache_ttl":        int(c.CacheTTL.Minutes()),
-		"dashboard_addr":   c.DashboardAddr,
-		"dashboard_user":   c.DashboardUser,
-		"dashboard_pass":   dashPassMasked,
-		"max_cache_items":  c.MaxCacheItems,
-		"strm_paths":       c.StrmPaths,
-		"strm_volumes":     c.StrmVolumes,
-		"stats_token":      statsTokenMasked,
+		"listen":            c.ListenAddr,
+		"target":            c.TargetAddr,
+		"log_level":         c.LogLevel,
+		"log_dir":           c.LogDir,
+		"cache_ttl":         int(c.CacheTTL.Minutes()),
+		"dashboard_addr":    c.DashboardAddr,
+		"dashboard_user":    c.DashboardUser,
+		"dashboard_pass":    dashPassMasked,
+		"max_cache_items":   c.MaxCacheItems,
+		"strm_paths":        c.StrmPaths,
+		"strm_volumes":      c.StrmVolumes,
+		"stats_token":       statsTokenMasked,
 		"strm_resolve_mode": c.StrmResolveMode,
-		"enable_lan_strm":  c.EnableLanStrm,
-		"enable_preload":   c.EnablePreload,
-		"enable_smart_ttl": c.EnableSmartTTL,
+		"enable_lan_strm":   c.EnableLanStrm,
+		"enable_preload":    c.EnablePreload,
+		"enable_smart_ttl":  c.EnableSmartTTL,
 		"enable_cdn_warmup": c.EnableCDNWarmup,
 		// 海报墙预取
 		"enable_poster_prefetch":      c.EnablePosterPrefetch,
@@ -1104,6 +1143,8 @@ func (c *Config) ToMap() map[string]interface{} {
 		"library_scan_concurrency":   c.LibraryScanConcurrency,
 		"library_scan_interval_ms":   c.LibraryScanIntervalMs,
 		"library_scan_episode_count": c.LibraryScanEpisodeCount,
+		// ✅ 增量扫描间隔
+		"library_scan_incremental_minutes": c.LibraryScanIncrementalMinutes,
 		// ✅ Webhook 通知
 		"webhook_notify_token":         webhookTokenMasked,
 		"webhook_notify_delay_seconds": c.WebhookNotifyDelaySeconds,
@@ -1296,6 +1337,7 @@ library_scan_on_start: false
 library_scan_concurrency: 2
 library_scan_interval_ms: 500
 library_scan_episode_count: 5
+library_scan_incremental_minutes: 5
 webhook_notify_token: ""
 webhook_notify_delay_seconds: 15
 listen: :28005
