@@ -10,14 +10,13 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
-
-// ========== 辅助结构体 ==========
 
 type libraryInfo struct {
 	ID   string
@@ -35,12 +34,12 @@ type jsonListResponse struct {
 }
 
 type jsonItem struct {
-	Id   string `json:"Id"`
-	Name string `json:"Name"`
-	Type string `json:"Type"`
+	Id          string `json:"Id"`
+	Name        string `json:"Name"`
+	Type        string `json:"Type"`
+	DateCreated string `json:"DateCreated"`
 }
 
-// 常量
 const maxScanItems = 10000
 const batchFlushSize = 3
 const memSafetyThresholdMB = 400
@@ -53,12 +52,14 @@ type LibraryScanner struct {
 	authStore     *AuthStore
 	stopCh        chan struct{}
 	stopOnce      sync.Once
+	wg            sync.WaitGroup
 	running       atomic.Bool
 	lastScanTime  time.Time
 	lastScanStats BatchStats
+
+	lastGCTime atomic.Int64
 }
 
-// NewLibraryScanner 创建全库扫描器
 func NewLibraryScanner(s *Server, b *BatchPrefetcher, auth *AuthStore) *LibraryScanner {
 	return &LibraryScanner{
 		server:    s,
@@ -77,20 +78,33 @@ func (ls *LibraryScanner) Start() {
 	}
 	cron := config.Global.GetLibraryScanCron()
 	if cron != "" {
-		go ls.cronScheduler(cron)
+		ls.wg.Add(1)
+		go func() {
+			defer ls.wg.Done()
+			ls.cronScheduler(cron)
+		}()
 		ls.logger.Info("📚 [全库扫描] 定时任务已启动: %s", cron)
 	} else {
 		ls.logger.Info("📚 [全库扫描] 未配置定时任务 (library_scan_cron 为空)")
 	}
 	if config.Global.GetLibraryScanOnStart() {
+		ls.wg.Add(1)
 		go func() {
+			defer ls.wg.Done()
 			ls.logger.Info("📚 [全库扫描] 启动后立即扫描")
 			ls.scanOnce(context.Background())
 		}()
 	}
 }
 
-// cronScheduler 定时调度器
+// Stop 停止扫描并等待所有 goroutine 退出
+func (ls *LibraryScanner) Stop() {
+	ls.stopOnce.Do(func() {
+		close(ls.stopCh)
+	})
+	ls.wg.Wait()
+}
+
 func (ls *LibraryScanner) cronScheduler(cron string) {
 	for {
 		nextDelay, err := ls.calcNextDelay(cron)
@@ -108,7 +122,6 @@ func (ls *LibraryScanner) cronScheduler(cron string) {
 	}
 }
 
-// calcNextDelay 计算 cron 到下次触发的时间间隔
 func (ls *LibraryScanner) calcNextDelay(cron string) (time.Duration, error) {
 	parts := strings.Split(cron, ":")
 	if len(parts) != 2 {
@@ -130,36 +143,34 @@ func (ls *LibraryScanner) calcNextDelay(cron string) (time.Duration, error) {
 	return next.Sub(now), nil
 }
 
-// Stop 停止扫描
-func (ls *LibraryScanner) Stop() {
-	ls.stopOnce.Do(func() {
-		close(ls.stopCh)
-	})
-}
-
-// TriggerScan 手动触发扫描
+// TriggerScan 手动触发（CAS 前置，避免并发双跑）
 func (ls *LibraryScanner) TriggerScan() error {
-	if ls.running.Load() {
+	if !ls.running.CompareAndSwap(false, true) {
 		return fmt.Errorf("扫描正在进行中，请稍后再试")
 	}
-	go ls.scanOnce(context.Background())
+	ls.wg.Add(1)
+	go func() {
+		defer ls.wg.Done()
+		defer ls.running.Store(false)
+		ls.scanOnceLocked(context.Background())
+	}()
 	return nil
 }
 
-// IsRunning 是否正在扫描
 func (ls *LibraryScanner) IsRunning() bool {
 	return ls.running.Load()
 }
 
-// GetStatus 获取扫描状态
 func (ls *LibraryScanner) GetStatus() map[string]interface{} {
 	status := map[string]interface{}{
 		"running": ls.running.Load(),
 		"lastScanStats": map[string]interface{}{
-			"total":   ls.lastScanStats.Total,
-			"success": ls.lastScanStats.Success,
-			"skipped": ls.lastScanStats.Skipped,
-			"failed":  ls.lastScanStats.Failed,
+			"total":     ls.lastScanStats.Total,
+			"success":   ls.lastScanStats.Success,
+			"skipped":   ls.lastScanStats.Skipped,
+			"deduped":   ls.lastScanStats.Deduped,
+			"failed":    ls.lastScanStats.Failed,
+			"cancelled": ls.lastScanStats.Cancelled,
 		},
 	}
 	if !ls.lastScanTime.IsZero() {
@@ -168,14 +179,18 @@ func (ls *LibraryScanner) GetStatus() map[string]interface{} {
 	return status
 }
 
-// scanOnce 执行一次完整扫描
+// scanOnce 定时/启动触发入口（自持 running）
 func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 	if !ls.running.CompareAndSwap(false, true) {
 		ls.logger.Warn("📚 [全库扫描] 已有扫描在进行中，跳过")
 		return
 	}
 	defer ls.running.Store(false)
+	ls.scanOnceLocked(ctx)
+}
 
+// scanOnceLocked 已持有 running 的扫描主体
+func (ls *LibraryScanner) scanOnceLocked(ctx context.Context) {
 	ls.logger.Info("📚 [全库扫描] 开始")
 	startTime := time.Now()
 
@@ -210,7 +225,9 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 		allStats.Total += stats.Total
 		allStats.Success += stats.Success
 		allStats.Skipped += stats.Skipped
+		allStats.Deduped += stats.Deduped
 		allStats.Failed += stats.Failed
+		allStats.Cancelled += stats.Cancelled
 
 		if stats.Failed > 0 {
 			for _, item := range pending {
@@ -251,8 +268,12 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 			batch := failedItems[i:end]
 
 			stats := ls.batch.PrefetchBatch(ctx, batch, authHeaders, "library_retry", 60, "全库扫描-重试")
+			allStats.Total += stats.Total
 			allStats.Success += stats.Success
+			allStats.Skipped += stats.Skipped
+			allStats.Deduped += stats.Deduped
 			allStats.Failed += stats.Failed
+			allStats.Cancelled += stats.Cancelled
 
 			select {
 			case <-time.After(1 * time.Second):
@@ -269,13 +290,13 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 		retryFailed()
 		ls.lastScanTime = time.Now()
 		ls.lastScanStats = allStats
+		label := "完成"
 		if reason != "" {
-			ls.logger.Info("📚 [全库扫描] 结束(%s): 总计=%d 成功=%d 跳过=%d 失败=%d 耗时=%v",
-				reason, allStats.Total, allStats.Success, allStats.Skipped, allStats.Failed, time.Since(startTime))
-		} else {
-			ls.logger.Info("📚 [全库扫描] 完成: 总计=%d 成功=%d 跳过=%d 失败=%d 耗时=%v",
-				allStats.Total, allStats.Success, allStats.Skipped, allStats.Failed, time.Since(startTime))
+			label = "结束(" + reason + ")"
 		}
+		ls.logger.Info("📚 [全库扫描] %s: 总计=%d 成功=%d 跳过=%d 去重=%d 失败=%d 取消=%d 耗时=%v",
+			label, allStats.Total, allStats.Success, allStats.Skipped,
+			allStats.Deduped, allStats.Failed, allStats.Cancelled, time.Since(startTime))
 	}
 
 	for _, lib := range libraries {
@@ -289,7 +310,7 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 
 		ls.logger.Info("📚 [全库扫描] 扫描媒体库: %s (ID=%s)", lib.Name, lib.ID)
 
-		items, total, err := ls.queryItems(ctx, userID, authHeaders, lib.ID, 0, 500)
+		items, total, err := ls.queryAllItems(ctx, userID, authHeaders, lib.ID)
 		if err != nil {
 			ls.logger.Warn("📚 [全库扫描] 查询项目失败: 库=%s err=%v", lib.Name, err)
 			continue
@@ -313,18 +334,16 @@ func (ls *LibraryScanner) scanOnce(ctx context.Context) {
 	finishScan("")
 }
 
-// waitForAuth 等待认证信息就绪
+// waitForAuth 等待认证（去掉 IsReady 双重检查，避免竞态）
 func (ls *LibraryScanner) waitForAuth(ctx context.Context) (string, http.Header, bool) {
 	const maxWait = 10 * time.Minute
 	const checkInterval = 30 * time.Second
 	deadline := time.Now().Add(maxWait)
 
 	for {
-		if ls.authStore.IsReady() {
-			headers, userID, expired := ls.authStore.Get()
-			if !expired && userID != "" && headers != nil {
-				return userID, headers, true
-			}
+		headers, userID, expired := ls.authStore.Get()
+		if !expired && userID != "" && headers != nil {
+			return userID, headers, true
 		}
 		if time.Now().After(deadline) {
 			return "", nil, false
@@ -340,23 +359,32 @@ func (ls *LibraryScanner) waitForAuth(ctx context.Context) (string, http.Header,
 	}
 }
 
-// checkMemoryAndYield 内存安全检查
+// checkMemoryAndYield 内存检查（改 HeapInuse + GC 节流）
 func (ls *LibraryScanner) checkMemoryAndYield(ctx context.Context) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	memMB := float64(m.Alloc) / 1024 / 1024
-	if memMB > memSafetyThresholdMB {
-		ls.logger.Warn("📚 [全库扫描] 内存过高 (%.1fMB/%dMB)，暂停扫描并触发GC", memMB, memSafetyThresholdMB)
-		runtime.GC()
-		select {
-		case <-time.After(2 * time.Second):
-		case <-ls.stopCh:
-		case <-ctx.Done():
-		}
+	memMB := float64(m.HeapInuse) / 1024 / 1024
+	if memMB <= memSafetyThresholdMB {
+		return
+	}
+	now := time.Now().Unix()
+	last := ls.lastGCTime.Load()
+	if now-last < 30 {
+		return
+	}
+	ls.lastGCTime.Store(now)
+
+	ls.logger.Warn("📚 [全库扫描] 内存过高 (%.1fMB/%dMB)，暂停扫描并触发GC", memMB, memSafetyThresholdMB)
+	runtime.GC()
+	debug.FreeOSMemory()
+	select {
+	case <-time.After(2 * time.Second):
+	case <-ls.stopCh:
+	case <-ctx.Done():
 	}
 }
 
-// doRequest：支持从 X-Emby-Authorization 解析 Token
+// doRequest 保持原样
 func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header, path string) (*http.Response, error) {
 	ls.server.proxyMu.RLock()
 	targetURL := ls.server.targetURL
@@ -407,11 +435,15 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
 
 	if token != "" {
-		userID := ls.getUserID()
+		_, userID, _ := ls.authStore.Get()
 		embyAuth := `MediaBrowser UserId="` + userID + `", Client="Emby Web", Device="Chrome", DeviceId="fnysfd-scanner", Version="4.7.0.0", Token="` + token + `"`
 		req.Header.Set("X-Emby-Authorization", embyAuth)
 		req.Header.Set("X-Emby-Token", token)
-		ls.logger.Debug("📤 [Emby请求] 已设置认证头 (Token: %s)", token)
+		preview := token
+		if len(preview) > 8 {
+			preview = preview[:8]
+		}
+		ls.logger.Debug("📤 [Emby请求] 已设置认证头 (Token: %s...)", preview)
 	} else {
 		ls.logger.Warn("⚠️ [Emby请求] 未找到 Token")
 	}
@@ -423,19 +455,7 @@ func (ls *LibraryScanner) doRequest(ctx context.Context, authHeaders http.Header
 	return ls.server.retryClient.Do(req)
 }
 
-func (ls *LibraryScanner) getUserID() string {
-	_, userID, _ := ls.authStore.Get()
-	return userID
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// queryViews 查询媒体库列表
+// queryViews 空列表 fallback 简化
 func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHeaders http.Header) ([]libraryInfo, error) {
 	path := "/emby/Users/" + userID + "/Views"
 
@@ -456,44 +476,26 @@ func (ls *LibraryScanner) queryViews(ctx context.Context, userID string, authHea
 	}
 
 	var listResp jsonListResponse
-	if err := json.Unmarshal(body, &listResp); err == nil && len(listResp.Items) > 0 {
-		libraries := make([]libraryInfo, 0, len(listResp.Items))
-		for _, item := range listResp.Items {
-			if item.Id == "" {
-				continue
-			}
-			libraries = append(libraries, libraryInfo{
-				ID:   item.Id,
-				Name: item.Name,
-			})
+	if err := json.Unmarshal(body, &listResp); err != nil {
+		var items []jsonItem
+		if err2 := json.Unmarshal(body, &items); err2 != nil {
+			return nil, fmt.Errorf("JSON解析失败: %w / %w", err, err2)
 		}
-		return libraries, nil
+		listResp.Items = items
 	}
 
-	var items []jsonItem
-	if err := json.Unmarshal(body, &items); err != nil {
-		return nil, fmt.Errorf("JSON解析失败: %w, body=%s", err, string(body))
-	}
-
-	libraries := make([]libraryInfo, 0, len(items))
-	for _, item := range items {
+	libraries := make([]libraryInfo, 0, len(listResp.Items))
+	for _, item := range listResp.Items {
 		if item.Id == "" {
 			continue
 		}
-		libraries = append(libraries, libraryInfo{
-			ID:   item.Id,
-			Name: item.Name,
-		})
+		libraries = append(libraries, libraryInfo{ID: item.Id, Name: item.Name})
 	}
 	return libraries, nil
 }
 
-// ============================================================
-// ✅ queryItems：支持电影 + 电视剧 + 其他（Video/Episode）
-// ============================================================
+// queryItems 单个分页查询（补齐 StartIndex）
 func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHeaders http.Header, parentID string, startIndex, limit int) ([]PrefetchItem, int, error) {
-	_ = startIndex
-
 	if limit <= 0 {
 		limit = 500
 	}
@@ -502,6 +504,7 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 	query.Set("ParentId", parentID)
 	query.Set("Fields", "Path,MediaSources")
 	query.Set("Limit", strconv.Itoa(limit))
+	query.Set("StartIndex", strconv.Itoa(startIndex))
 
 	path := "/emby/Users/" + userID + "/Items?" + query.Encode()
 
@@ -531,19 +534,15 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 		if item.Id == "" {
 			continue
 		}
-
 		switch item.Type {
-		case "Movie":
-			// 电影直接加入预取列表
+		case "Movie", "Video", "Episode":
 			result = append(result, PrefetchItem{
 				ItemID: item.Id,
 				UserID: userID,
 				Name:   item.Name,
 				Type:   item.Type,
 			})
-
 		case "Series":
-			// ✅ 剧集：展开到 Episode
 			select {
 			case <-ls.stopCh:
 				return result, listResp.TotalRecordCount, nil
@@ -551,38 +550,47 @@ func (ls *LibraryScanner) queryItems(ctx context.Context, userID string, authHea
 				return result, listResp.TotalRecordCount, nil
 			default:
 			}
-
 			episodes, err := ls.querySeriesEpisodes(ctx, userID, authHeaders, item.Id, item.Name)
 			if err != nil {
 				ls.logger.Warn("📚 [全库扫描] 展开剧集失败: %s err=%v", item.Name, err)
 				continue
 			}
 			result = append(result, episodes...)
-			ls.logger.Debug("📚 [全库扫描] 剧集 %s 展开为 %d 集", item.Name, len(episodes))
-
-		case "Video", "Episode":
-			// ✅ 单个视频/单集：直接加入预取列表（"其他"分类里的视频文件、B站视频等）
-			result = append(result, PrefetchItem{
-				ItemID: item.Id,
-				UserID: userID,
-				Name:   item.Name,
-				Type:   item.Type,
-			})
-
 		default:
-			// 其他未识别类型，跳过并打日志方便排查
 			ls.logger.Debug("📚 [全库扫描] 跳过未识别类型: %s (%s)", item.Name, item.Type)
 		}
 	}
 	return result, listResp.TotalRecordCount, nil
 }
 
-// ============================================================
-// ✅ querySeriesEpisodes：把整部剧展开为所有季的所有集
-//    流程：Series → Seasons → 每季查 Episodes
-// ============================================================
+// queryAllItems 分页拉取一个库的全部 Items
+func (ls *LibraryScanner) queryAllItems(ctx context.Context, userID string, authHeaders http.Header, parentID string) ([]PrefetchItem, int, error) {
+	const pageSize = 500
+	var all []PrefetchItem
+	total := 0
+	for start := 0; ; start += pageSize {
+		page, t, err := ls.queryItems(ctx, userID, authHeaders, parentID, start, pageSize)
+		if err != nil {
+			return all, total, err
+		}
+		total = t
+		all = append(all, page...)
+
+		if len(page) < pageSize || start+pageSize >= total {
+			return all, total, nil
+		}
+		select {
+		case <-ls.stopCh:
+			return all, total, nil
+		case <-ctx.Done():
+			return all, total, nil
+		default:
+		}
+	}
+}
+
+// querySeriesEpisodes 展开剧集（去掉固定 200ms sleep，交给 PrefetchBatch 节流）
 func (ls *LibraryScanner) querySeriesEpisodes(ctx context.Context, userID string, authHeaders http.Header, seriesID string, seriesName string) ([]PrefetchItem, error) {
-	// 1. 查季列表
 	path := "/emby/Shows/" + seriesID + "/Seasons"
 
 	resp, err := ls.doRequest(ctx, authHeaders, path)
@@ -606,17 +614,14 @@ func (ls *LibraryScanner) querySeriesEpisodes(ctx context.Context, userID string
 	}
 
 	if len(seasonsResp.Items) == 0 {
-		ls.logger.Debug("📚 [全库扫描] 剧集 %s 无季", seriesName)
 		return nil, nil
 	}
 
-	// 2. 遍历每季，查该季所有 Episode
 	var allEpisodes []PrefetchItem
 	for _, season := range seasonsResp.Items {
 		if season.Id == "" {
 			continue
 		}
-
 		select {
 		case <-ls.stopCh:
 			return allEpisodes, nil
@@ -624,32 +629,16 @@ func (ls *LibraryScanner) querySeriesEpisodes(ctx context.Context, userID string
 			return allEpisodes, nil
 		default:
 		}
-
 		episodes, err := ls.querySeasonEpisodes(ctx, userID, authHeaders, seriesID, season.Id)
 		if err != nil {
 			ls.logger.Warn("📚 [全库扫描] 查询季 %s 的集失败: %v", season.Name, err)
 			continue
 		}
 		allEpisodes = append(allEpisodes, episodes...)
-
-		// 每季之间小延迟，避免请求过密
-		select {
-		case <-time.After(200 * time.Millisecond):
-		case <-ls.stopCh:
-			return allEpisodes, nil
-		case <-ctx.Done():
-			return allEpisodes, nil
-		}
 	}
-
 	return allEpisodes, nil
 }
 
-// ============================================================
-// ✅ querySeasonEpisodes：查询某一季下所有集
-//    端点：/emby/Shows/{seriesId}/Episodes?SeasonId={seasonId}
-//    （已通过 curl 测试验证飞牛支持）
-// ============================================================
 func (ls *LibraryScanner) querySeasonEpisodes(ctx context.Context, userID string, authHeaders http.Header, seriesID, seasonID string) ([]PrefetchItem, error) {
 	query := url.Values{}
 	query.Set("SeasonId", seasonID)
@@ -687,25 +676,19 @@ func (ls *LibraryScanner) querySeasonEpisodes(ctx context.Context, userID string
 			ItemID: item.Id,
 			UserID: userID,
 			Name:   item.Name,
-			Type:   item.Type, // "Episode"
+			Type:   item.Type,
 		})
 	}
 	return episodes, nil
 }
 
-// ============================================================
-// ✅ ScanLibraryOnce：只扫描指定媒体库（用于海报墙预取触发）
-//
-// 与 scanOnce（全库）的区别：
-//   - 只查询一个媒体库的 Items
-//   - 复用 queryItems（含 Movie/TV/Video 处理）
-//   - 复用 PrefetchBatch（含去重、缓存跳过）
-//   - 无失败重试（海报墙是尽力而为，不做重试）
-// ============================================================
+// ScanLibraryOnce 单库扫描（CAS 前置 + ctx.Err）
 func (ls *LibraryScanner) ScanLibraryOnce(ctx context.Context, libID string) error {
 	if !ls.running.CompareAndSwap(false, true) {
 		return fmt.Errorf("已有扫描在进行中")
 	}
+	ls.wg.Add(1)
+	defer ls.wg.Done()
 	defer ls.running.Store(false)
 
 	startTime := time.Now()
@@ -717,7 +700,7 @@ func (ls *LibraryScanner) ScanLibraryOnce(ctx context.Context, libID string) err
 
 	ls.logger.Info("📚 [单库扫描] 开始 (库=%s)", libID)
 
-	items, total, err := ls.queryItems(ctx, userID, authHeaders, libID, 0, 500)
+	items, total, err := ls.queryAllItems(ctx, userID, authHeaders, libID)
 	if err != nil {
 		return fmt.Errorf("查询项目失败: %w", err)
 	}
@@ -725,7 +708,6 @@ func (ls *LibraryScanner) ScanLibraryOnce(ctx context.Context, libID string) err
 	ls.logger.Info("📚 [单库扫描] 获取到 %d 个项目 (total=%d)", len(items), total)
 
 	if len(items) == 0 {
-		ls.logger.Info("📚 [单库扫描] 完成: 无项目")
 		return nil
 	}
 
@@ -739,30 +721,34 @@ func (ls *LibraryScanner) ScanLibraryOnce(ctx context.Context, libID string) err
 			allStats.Total += stats.Total
 			allStats.Success += stats.Success
 			allStats.Skipped += stats.Skipped
+			allStats.Deduped += stats.Deduped
 			allStats.Failed += stats.Failed
+			allStats.Cancelled += stats.Cancelled
 			pending = pending[:0]
 
 			select {
 			case <-time.After(800 * time.Millisecond):
 			case <-ls.stopCh:
-				return nil
+				return ctx.Err()
 			case <-ctx.Done():
-				return nil
+				return ctx.Err()
 			}
 		}
 	}
 
-	// 处理剩余
 	if len(pending) > 0 {
 		stats := ls.batch.PrefetchBatch(ctx, pending, authHeaders, "library_single", 3600, "单库扫描")
 		allStats.Total += stats.Total
 		allStats.Success += stats.Success
 		allStats.Skipped += stats.Skipped
+		allStats.Deduped += stats.Deduped
 		allStats.Failed += stats.Failed
+		allStats.Cancelled += stats.Cancelled
 	}
 
-	ls.logger.Info("📚 [单库扫描] 完成: 总计=%d 成功=%d 跳过=%d 失败=%d 耗时=%v",
-		allStats.Total, allStats.Success, allStats.Skipped, allStats.Failed, time.Since(startTime))
+	ls.logger.Info("📚 [单库扫描] 完成: 总计=%d 成功=%d 跳过=%d 去重=%d 失败=%d 取消=%d 耗时=%v",
+		allStats.Total, allStats.Success, allStats.Skipped, allStats.Deduped,
+		allStats.Failed, allStats.Cancelled, time.Since(startTime))
 
 	return nil
 }
