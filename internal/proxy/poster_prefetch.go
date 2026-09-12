@@ -10,11 +10,9 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"fnysfd/internal/config"
 	"fnysfd/internal/logger"
-	"fnysfd/internal/util"
 )
 
 // PosterPrefetcher 海报墙预取器
