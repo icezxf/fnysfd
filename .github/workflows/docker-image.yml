@@ -11,7 +11,7 @@ on:
       tag:
         description: '镜像标签'
         required: true
-        default: 'aa'
+        default: 'main'
         type: string
 
 env:
