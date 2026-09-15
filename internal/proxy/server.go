@@ -41,7 +41,7 @@ type Server struct {
 	httpServer      *http.Server
 	stopOnce        sync.Once
 	retryClient     *http.Client
-	prefetchClient  *http.Client // ✅ 新增：批量预取专用（长超时）
+	prefetchClient  *http.Client // 批量预取专用（长超时）
 	targetURL       *url.URL
 	prefetchRecent  map[string]int64
 	prefetchMu      sync.Mutex
@@ -51,6 +51,7 @@ type Server struct {
 	batchPrefetcher *BatchPrefetcher
 	posterPrefetch  *PosterPrefetcher
 	libraryScanner  *LibraryScanner
+	doubanProvider  *DoubanProvider // ✅ 新增
 
 	// 服务级 context：Stop 时取消，用于中断内部长任务
 	serverCtx    context.Context
@@ -79,7 +80,7 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 
-	// 主动重试客户端（实时路径用：详情页/主动预请求/MediaSource兜底）
+	// 主动重试客户端（实时路径用）
 	retryTransport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second,
@@ -100,9 +101,7 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		Transport: retryTransport,
 	}
 
-	// ✅ 批量预取专用客户端（长超时）
-	// 飞牛"实时 probe 未探测的媒体"需要几十秒（向网盘请求 + 生成响应），
-	// 用独立的 90s/120s 超时 client，避免影响其他实时路径（stream/detail）
+	// 批量预取专用客户端（长超时）
 	prefetchTransport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
@@ -114,16 +113,16 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		IdleConnTimeout:       120 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 90 * time.Second, // 关键：等飞牛慢慢 probe
+		ResponseHeaderTimeout: 90 * time.Second,
 		DisableKeepAlives:     false,
 		ForceAttemptHTTP2:     true,
 	}
 	prefetchClient := &http.Client{
-		Timeout:   120 * time.Second, // 整个请求最长 120s
+		Timeout:   120 * time.Second,
 		Transport: prefetchTransport,
 	}
 
-	// ✅ 服务级 context
+	// 服务级 context
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 
 	s := &Server{
@@ -135,7 +134,7 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		proxy:           proxy,
 		currentTarget:   cfg.GetTargetAddr(),
 		retryClient:     retryClient,
-		prefetchClient:  prefetchClient, // ✅ 新增
+		prefetchClient:  prefetchClient,
 		targetURL:       targetURL,
 		prefetchRecent:  make(map[string]int64),
 		version:         version,
@@ -159,7 +158,7 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		}
 		log.Debug("⏭️ [下一集预取] STRM缓存回调触发: 当前=%s", itemID)
 
-		// ✅ 克隆请求再传给 goroutine，避免跨 goroutine 使用同一 *http.Request
+		// ✅ 克隆请求再传给 goroutine
 		reqCopy := resp.Request.Clone(context.Background())
 		userID := reqCopy.URL.Query().Get("UserId")
 		go s.prefetchNextEpisodesBestEffort(reqCopy, itemID, userID)
@@ -184,7 +183,6 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		if err := s.authStore.LoginViaEmby(fnosUser, fnosPass, serverAddr); err != nil {
 			log.Warn("⚠️ [主动登录] 飞牛影视登录失败，将依赖被动捕获: %v", err)
 		} else {
-			// ✅ 走 Get() 避免直接读字段造成竞态
 			_, uid, _ := s.authStore.Get()
 			log.Info("✅ [主动登录] 飞牛影视登录成功，UserID=%s", uid)
 		}
@@ -194,6 +192,7 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 
 	s.batchPrefetcher = NewBatchPrefetcher(s, initialConcurrency)
 	s.posterPrefetch = NewPosterPrefetcher(s, s.batchPrefetcher, s.authStore)
+	s.doubanProvider = NewDoubanProvider(s) // ✅ 新增
 	s.libraryScanner = NewLibraryScanner(s, s.batchPrefetcher, s.authStore)
 	s.logger.Info("📦 [批量预取] 引擎已初始化: 并发=%d (海报墙=%d, 全库扫描=%d)",
 		initialConcurrency, cfg.GetPosterPrefetchConcurrency(), cfg.GetLibraryScanConcurrency())
@@ -239,8 +238,6 @@ func (s *Server) Start() error {
 }
 
 // applyProxyHandlers 给 proxy 挂上 Director / ModifyResponse / ErrorHandler
-//
-// setupProxy 与 Reload 共用，避免 Reload 时遗漏 ErrorHandler 等。
 func (s *Server) applyProxyHandlers(p *httputil.ReverseProxy, targetURL *url.URL) {
 	originalDirector := p.Director
 	p.Director = func(req *http.Request) {
@@ -254,7 +251,6 @@ func (s *Server) applyProxyHandlers(p *httputil.ReverseProxy, targetURL *url.URL
 
 		// 进入详情页就主动预请求 PlaybackInfo
 		if itemID, userID, ok := s.isItemDetailRequest(req); ok {
-			// ✅ 克隆请求再传入 goroutine，避免跨 goroutine 使用同一 *http.Request
 			reqCopy := req.Clone(context.Background())
 			go s.prefetchForDetailPage(reqCopy, itemID, userID)
 			return
@@ -267,9 +263,7 @@ func (s *Server) applyProxyHandlers(p *httputil.ReverseProxy, targetURL *url.URL
 		}
 
 		// 拦截 FNOS 原生海报墙请求
-		// ⚠️ 海报墙预取触发已临时禁用（方案 A），此处只做 body 读取的防御性限制
 		if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/v/api/v1/item/list") {
-			// ✅ 1MB 上限，防止恶意大 body 打满内存
 			body, err := io.ReadAll(io.LimitReader(req.Body, 1*1024*1024))
 			if err == nil && len(body) > 0 {
 				req.Body.Close()
@@ -277,8 +271,6 @@ func (s *Server) applyProxyHandlers(p *httputil.ReverseProxy, targetURL *url.URL
 				req.ContentLength = int64(len(body))
 				req.Header.Set("Content-Length", strconv.Itoa(len(body)))
 				if s.posterPrefetch != nil {
-					// ⚠️ HandleFnosListRequest 内部已立即 return（方案 A），
-					// 保留调用以便恢复时只删函数首行
 					go s.posterPrefetch.HandleFnosListRequest(body)
 				}
 			}
@@ -304,7 +296,7 @@ func (s *Server) applyProxyHandlers(p *httputil.ReverseProxy, targetURL *url.URL
 	}
 }
 
-// setupProxy 配置反向代理的Director和ModifyResponse
+// setupProxy 配置反向代理
 func (s *Server) setupProxy(targetURL *url.URL) {
 	s.applyProxyHandlers(s.proxy, targetURL)
 }
@@ -318,14 +310,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 // Stop 停止服务器
-//
-// 顺序：取消 serverCtx → 停 httpServer → 停后台任务 → 关 cache/logger
 func (s *Server) Stop() error {
 	var err error
 	s.stopOnce.Do(func() {
 		s.logger.Info("🛑 正在关闭服务...")
 
-		// 0. 取消服务级 context，中断内部长任务
+		// 0. 取消服务级 context
 		if s.serverCancel != nil {
 			s.serverCancel()
 		}
@@ -340,6 +330,9 @@ func (s *Server) Stop() error {
 		// 2. 停止后台任务
 		if s.libraryScanner != nil {
 			s.libraryScanner.Stop()
+		}
+		if s.doubanProvider != nil { // ✅ 新增
+			s.doubanProvider.Stop()
 		}
 		if s.batchPrefetcher != nil {
 			s.batchPrefetcher.Stop()
@@ -359,9 +352,10 @@ func (s *Server) Stop() error {
 }
 
 func (s *Server) GetCache() *cache.Cache                  { return s.cache }
-func (s *Server) GetLogger() *logger.Logger                { return s.logger }
+func (s *Server) GetLogger() *logger.Logger               { return s.logger }
 func (s *Server) GetStreamHandler() *handler.StreamHandler { return s.streamHandler }
-func (s *Server) GetLibraryScanner() *LibraryScanner       { return s.libraryScanner }
+func (s *Server) GetLibraryScanner() *LibraryScanner      { return s.libraryScanner }
+func (s *Server) GetDoubanProvider() *DoubanProvider      { return s.doubanProvider } // ✅ 新增
 
 // Reload 重新加载配置
 func (s *Server) Reload() {
@@ -384,7 +378,6 @@ func (s *Server) Reload() {
 		}
 
 		newProxy := httputil.NewSingleHostReverseProxy(targetURL)
-		// ✅ 复用公共挂载逻辑，避免遗漏 ErrorHandler / Director 拦截
 		s.applyProxyHandlers(newProxy, targetURL)
 
 		s.proxyMu.Lock()
@@ -403,9 +396,64 @@ func (s *Server) Reload() {
 	s.logger.Info("📊 缓存条目数限制已更新: %d", s.config.GetMaxCacheItems())
 }
 
+// injectDoubanRatings 解析 JSON，对每个 item 注入豆瓣评分
+//
+// ✅ 新增：豆瓣评分注入
+func (s *Server) injectDoubanRatings(body []byte) []byte {
+	var obj map[string]interface{}
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+
+	injected := false
+
+	// 列表响应
+	if items, ok := obj["Items"].([]interface{}); ok {
+		for _, it := range items {
+			if m, ok := it.(map[string]interface{}); ok {
+				s.doubanProvider.InjectInto(m)
+				injected = true
+			}
+		}
+	} else if _, ok := obj["Id"]; ok {
+		// 单项响应
+		s.doubanProvider.InjectInto(obj)
+		injected = true
+	}
+
+	if !injected {
+		return body
+	}
+
+	newBody, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return newBody
+}
+
 // handleResponse 处理响应
 func (s *Server) handleResponse(resp *http.Response) error {
-	// ✅ 拦截 Emby Views 响应，缓存媒体库列表（用于 FNOS→Emby 映射）
+	// ============================================================
+	// ✅ 豆瓣评分注入：拦截 /Items 响应（列表或详情）
+	// ============================================================
+	if s.doubanProvider != nil && resp.StatusCode == http.StatusOK && resp.Request != nil {
+		path := resp.Request.URL.Path
+		if strings.Contains(path, "/Items") && !strings.Contains(path, "/PlaybackInfo") {
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
+			if err == nil && len(body) > 0 {
+				resp.Body.Close()
+				newBody := s.injectDoubanRatings(body)
+				resp.Body = io.NopCloser(bytes.NewBuffer(newBody))
+				resp.ContentLength = int64(len(newBody))
+				resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
+				resp.Header.Del("Transfer-Encoding")
+				return nil
+			}
+		}
+	}
+
+	// ✅ 拦截 Emby Views 响应，缓存媒体库列表
 	if s.posterPrefetch != nil && resp.StatusCode == http.StatusOK &&
 		resp.Request != nil && strings.HasSuffix(resp.Request.URL.Path, "/Views") {
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
@@ -420,7 +468,7 @@ func (s *Server) handleResponse(resp *http.Response) error {
 		return nil
 	}
 
-	// ✅ 拦截 FNOS 媒体库列表响应，缓存媒体库列表
+	// ✅ 拦截 FNOS 媒体库列表响应
 	if s.posterPrefetch != nil && resp.StatusCode == http.StatusOK &&
 		resp.Request != nil && strings.HasSuffix(resp.Request.URL.Path, "/v/api/v1/mediadb/list") {
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
@@ -436,26 +484,13 @@ func (s *Server) handleResponse(resp *http.Response) error {
 	}
 
 	// ⚠️ 海报墙预取触发已临时禁用（方案 A）
-	// 恢复时取消注释即可
-	// // 海报墙列表响应拦截：提取 ItemID 批量预取 Movie PlaybackInfo
 	// if s.posterPrefetch != nil && resp.StatusCode == http.StatusOK {
 	// 	if userID, ok := s.posterPrefetch.IsItemListRequest(resp.Request); ok {
-	// 		body, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
-	// 		if err != nil {
-	// 			s.logger.Warn("🖼️ [海报墙预取] 读取响应体失败: %v", err)
-	// 			return err
-	// 		}
-	// 		resp.Body.Close()
-	// 		resp.Body = io.NopCloser(bytes.NewBuffer(body))
-	// 		resp.ContentLength = int64(len(body))
-	// 		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
-	// 		resp.Header.Del("Transfer-Encoding")
-	// 		go s.posterPrefetch.HandleListResponse(resp, body, userID)
-	// 		return nil
+	// 		...
 	// 	}
 	// }
 
-	// ✅ 防御：resp.Request 为 nil 时直接返回
+	// PlaybackInfo 处理
 	if resp.Request == nil {
 		return nil
 	}
@@ -501,8 +536,6 @@ func (s *Server) handleResponse(resp *http.Response) error {
 }
 
 // retryPlaybackInfo 主动重试 PlaybackInfo 请求
-//
-// 用 serverCtx 派生，服务关闭时能中断
 func (s *Server) retryPlaybackInfo(originalReq *http.Request) {
 	s.proxyMu.RLock()
 	targetURL := s.targetURL
@@ -539,7 +572,6 @@ func (s *Server) retryPlaybackInfo(originalReq *http.Request) {
 		resp, err := s.retryClient.Do(req)
 		if err != nil {
 			if s.serverCtx.Err() != nil {
-				s.logger.Debug("🛑 [重试] 服务关闭，中止重试: %s", reqPath)
 				return
 			}
 			s.logger.Debug("⚠️ [重试] 第%d次请求失败: %v", attempt, err)
@@ -645,13 +677,7 @@ func (s *Server) proactivePlaybackInfo(originalReq *http.Request) {
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 	resp.Body.Close()
-	if err != nil {
-		s.logger.Warn("⚠️ [主动] 读取响应体失败: %v", err)
-		return
-	}
-
-	if len(body) == 0 {
-		s.logger.Warn("⚠️ [主动] 响应体为空")
+	if err != nil || len(body) == 0 {
 		return
 	}
 
@@ -706,7 +732,6 @@ func (s *Server) prefetchForDetailPage(originalReq *http.Request, itemID string,
 		}
 	} else {
 		s.markPrefetchDone(buildPrefetchKey("detail", itemID, ""))
-		s.logger.Debug("🎬 [详情页] 预取链路调用，跳过检查但设置去重标记: %s", itemID)
 	}
 
 	s.proxyMu.RLock()
@@ -741,7 +766,6 @@ func (s *Server) prefetchForDetailPage(originalReq *http.Request, itemID string,
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(overallCtx, "GET", fullURL, nil)
 		if err != nil {
-			s.logger.Warn("❌ [详情页] 创建请求失败: %v", err)
 			return
 		}
 		req.Header = reqHeaders.Clone()
@@ -750,10 +774,8 @@ func (s *Server) prefetchForDetailPage(originalReq *http.Request, itemID string,
 		resp, err := s.retryClient.Do(req)
 		if err != nil {
 			if s.serverCtx.Err() != nil {
-				s.logger.Debug("🛑 [详情页] 服务关闭，中止: %s", itemID)
 				return
 			}
-			s.logger.Debug("⚠️ [详情页] 第%d次请求失败: %v", attempt, err)
 			if attempt < maxAttempts {
 				time.Sleep(playbackProbeRetryInterval(attempt))
 			}
@@ -762,8 +784,6 @@ func (s *Server) prefetchForDetailPage(originalReq *http.Request, itemID string,
 
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
-			s.logger.Debug("⏳ [详情页] 第%d次: %d (飞牛probe中, 已等%ds): %s",
-				attempt, resp.StatusCode, int(prefetchElapsedSeconds(attempt)), itemID)
 			if attempt < maxAttempts {
 				time.Sleep(playbackProbeRetryInterval(attempt))
 			}
@@ -772,27 +792,13 @@ func (s *Server) prefetchForDetailPage(originalReq *http.Request, itemID string,
 
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 		resp.Body.Close()
-		if err != nil {
-			s.logger.Warn("⚠️ [详情页] 读取响应体失败: %v", err)
+		if err != nil || len(body) == 0 {
 			return
 		}
 
-		if len(body) == 0 {
-			s.logger.Warn("⚠️ [详情页] 响应体为空")
-			return
-		}
-
-		if attempt == 1 {
-			s.logger.Info("✅ [详情页] 首次成功: %s", itemID)
-		} else {
-			s.logger.Info("✅ [详情页] 第%d次成功(约等%.1fs): %s (飞牛probe完成)",
-				attempt, prefetchElapsedSeconds(attempt), itemID)
-		}
 		_, _ = s.playbackHandler.Handle(resp, body)
 		return
 	}
-
-	s.logger.Debug("⚠️ [详情页] %d次尝试均未成功(飞牛probe超时约33s): %s", maxAttempts, itemID)
 }
 
 // prefetchForMediaSourceMiss 流请求发现 MediaSource 未缓存时的同步兜底
@@ -826,8 +832,6 @@ func (s *Server) prefetchForMediaSourceMiss(originalReq *http.Request, itemID st
 	reqHeaders.Set("Accept", "application/json")
 	reqHost := targetURL.Host
 
-	s.logger.Info("🧩 [MediaSource兜底] 轮询PlaybackInfo: ItemId=%s, MS=%s", itemID, mediaSourceID)
-
 	overallCtx, overallCancel := context.WithTimeout(s.serverCtx, 60*time.Second)
 	defer overallCancel()
 
@@ -835,7 +839,6 @@ func (s *Server) prefetchForMediaSourceMiss(originalReq *http.Request, itemID st
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(overallCtx, "GET", fullURL, nil)
 		if err != nil {
-			s.logger.Warn("❌ [MediaSource兜底] 创建请求失败: %v", err)
 			return false
 		}
 		req.Header = reqHeaders.Clone()
@@ -846,7 +849,6 @@ func (s *Server) prefetchForMediaSourceMiss(originalReq *http.Request, itemID st
 			if s.serverCtx.Err() != nil {
 				return false
 			}
-			s.logger.Debug("⚠️ [MediaSource兜底] 第%d次请求失败: %v", attempt, err)
 			if attempt < maxAttempts {
 				time.Sleep(mediaSourceMissRetryInterval(attempt))
 			}
@@ -855,7 +857,6 @@ func (s *Server) prefetchForMediaSourceMiss(originalReq *http.Request, itemID st
 
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
-			s.logger.Debug("⏳ [MediaSource兜底] 第%d次: %d (probe中): %s", attempt, resp.StatusCode, itemID)
 			if attempt < maxAttempts {
 				time.Sleep(mediaSourceMissRetryInterval(attempt))
 			}
@@ -865,7 +866,6 @@ func (s *Server) prefetchForMediaSourceMiss(originalReq *http.Request, itemID st
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 		resp.Body.Close()
 		if err != nil || len(body) == 0 {
-			s.logger.Debug("⚠️ [MediaSource兜底] 响应读取失败或为空: %v", err)
 			if attempt < maxAttempts {
 				time.Sleep(mediaSourceMissRetryInterval(attempt))
 			}
@@ -890,12 +890,7 @@ func (s *Server) prefetchForMediaSourceMiss(originalReq *http.Request, itemID st
 		}
 
 		if msFound {
-			s.logger.Info("✅ [MediaSource兜底] 第%d次成功: ItemId=%s, 等待URL解析...", attempt, itemID)
-			if s.streamHandler.WaitForURLResolution(cachedMediaSourceID, itemID, 5*time.Second) {
-				s.logger.Info("✅ [MediaSource兜底] URL已就绪: ItemId=%s", itemID)
-			} else {
-				s.logger.Warn("⚠️ [MediaSource兜底] URL解析未完成，流请求将自行解析: ItemId=%s", itemID)
-			}
+			s.streamHandler.WaitForURLResolution(cachedMediaSourceID, itemID, 5*time.Second)
 			return true
 		}
 
@@ -903,8 +898,6 @@ func (s *Server) prefetchForMediaSourceMiss(originalReq *http.Request, itemID st
 			time.Sleep(mediaSourceMissRetryInterval(attempt))
 		}
 	}
-
-	s.logger.Warn("⚠️ [MediaSource兜底] 超时仍未准备好: ItemId=%s, MS=%s", itemID, mediaSourceID)
 	return false
 }
 
@@ -918,31 +911,23 @@ func mediaSourceMissRetryInterval(attempt int) time.Duration {
 // prefetchNextEpisodesBestEffort 预取同一季后续集
 func (s *Server) prefetchNextEpisodesBestEffort(originalReq *http.Request, itemID string, userID string) {
 	if itemID == "" {
-		s.logger.Debug("⏭️ [下一集预取] 跳过：ItemId为空")
 		return
 	}
 	if !config.Global.GetEnablePreload() {
-		s.logger.Debug("⏭️ [下一集预取] 跳过：预加载开关已关闭 当前=%s", itemID)
 		return
 	}
 	if originalReq == nil {
-		s.logger.Debug("⏭️ [下一集预取] 跳过：原始请求为空 当前=%s", itemID)
 		return
 	}
 	if originalReq.Header.Get("X-Fnysfd-Next-Prefetch") == "1" {
-		s.logger.Debug("⏭️ [下一集预取] 跳过：当前请求来自下一集预取 当前=%s", itemID)
 		return
 	}
 	if s.shouldSkipPrefetch(buildPrefetchKey("next", itemID, ""), 20, "下一集预取") {
-		s.logger.Debug("⏭️ [下一集预取] 跳过：20秒内已触发 当前=%s", itemID)
 		return
 	}
-	s.logger.Info("⏭️ [下一集预取] 收到触发: 当前=%s", itemID)
 	if userID == "" {
 		userID = originalReq.URL.Query().Get("UserId")
 	}
-
-	s.logger.Debug("⏭️ [下一集预取] 准备查询同季后续集: 当前=%s", itemID)
 
 	s.proxyMu.RLock()
 	targetURL := s.targetURL
@@ -972,7 +957,6 @@ func (s *Server) prefetchNextEpisodesBestEffort(originalReq *http.Request, itemI
 
 	req, err := http.NewRequestWithContext(overallCtx, "GET", detailURL, nil)
 	if err != nil {
-		s.logger.Warn("⏭️ [下一集预取] 创建详情请求失败: %v itemID=%s", err, itemID)
 		return
 	}
 	req.Header = reqHeaders.Clone()
@@ -980,18 +964,14 @@ func (s *Server) prefetchNextEpisodesBestEffort(originalReq *http.Request, itemI
 
 	resp, err := s.retryClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		status := 0
 		if resp != nil {
-			status = resp.StatusCode
 			resp.Body.Close()
 		}
-		s.logger.Warn("⏭️ [下一集预取] 当前集详情查询失败: status=%d err=%v itemID=%s", status, err, itemID)
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 	resp.Body.Close()
 	if err != nil || len(body) == 0 {
-		s.logger.Warn("⏭️ [下一集预取] 当前集详情响应为空或读取失败: %v itemID=%s", err, itemID)
 		return
 	}
 
@@ -1005,36 +985,21 @@ func (s *Server) prefetchNextEpisodesBestEffort(originalReq *http.Request, itemI
 		Type        string `json:"Type"`
 	}
 	if err := json.Unmarshal(body, &detail); err != nil {
-		preview := string(body)
-		if len(preview) > 200 {
-			preview = preview[:200]
-		}
-		s.logger.Warn("⏭️ [下一集预取] 当前集详情JSON解析失败: %v itemID=%s bodyLen=%d bodyPreview=%s", err, itemID, len(body), preview)
 		return
 	}
 	if detail.Type != "" && detail.Type != "Episode" {
-		s.logger.Info("⏭️ [下一集预取] 跳过：非剧集类型 Type=%s 名称=%s", detail.Type, detail.Name)
 		return
 	}
 	if detail.ParentID == "" && detail.SeasonID != "" {
 		detail.ParentID = detail.SeasonID
 	}
 	if detail.ParentID == "" {
-		s.logger.Debug("⏭️ [下一集预取] 当前集缺少 ParentId/SeasonId，无法定位同季: 当前=%s", itemID)
 		return
 	}
-	curName := detail.Name
-	if curName == "" {
-		curName = itemID
-	}
-	s.logger.Info("⏭️ [下一集预取] 当前集: %s (第%d集)，准备查询同季列表", curName, detail.IndexNumber)
-	s.logger.Debug("⏭️ [下一集预取] 当前集信息: ParentId=%s SeriesId=%s SeasonId=%s Index=%d",
-		detail.ParentID, detail.SeriesID, detail.SeasonID, detail.IndexNumber)
 
 	listQuery := url.Values{}
 	listQuery.Set("ParentId", detail.ParentID)
 	listQuery.Set("IncludeItemTypes", "Episode")
-	listQuery.Set("Recursive", "false")
 	listQuery.Set("SortBy", "IndexNumber")
 	listQuery.Set("SortOrder", "Ascending")
 	listQuery.Set("Fields", "BasicSyncInfo,MediaSources")
@@ -1042,24 +1007,6 @@ func (s *Server) prefetchNextEpisodesBestEffort(originalReq *http.Request, itemI
 	if userID != "" {
 		listQuery.Set("UserId", userID)
 	}
-
-	listURLs := []string{}
-	if detail.SeriesID != "" {
-		episodesQuery := url.Values{}
-		if userID != "" {
-			episodesQuery.Set("UserId", userID)
-		}
-		if detail.SeasonID != "" {
-			episodesQuery.Set("SeasonId", detail.SeasonID)
-		}
-		episodesQuery.Set("Fields", "BasicSyncInfo,MediaSources")
-		episodesQuery.Set("Limit", "200")
-		listURLs = append(listURLs, targetURL.Scheme+"://"+targetURL.Host+"/emby/Shows/"+detail.SeriesID+"/Episodes?"+episodesQuery.Encode())
-	}
-	if userID != "" {
-		listURLs = append(listURLs, targetURL.Scheme+"://"+targetURL.Host+"/emby/Users/"+userID+"/Items?"+listQuery.Encode())
-	}
-	listURLs = append(listURLs, targetURL.Scheme+"://"+targetURL.Host+"/emby/Items?"+listQuery.Encode())
 
 	var listResp struct {
 		Items []struct {
@@ -1069,55 +1016,29 @@ func (s *Server) prefetchNextEpisodesBestEffort(originalReq *http.Request, itemI
 		} `json:"Items"`
 	}
 
-	for _, listURL := range listURLs {
-		req, err = http.NewRequestWithContext(overallCtx, "GET", listURL, nil)
-		if err != nil {
-			continue
-		}
-		req.Header = reqHeaders.Clone()
-		req.Host = reqHost
-
-		resp, err = s.retryClient.Do(req)
-		if err != nil || resp.StatusCode != http.StatusOK {
-			status := 0
-			if resp != nil {
-				status = resp.StatusCode
-				resp.Body.Close()
-			}
-			s.logger.Debug("⏭️ [下一集预取] 同季列表接口失败: status=%d err=%v url=%s", status, err, listURL)
-			continue
-		}
-		body, err = io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
-		resp.Body.Close()
-		if err != nil || len(body) == 0 {
-			s.logger.Warn("⏭️ [下一集预取] 同季列表响应为空或读取失败: %v url=%s", err, listURL)
-			continue
-		}
-		listResp.Items = nil
-		if err := json.Unmarshal(body, &listResp); err != nil {
-			s.logger.Warn("⏭️ [下一集预取] 同季列表JSON解析失败: %v url=%s bodyLen=%d", err, listURL, len(body))
-			if len(body) > 0 {
-				preview := string(body)
-				if len(preview) > 200 {
-					preview = preview[:200]
-				}
-				s.logger.Warn("⏭️ [下一集预取] 同季列表响应预览: %s", preview)
-			}
-			continue
-		}
-		if len(listResp.Items) > 0 {
-			s.logger.Debug("⏭️ [下一集预取] 同季列表获取成功: %d 集", len(listResp.Items))
-			break
-		}
-		s.logger.Debug("⏭️ [下一集预取] 同季列表为空: url=%s", listURL)
-	}
-
-	if len(listResp.Items) == 0 {
-		s.logger.Info("⏭️ [下一集预取] 未获取到同季列表，跳过: 当前=%s", curName)
+	listURL := targetURL.Scheme + "://" + targetURL.Host + "/emby/Items?" + listQuery.Encode()
+	req2, err := http.NewRequestWithContext(overallCtx, "GET", listURL, nil)
+	if err != nil {
 		return
 	}
+	req2.Header = reqHeaders.Clone()
+	req2.Host = reqHost
 
-	s.logger.Info("⏭️ [下一集预取] 同季列表获取成功: %d 集", len(listResp.Items))
+	resp2, err := s.retryClient.Do(req2)
+	if err != nil || resp2.StatusCode != http.StatusOK {
+		if resp2 != nil {
+			resp2.Body.Close()
+		}
+		return
+	}
+	body2, err := io.ReadAll(io.LimitReader(resp2.Body, 5*1024*1024))
+	resp2.Body.Close()
+	if err != nil || len(body2) == 0 {
+		return
+	}
+	if err := json.Unmarshal(body2, &listResp); err != nil {
+		return
+	}
 
 	curPos := -1
 	for i, ep := range listResp.Items {
@@ -1127,59 +1048,30 @@ func (s *Server) prefetchNextEpisodesBestEffort(originalReq *http.Request, itemI
 		}
 	}
 
-	for i, ep := range listResp.Items {
-		s.logger.Debug("⏭️ [下一集预取] 列表[%d]: ID=%s Name=%s IndexNumber=%d (当前集Index=%d curPos=%d)",
-			i, ep.ID[:12], ep.Name, ep.IndexNumber, detail.IndexNumber, curPos)
-	}
-
-	if curPos < 0 {
-		s.logger.Warn("⏭️ [下一集预取] 当前集不在列表中，可能列表来源不一致: itemID=%s", itemID)
-	}
-
 	prefetched := 0
-	alreadyCached := 0
 	for i, ep := range listResp.Items {
 		if ep.ID == "" || ep.ID == itemID {
 			continue
 		}
-		shouldSkip := false
 		if detail.IndexNumber > 0 && ep.IndexNumber > 0 {
 			if ep.IndexNumber <= detail.IndexNumber {
-				shouldSkip = true
+				continue
 			}
-		} else if curPos >= 0 {
-			if i <= curPos {
-				shouldSkip = true
-			}
-		}
-		if shouldSkip {
+		} else if curPos >= 0 && i <= curPos {
 			continue
 		}
 		if _, found := s.cache.GetByItemID(ep.ID); found {
-			alreadyCached++
-			s.logger.Debug("⏭️ [下一集预取] 跳过(已缓存): %s (第%d集)", ep.Name, ep.IndexNumber)
 			continue
 		}
 
 		nextReq := originalReq.Clone(context.Background())
 		nextReq.Header = originalReq.Header.Clone()
 		nextReq.Header.Set("X-Fnysfd-Next-Prefetch", "1")
-		epName := ep.Name
-		if epName == "" {
-			epName = ep.ID
-		}
-		s.logger.Info("⏭️ [下一集预取] 开始: %s → 下一集: %s (第%d集)", curName, epName, ep.IndexNumber)
 		go s.prefetchForDetailPage(nextReq, ep.ID, userID)
 		prefetched++
 		if prefetched >= 2 {
 			break
 		}
-	}
-
-	if prefetched > 0 {
-		s.logger.Info("⏭️ [下一集预取] 完成: %s | 新预取 %d 集, 已缓存 %d 集", curName, prefetched, alreadyCached)
-	} else {
-		s.logger.Info("⏭️ [下一集预取] 完成: %s | 无新集需要预取（后续集已全部缓存或已是最后一集）", curName)
 	}
 }
 
@@ -1244,7 +1136,6 @@ func (s *Server) shouldSkipPrefetch(key string, ttl int64, logTag string) bool {
 	return false
 }
 
-// markPrefetchDone 仅设置去重标记
 func (s *Server) markPrefetchDone(key string) {
 	if key == "" {
 		return
@@ -1254,17 +1145,14 @@ func (s *Server) markPrefetchDone(key string) {
 	s.prefetchRecent[key] = time.Now().Unix()
 }
 
-// buildPrefetchKey 构造去重 key
 func buildPrefetchKey(prefix, itemID, mediaSourceID string) string {
 	return prefix + ":" + itemID + "|" + mediaSourceID
 }
 
-// extractItemIDFromPath 从 URL 路径提取 ItemID
 func extractItemIDFromPath(path string) string {
 	return util.ExtractItemIDFromPath(path)
 }
 
-// extractPlaybackInfoItemID 从 PlaybackInfo 响应体提取 ItemId
 func extractPlaybackInfoItemID(resp *http.Response, body []byte) string {
 	if len(body) == 0 {
 		if resp != nil && resp.Request != nil {
@@ -1302,38 +1190,29 @@ func extractPlaybackInfoItemID(resp *http.Response, body []byte) string {
 	return ""
 }
 
-// isPlaybackInfoRequest 检查是否是PlaybackInfo
 func (s *Server) isPlaybackInfoRequest(req *http.Request) bool {
 	if req.Method != "POST" && req.Method != "GET" {
 		return false
 	}
 	path := req.URL.Path
 	pathLower := strings.ToLower(path)
-	playbackPatterns := []string{
-		"/playbackinfo",
-		"/playback-info",
-		"/playback_info",
-	}
+	playbackPatterns := []string{"/playbackinfo", "/playback-info", "/playback_info"}
 	for _, pattern := range playbackPatterns {
 		if strings.Contains(pathLower, pattern) {
-			s.logger.Debug("📥 [PlaybackInfo] 检测到请求: %s %s", req.Method, path)
 			return true
 		}
 	}
 	return false
 }
 
-// loggingMiddleware 日志中间件
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-
 		requestID := r.Header.Get("X-Request-Id")
 		if requestID == "" {
 			requestID = generateRequestID()
 		}
 		w.Header().Set("X-Request-Id", requestID)
-
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
@@ -1343,9 +1222,7 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 			s.logger.Debug("📤 [请求] %s %s 命中流处理 耗时: %v", r.Method, r.URL.Path, time.Since(start))
 			return
 		}
-
 		next.ServeHTTP(w, r)
-
 		s.logger.Debug("📤 [请求] %s %s 耗时: %v", r.Method, r.URL.Path, time.Since(start))
 	})
 }
@@ -1357,14 +1234,9 @@ func generateRequestID() string {
 	return fmt.Sprintf("%d-%d-%d", time.Now().UnixNano(), os.Getpid(), n)
 }
 
-// errorHandler 错误处理中间件
 func (s *Server) errorHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		safeW := &safeResponseWriter{
-			ResponseWriter: w,
-			written:        false,
-		}
-
+		safeW := &safeResponseWriter{ResponseWriter: w, written: false}
 		defer func() {
 			if err := recover(); err != nil {
 				errStr := ""
@@ -1375,7 +1247,6 @@ func (s *Server) errorHandler(next http.Handler) http.Handler {
 				} else if str, ok := err.(string); ok {
 					errStr = str
 				}
-
 				isClientAbort := false
 				if asErr != nil && errors.Is(asErr, context.Canceled) {
 					isClientAbort = true
@@ -1386,7 +1257,6 @@ func (s *Server) errorHandler(next http.Handler) http.Handler {
 					strings.Contains(errStr, "context canceled")) {
 					isClientAbort = true
 				}
-
 				if isClientAbort {
 					s.logger.Debug("⚠️ 客户端中断: %s %s (%s)", r.Method, r.URL.Path, errStr)
 				} else {
@@ -1397,7 +1267,6 @@ func (s *Server) errorHandler(next http.Handler) http.Handler {
 				}
 			}
 		}()
-
 		next.ServeHTTP(safeW, r)
 	})
 }
@@ -1424,7 +1293,7 @@ func (s *Server) statsHandler(w http.ResponseWriter, r *http.Request) {
 		if host != "" && host != "127.0.0.1" && host != "::1" && host != "localhost" {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusForbidden)
-			w.Write([]byte(`{"error":"forbidden: stats endpoint requires token for remote access"}`))
+			w.Write([]byte(`{"error":"forbidden"}`))
 			return
 		}
 	}
@@ -1438,25 +1307,22 @@ func (s *Server) statsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.cache != nil {
-		cacheStats := s.cache.GetStats()
-		stats["cache"] = cacheStats
+		stats["cache"] = s.cache.GetStats()
 	}
-
 	if s.streamHandler != nil {
-		streamStats := s.streamHandler.GetStats()
-		stats["stream"] = streamStats
+		stats["stream"] = s.streamHandler.GetStats()
 	}
-
-	// ✅ 全库扫描状态
 	if s.libraryScanner != nil {
 		stats["libraryScan"] = s.libraryScanner.GetStatus()
+	}
+	if s.doubanProvider != nil { // ✅ 新增
+		stats["douban"] = s.doubanProvider.GetStats()
 	}
 
 	jsonBytes, _ := json.Marshal(stats)
 	w.Write(jsonBytes)
 }
 
-// healthHandler 健康检查端点
 func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -1464,17 +1330,12 @@ func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"error":"method not allowed"}`))
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	health := map[string]string{
-		"status": "ok",
-		"uptime": time.Since(s.startTime).String(),
-	}
+	health := map[string]string{"status": "ok", "uptime": time.Since(s.startTime).String()}
 	jsonBytes, _ := json.Marshal(health)
 	w.Write(jsonBytes)
 }
 
-// safeResponseWriter 安全的响应写入器
 type safeResponseWriter struct {
 	http.ResponseWriter
 	written bool
