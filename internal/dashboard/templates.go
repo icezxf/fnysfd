@@ -1,6 +1,6 @@
 package dashboard
 
-// loginHTML 登录页面（极简风格，浅灰背景 + 白色登录卡片 + 微妙阴影）
+// loginHTML 登录页面（极简风格）
 const loginHTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -186,11 +186,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Ar
 .log-view .lv-debug{color:#a78bfa}
 .log-view .lv-empty{color:#71717a}
 
-/* 豆瓣缓存表格 */
+/* 豆瓣缓存 */
 .douban-toolbar{display:flex;align-items:center;gap:12px;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border);flex-wrap:wrap}
 .douban-toolbar input[type="text"]{height:32px;border:1px solid var(--border);border-radius:4px;padding:0 10px;font-size:13px;font-family:inherit;min-width:180px;flex:1;max-width:320px;transition:all .15s ease}
 .douban-toolbar input[type="text"]:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
 .douban-toolbar .spacer{flex:1}
+.douban-filters{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+.douban-chip{height:28px;padding:0 12px;border:1px solid var(--border);background:#fff;border-radius:14px;font-size:12px;color:#71717a;cursor:pointer;font-family:inherit;transition:all .15s ease}
+.douban-chip:hover{border-color:var(--primary);color:var(--primary)}
+.douban-chip.active{background:var(--primary);border-color:var(--primary);color:#fff}
 .douban-table{width:100%;border-collapse:collapse;font-size:13px}
 .douban-table thead th{text-align:left;padding:10px 8px;border-bottom:2px solid var(--border);color:#71717a;font-weight:600;font-size:12px;user-select:none;white-space:nowrap}
 .douban-table thead th.sortable{cursor:pointer}
@@ -337,6 +341,13 @@ body.sidebar-open .sidebar-overlay{display:block}
 <button class="btn-text" id="refreshDoubanCacheBtn">刷新</button>
 <button class="btn-text danger" id="clearDoubanCacheBtn">清空全部</button>
 </div>
+<div class="douban-filters">
+<button type="button" class="douban-chip active" data-type="all">全部</button>
+<button type="button" class="douban-chip" data-type="movie">电影</button>
+<button type="button" class="douban-chip" data-type="series">剧集</button>
+<button type="button" class="douban-chip" data-type="season">季</button>
+<button type="button" class="douban-chip" data-type="unknown">未知</button>
+</div>
 <div id="doubanCacheEmpty" class="path-empty" style="display:none">暂无缓存</div>
 <table class="douban-table" id="doubanCacheTable" style="display:none">
 <thead>
@@ -407,6 +418,21 @@ body.sidebar-open .sidebar-overlay{display:block}
 <label>缓存 TTL（分钟）</label>
 <input type="number" id="cfgCacheTTL" min="1" placeholder="30">
 <div class="hint">缓存条目存活时间（默认 30 分钟，配合智能签名 TTL 避免播放中 403）</div>
+</div>
+</div>
+
+<!-- ✅ 飞牛账号 -->
+<div class="card">
+<div class="form-group-title">飞牛账号</div>
+<div class="form-item">
+<label>飞牛用户名</label>
+<input type="text" id="cfgFnosUsername" placeholder="留空则不主动登录">
+<div class="hint">服务启动时主动登录飞牛拿 Emby Token，避免依赖用户访问触发被动捕获。留空则回退到环境变量 FNOS_USERNAME。</div>
+</div>
+<div class="form-item">
+<label>飞牛密码</label>
+<input type="password" id="cfgFnosPassword" placeholder="未修改请留空">
+<div class="hint">留空表示不修改。修改后需重启生效。留空时回退到环境变量 FNOS_PASSWORD。</div>
 </div>
 </div>
 
@@ -544,13 +570,14 @@ var logAutoRefresh=true;
 var logTimer=null;
 var statsTimer=null;
 
-/* 豆瓣缓存 tab 状态 */
+/* 豆瓣缓存 */
 var doubanAllItems=[];
 var doubanFiltered=[];
 var doubanSortKey='fetched_at';
 var doubanSortAsc=false;
 var doubanPage=1;
 var doubanPageSize=100;
+var doubanFilterType='all';
 
 /* ===== 工具函数 ===== */
 function $(id){return document.getElementById(id)}
@@ -649,7 +676,7 @@ function stopStatsTimer(){
 if(statsTimer){clearInterval(statsTimer);statsTimer=null}
 }
 
-/* ===== 概览：统计 / 系统 ===== */
+/* ===== 概览 ===== */
 function loadStats(){
 ajax('/api/stats','GET',null,function(err,d){
 if(err||!d||d.code!==200||!d.data)return;
@@ -700,10 +727,7 @@ $('sysArch').textContent=s.arch||'-';
 function loadDoubanCache(){
 ajax('/api/douban/cache','GET',null,function(err,d){
 if(err){toast('加载豆瓣缓存失败: '+err,'error');return}
-if(!d||d.code!==200){
-toast('加载豆瓣缓存失败','error');
-return
-}
+if(!d||d.code!==200){toast('加载豆瓣缓存失败','error');return}
 doubanAllItems=Array.isArray(d.data)?d.data:[];
 doubanPage=1;
 applyDoubanFilterAndRender();
@@ -713,12 +737,15 @@ applyDoubanFilterAndRender();
 function applyDoubanFilterAndRender(){
 var q=($('doubanSearchBox').value||'').trim().toLowerCase();
 doubanFiltered=doubanAllItems.filter(function(it){
+if(doubanFilterType!=='all'){
+var t=it.type||'unknown';
+if(t!==doubanFilterType)return false;
+}
 if(!q)return true;
-var t=(it.title||'').toLowerCase();
-return t.indexOf(q)>-1;
+var title=(it.title||'').toLowerCase();
+return title.indexOf(q)>-1;
 });
 
-// 排序
 var key=doubanSortKey;
 var asc=doubanSortAsc;
 doubanFiltered.sort(function(a,b){
@@ -735,7 +762,6 @@ if(va>vb)return asc?1:-1;
 return 0;
 });
 
-// 更新表头箭头
 var ths=document.querySelectorAll('#doubanCacheTable thead th.sortable');
 for(var i=0;i<ths.length;i++){
 var th=ths[i];
@@ -781,16 +807,21 @@ var h='';
 for(var i=start;i<end;i++){
 var it=doubanFiltered[i];
 var typeLabel, typeCls;
-if(it.type==='season'){
+var t=it.type||'unknown';
+if(t==='season'){
 typeLabel='第'+it.season_num+'季';
 typeCls='tag season';
+}else if(t==='movie'){
+typeLabel='电影';
+typeCls='tag';
+}else if(t==='series'){
+typeLabel='剧集';
+typeCls='tag';
 }else{
-typeLabel='电影/剧集';
+typeLabel='未知';
 typeCls='tag';
 }
 var ratingText=(it.rating!=null)?Number(it.rating).toFixed(1):'-';
-
-// 用 key 作为 data-key，删除时把 all_keys 一起传给后端
 var allKeysJson=esc(JSON.stringify(it.all_keys||[it.key]));
 
 h+='<tr>';
@@ -807,7 +838,6 @@ $('doubanPageInfo').textContent='第 '+doubanPage+' / '+totalPages+' 页';
 $('doubanPrevBtn').disabled=(doubanPage<=1);
 $('doubanNextBtn').disabled=(doubanPage>=totalPages);
 
-// 绑定删除按钮
 var btns=tbody.querySelectorAll('button.douban-del-btn');
 for(var j=0;j<btns.length;j++){
 (function(b){
@@ -829,7 +859,6 @@ if(err){toast('删除失败: '+err,'error');return}
 if(d&&d.code===200){
 toast(d.message||'已删除','success');
 loadDoubanCache();
-// 概览页的统计也刷新一下
 loadStats();
 }else{
 toast((d&&d.message)||'删除失败','error');
@@ -864,6 +893,10 @@ $('cfgCacheTTL').value=data.cache_ttl||'';
 $('cfgMaxItems').value=data.max_cache_items||10000;
 $('cfgUser').value=data.dashboard_user||'admin';
 $('cfgPass').value='';
+// ✅ 飞牛账号
+$('cfgFnosUsername').value=data.fnos_username||'';
+$('cfgFnosPassword').value='';
+
 $('cfgEnableLanStrm').checked = data.enable_lan_strm !== false;
 $('cfgEnablePreload').checked = data.enable_preload !== false;
 $('cfgEnableCDNWarmup').checked = data.enable_cdn_warmup !== false;
@@ -881,6 +914,7 @@ loadScanStatus();
 
 function saveConfig(){
 var pass=$('cfgPass').value;
+var fnosPass=$('cfgFnosPassword').value;
 var ttlInput=$('cfgCacheTTL').value.trim();
 if(ttlInput===''){toast('缓存 TTL 不能为空','warning');return}
 var ttlVal=parseInt(ttlInput,10);
@@ -904,14 +938,19 @@ library_scan_cron:$('cfgLibraryScanCron').value.trim(),
 library_scan_on_start:$('cfgLibraryScanOnStart').checked,
 library_scan_concurrency:parseInt($('cfgLibraryScanConcurrency').value.trim(),10)||2,
 library_scan_interval_ms:parseInt($('cfgLibraryScanIntervalMs').value.trim(),10)||500,
-library_scan_incremental_minutes:parseInt($('cfgLibraryScanIncrementalMinutes').value.trim(),10)||5
+library_scan_incremental_minutes:parseInt($('cfgLibraryScanIncrementalMinutes').value.trim(),10)||5,
+// ✅ 飞牛账号
+fnos_username:$('cfgFnosUsername').value.trim()
 };
 if(pass&&pass!==''&&pass!=='****'){data.dashboard_pass=pass}
+// 飞牛密码：仅在输入非空且非占位符时提交
+if(fnosPass&&fnosPass!==''&&fnosPass!=='****'){data.fnos_password=fnosPass}
 ajax('/api/config/update','POST',data,function(err,r){
 if(err){toast('保存失败: '+err,'error');return}
 if(r&&r.code===200){
 toast(r.message||'配置已保存','success');
 $('cfgPass').value='';
+$('cfgFnosPassword').value='';
 if(r.data&&r.data.needs_restart){
 toast(r.data.message||'检测到需要重启的配置变更，请重启服务生效','warning');
 }
@@ -1175,7 +1214,7 @@ if(currentTab==='logs'&&logAutoRefresh)startLogTimer();
 else stopLogTimer();
 };
 
-// 豆瓣缓存 tab 的交互
+// 豆瓣缓存
 $('viewDoubanCacheBtn').onclick=function(){switchTab('douban')};
 $('refreshDoubanCacheBtn').onclick=loadDoubanCache;
 $('clearDoubanCacheBtn').onclick=clearDoubanCache;
@@ -1186,7 +1225,6 @@ var totalPages=Math.max(1,Math.ceil(doubanFiltered.length/doubanPageSize));
 if(doubanPage<totalPages){doubanPage++;renderDoubanPage()}
 };
 
-// 表头排序
 var sortThs=document.querySelectorAll('#doubanCacheTable thead th.sortable');
 for(var s=0;s<sortThs.length;s++){
 (function(th){
@@ -1203,7 +1241,21 @@ applyDoubanFilterAndRender();
 })(sortThs[s]);
 }
 
-// 移动端汉堡菜单
+// ✅ 类型筛选 chip
+var chips=document.querySelectorAll('.douban-chip');
+for(var c=0;c<chips.length;c++){
+(function(chip){
+chip.onclick=function(){
+doubanFilterType=chip.getAttribute('data-type')||'all';
+doubanPage=1;
+var all=document.querySelectorAll('.douban-chip');
+for(var x=0;x<all.length;x++)all[x].classList.remove('active');
+chip.classList.add('active');
+applyDoubanFilterAndRender();
+};
+})(chips[c]);
+}
+
 var menuToggle=$('menuToggle');
 if(menuToggle){
 menuToggle.onclick=function(){document.body.classList.toggle('sidebar-open')};
