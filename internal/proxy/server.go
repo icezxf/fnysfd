@@ -514,6 +514,95 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 	return newBody
 }
 
+// ============================================================
+// ✅ 飞牛原生列表接口注入（/v/api/v1/item/list）
+//    海报墙评分（左上角数字）走这里
+// ============================================================
+
+// shouldInjectNativeList 判断是否飞牛原生列表接口（海报墙等）
+func (s *Server) shouldInjectNativeList(path string) bool {
+	return strings.HasSuffix(path, "/v/api/v1/item/list")
+}
+
+// injectDoubanNativeList 注入豆瓣评分到飞牛原生列表响应
+//
+// 响应结构：{ "code":0, "data": { "list": [ {..item..}, ... ] } }
+func (s *Server) injectDoubanNativeList(body []byte) []byte {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Warn("🎬 [豆瓣评分] 原生列表注入 panic: %v", r)
+		}
+	}()
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+
+	if code, ok := payload["code"].(float64); ok && code != 0 {
+		return body
+	}
+
+	data, ok := payload["data"].(map[string]interface{})
+	if !ok || data == nil {
+		return body
+	}
+
+	list, ok := data["list"].([]interface{})
+	if !ok || len(list) == 0 {
+		return body
+	}
+
+	injected := 0
+	for _, it := range list {
+		item, ok := it.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		imdbID, _ := item["imdb_id"].(string)
+		title, _ := item["title"].(string)
+		itemType, _ := item["type"].(string)
+
+		var rating float64
+		var found bool
+
+		switch itemType {
+		case "Movie", "Series":
+			rating, found = s.doubanProvider.GetRating(imdbID, title, 0)
+		case "Season":
+			seriesName, _ := item["parent_title"].(string)
+			seasonNum := 0
+			if n, ok := item["season_number"].(float64); ok {
+				seasonNum = int(n)
+			}
+			if seriesName != "" && seasonNum > 0 {
+				rating, found = s.doubanProvider.GetSeasonRating(seriesName, seasonNum)
+			}
+		}
+
+		if !found || rating <= 0 {
+			continue
+		}
+
+		// ✅ vote_average 是字符串，保持类型
+		item["vote_average"] = fmt.Sprintf("%.1f", rating)
+		injected++
+	}
+
+	if injected == 0 {
+		return body
+	}
+
+	s.logger.Debug("🎬 [豆瓣评分] 原生列表注入: %d 项", injected)
+
+	newBody, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return newBody
+}
+
 // handleResponse 处理响应
 func (s *Server) handleResponse(resp *http.Response) error {
 	// ============================================================
@@ -537,7 +626,27 @@ func (s *Server) handleResponse(resp *http.Response) error {
 	}
 
 	// ============================================================
-	// ✅ 豆瓣评分注入：拦截 /Items 响应（列表或详情）
+	// ✅ 飞牛原生列表接口注入：/v/api/v1/item/list
+	//    海报墙评分（左上角数字）走这里
+	// ============================================================
+	if s.doubanProvider != nil && resp.StatusCode == http.StatusOK && resp.Request != nil {
+		listPath := resp.Request.URL.Path
+		if s.shouldInjectNativeList(listPath) {
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
+			if err == nil && len(body) > 0 {
+				resp.Body.Close()
+				newBody := s.injectDoubanNativeList(body)
+				resp.Body = io.NopCloser(bytes.NewBuffer(newBody))
+				resp.ContentLength = int64(len(newBody))
+				resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
+				resp.Header.Del("Transfer-Encoding")
+				return nil
+			}
+		}
+	}
+
+	// ============================================================
+	// ✅ 豆瓣评分注入：拦截 /Items 响应（Emby 协议，列表或详情）
 	// ============================================================
 	if s.doubanProvider != nil && resp.StatusCode == http.StatusOK && resp.Request != nil {
 		path := resp.Request.URL.Path
