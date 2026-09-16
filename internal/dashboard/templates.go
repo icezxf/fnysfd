@@ -764,6 +764,8 @@ if(name==='config'){loadConfig()}
 if(name==='paths'){loadPaths()}
 if(name==='douban'){loadDoubanCache()}
 if(name==='records'){loadRecordTab()}
+// ✅ 把当前 tab 写进 URL hash，刷新时能恢复
+if(location.hash !== '#'+name) location.hash = name;
 }
 
 function startLogTimer(){
@@ -1565,12 +1567,12 @@ sidebarOverlay.onclick=function(){document.body.classList.remove('sidebar-open')
 }
 }
 
-/* ===== 初始化 ===== */
 function init(){
 bindEvents();
-loadStats();
-loadSystem();
-startStatsTimer();
+// ✅ 从 URL hash 恢复 tab，空或无效时回退到 overview
+var name=(location.hash||'').replace('#','');
+if(!name || !document.getElementById('pane-'+name)) name='overview';
+switchTab(name);
 }
 
 init();
