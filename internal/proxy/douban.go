@@ -665,7 +665,7 @@ func (dp *DoubanProvider) storeCache(imdbID, name string, year int, rating float
 	dp.dirty.Store(true)
 }
 
-func (dp *DoubanProvider) storeCacheByKey(key, title, rating, itemType string) {
+func (dp *DoubanProvider) storeCacheByKey(key, title string, rating float64, itemType string) {
 	normalizedType := strings.ToLower(itemType)
 	if normalizedType == "" {
 		normalizedType = "unknown"
