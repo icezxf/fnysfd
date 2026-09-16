@@ -41,7 +41,7 @@ type Server struct {
 	httpServer      *http.Server
 	stopOnce        sync.Once
 	retryClient     *http.Client
-	prefetchClient  *http.Client // 批量预取专用（长超时）
+	prefetchClient  *http.Client
 	targetURL       *url.URL
 	prefetchRecent  map[string]int64
 	prefetchMu      sync.Mutex
@@ -50,12 +50,12 @@ type Server struct {
 	authStore       *AuthStore
 	batchPrefetcher *BatchPrefetcher
 	libraryScanner  *LibraryScanner
-	doubanProvider  *DoubanProvider // ✅
+	doubanProvider  *DoubanProvider
+	recordService   *RecordService // ✅ 观看记录服务
 
-	// ✅ TV guid → title 缓存（季列表注入需要）
+	// TV guid → title 缓存（季列表注入需要）
 	seriesTitleCache sync.Map
 
-	// 服务级 context：Stop 时取消，用于中断内部长任务
 	serverCtx    context.Context
 	serverCancel context.CancelFunc
 }
@@ -77,12 +77,10 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 	ph := handler.NewPlaybackHandler(c, log)
 	sh := handler.NewStreamHandler(c, log)
 
-	// 🔗 核心优化：绑定PlaybackHandler和StreamHandler，启用智能预加载
 	ph.SetStreamHandler(sh)
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 
-	// 主动重试客户端（实时路径用）
 	retryTransport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second,
@@ -103,7 +101,6 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		Transport: retryTransport,
 	}
 
-	// 批量预取专用客户端（长超时）
 	prefetchTransport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
@@ -124,7 +121,6 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		Transport: prefetchTransport,
 	}
 
-	// 服务级 context
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 
 	s := &Server{
@@ -144,7 +140,6 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		serverCancel:    serverCancel,
 	}
 
-	// 下一集预取回调绑定
 	ph.SetPlaybackCachedHandler(func(resp *http.Response, itemID string) {
 		if resp == nil || resp.Request == nil {
 			log.Debug("⏭️ [下一集预取] 回调跳过：缺少原始请求 ItemId=%s", itemID)
@@ -160,21 +155,18 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 		}
 		log.Debug("⏭️ [下一集预取] STRM缓存回调触发: 当前=%s", itemID)
 
-		// ✅ 克隆请求再传给 goroutine
 		reqCopy := resp.Request.Clone(context.Background())
 		userID := reqCopy.URL.Query().Get("UserId")
 		go s.prefetchNextEpisodesBestEffort(reqCopy, itemID, userID)
 	})
 	log.Info("⏭️ [下一集预取] STRM缓存回调已绑定，详情页成功后将显式触发下一集预取")
 
-	// 新剧无媒体信息兜底
 	sh.SetMediaSourceMissHandler(s.prefetchForMediaSourceMiss)
 
-	// 初始化批量预取组件
 	initialConcurrency := cfg.GetLibraryScanConcurrency()
 	s.authStore = NewAuthStore()
 
-		// 主动登录（优先读 config，config 空则回退环境变量）
+	// 主动登录（优先读 config，config 空则回退环境变量）
 	fnosUser := config.Global.GetFnosUsername()
 	fnosPass := config.Global.GetFnosPassword()
 	if fnosUser == "" {
@@ -196,7 +188,16 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 	}
 
 	s.batchPrefetcher = NewBatchPrefetcher(s, initialConcurrency)
-	s.doubanProvider = NewDoubanProvider(s) // ✅
+	s.doubanProvider = NewDoubanProvider(s)
+
+	// ✅ 观看记录服务（源数据库路径从配置读，空=禁用）
+	s.recordService = NewRecordService(cfg.GetPlayHistoryDBPath(), log)
+	if s.recordService != nil && s.recordService.Available() {
+		log.Info("🎬 [观看记录] 服务已就绪: %s", cfg.GetPlayHistoryDBPath())
+	} else if s.recordService != nil {
+		log.Warn("🎬 [观看记录] 源数据库不可访问，功能将不可用: %s", cfg.GetPlayHistoryDBPath())
+	}
+
 	s.libraryScanner = NewLibraryScanner(s, s.batchPrefetcher, s.authStore)
 	s.logger.Info("📦 [批量预取] 引擎已初始化: 并发=%d (全库扫描=%d)",
 		initialConcurrency, cfg.GetLibraryScanConcurrency())
@@ -233,7 +234,6 @@ func (s *Server) Start() error {
 	s.logger.Info("⏭️ [下一集预取] 当前运行版本包含：详情页成功显式触发 + STRM缓存回调触发")
 	s.logger.Info("📊 性能监控: http://localhost%s/stats", s.config.GetListenAddr())
 
-	// 启动全库扫描器
 	if s.libraryScanner != nil {
 		s.libraryScanner.Start()
 	}
@@ -248,19 +248,16 @@ func (s *Server) applyProxyHandlers(p *httputil.ReverseProxy, targetURL *url.URL
 		originalDirector(req)
 		req.Host = targetURL.Host
 
-		// 捕获认证信息
 		if s.authStore != nil {
 			s.authStore.CaptureFromRequest(req)
 		}
 
-		// 进入详情页就主动预请求 PlaybackInfo
 		if itemID, userID, ok := s.isItemDetailRequest(req); ok {
 			reqCopy := req.Clone(context.Background())
 			go s.prefetchForDetailPage(reqCopy, itemID, userID)
 			return
 		}
 
-		// 兜底：点击播放时的主动预请求
 		if s.isPlaybackInfoRequest(req) && req.Method == "GET" {
 			reqCopy := req.Clone(context.Background())
 			go s.proactivePlaybackInfo(reqCopy)
@@ -305,24 +302,25 @@ func (s *Server) Stop() error {
 	s.stopOnce.Do(func() {
 		s.logger.Info("🛑 正在关闭服务...")
 
-		// 0. 取消服务级 context
 		if s.serverCancel != nil {
 			s.serverCancel()
 		}
 
-		// 1. 先停止接收新请求
 		if s.httpServer != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			err = s.httpServer.Shutdown(ctx)
 			cancel()
 		}
 
-		// 2. 停止后台任务
 		if s.libraryScanner != nil {
 			s.libraryScanner.Stop()
 		}
-		if s.doubanProvider != nil { // ✅
+		if s.doubanProvider != nil {
 			s.doubanProvider.Stop()
+		}
+		// ✅ 观看记录服务
+		if s.recordService != nil {
+			s.recordService.Stop()
 		}
 		if s.batchPrefetcher != nil {
 			s.batchPrefetcher.Stop()
@@ -331,7 +329,6 @@ func (s *Server) Stop() error {
 			s.streamHandler.Stop()
 		}
 
-		// 3. 最后关 cache 和 logger
 		if s.cache != nil {
 			s.cache.Stop()
 		}
@@ -345,7 +342,10 @@ func (s *Server) GetCache() *cache.Cache                   { return s.cache }
 func (s *Server) GetLogger() *logger.Logger                { return s.logger }
 func (s *Server) GetStreamHandler() *handler.StreamHandler { return s.streamHandler }
 func (s *Server) GetLibraryScanner() *LibraryScanner       { return s.libraryScanner }
-func (s *Server) GetDoubanProvider() *DoubanProvider       { return s.doubanProvider } // ✅
+func (s *Server) GetDoubanProvider() *DoubanProvider       { return s.doubanProvider }
+
+// ✅ 观看记录服务 Getter
+func (s *Server) GetRecordService() *RecordService { return s.recordService }
 
 // Reload 重新加载配置
 func (s *Server) Reload() {
@@ -387,8 +387,6 @@ func (s *Server) Reload() {
 }
 
 // injectDoubanRatings 解析 JSON，对每个 item 注入豆瓣评分
-//
-// ✅ 豆瓣评分注入（Emby 协议 /Items 响应）
 func (s *Server) injectDoubanRatings(body []byte) []byte {
 	var obj map[string]interface{}
 	if err := json.Unmarshal(body, &obj); err != nil {
@@ -397,7 +395,6 @@ func (s *Server) injectDoubanRatings(body []byte) []byte {
 
 	injected := false
 
-	// 列表响应
 	if items, ok := obj["Items"].([]interface{}); ok {
 		for _, it := range items {
 			if m, ok := it.(map[string]interface{}); ok {
@@ -406,7 +403,6 @@ func (s *Server) injectDoubanRatings(body []byte) []byte {
 			}
 		}
 	} else if _, ok := obj["Id"]; ok {
-		// 单项响应
 		s.doubanProvider.InjectInto(obj)
 		injected = true
 	}
@@ -423,24 +419,21 @@ func (s *Server) injectDoubanRatings(body []byte) []byte {
 }
 
 // ============================================================
-// ✅ 飞牛原生详情接口注入（/v/api/v1/item/{guid}）
+// 飞牛原生详情接口注入（/v/api/v1/item/{guid}）
 // ============================================================
 
-// shouldInjectNative 判断是否飞牛原生详情接口 /v/api/v1/item/{guid}
 func (s *Server) shouldInjectNative(path string) bool {
 	const prefix = "/v/api/v1/item/"
 	if !strings.HasPrefix(path, prefix) {
 		return false
 	}
 	rest := path[len(prefix):]
-	// 必须正好是一个 32 位 GUID，后面不带任何子路径
 	if rest == "" || strings.Contains(rest, "/") || len(rest) != 32 {
 		return false
 	}
 	return true
 }
 
-// injectDoubanNative 注入豆瓣评分到飞牛原生详情响应
 func (s *Server) injectDoubanNative(body []byte) []byte {
 	defer func() {
 		if r := recover(); r != nil {
@@ -453,7 +446,6 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 		return body
 	}
 
-	// 只处理 code==0 的成功响应
 	if code, ok := payload["code"].(float64); ok && code != 0 {
 		return body
 	}
@@ -467,7 +459,6 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 	title, _ := data["title"].(string)
 	itemType, _ := data["type"].(string)
 
-	// ✅ 缓存 TV guid → title（供季列表注入用）
 	if itemType == "TV" || itemType == "Series" {
 		if guid, ok := data["guid"].(string); ok && guid != "" && title != "" {
 			s.seriesTitleCache.Store(guid, title)
@@ -482,7 +473,6 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 		rating, found = s.doubanProvider.GetRating(imdbID, title, 0)
 
 	case "Series", "TV":
-		// ✅ 剧集：优先用 season_number，其次 number_of_seasons，查最新季豆瓣分
 		seriesName := title
 		seasonNum := 0
 		if n, ok := data["season_number"].(float64); ok && n > 0 {
@@ -497,10 +487,8 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 			rating, found = s.doubanProvider.GetSeasonRating(seriesName, seasonNum)
 		}
 		if !found {
-			// 兜底：IMDb 查整剧（当前缓存里可能没有）
 			rating, found = s.doubanProvider.GetRating(imdbID, title, 0)
 		}
-		// ✅ TV 详情页前端不渲染 vote_average，把评分附加到 content_ratings
 		if found && rating > 0 {
 			cr, _ := data["content_ratings"].(string)
 			if !strings.Contains(cr, "⭐") {
@@ -513,10 +501,8 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 		}
 
 	case "Season":
-		// ✅ 剧名在 tv_title（飞牛的 parent_title 是空字符串）
 		seriesName, _ := data["tv_title"].(string)
 		if seriesName == "" {
-			// 兜底：万一某些接口用 parent_title
 			seriesName, _ = data["parent_title"].(string)
 		}
 		seasonNum := 0
@@ -532,7 +518,6 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 		return body
 	}
 
-	// ✅ vote_average 是字符串，保持类型
 	data["vote_average"] = fmt.Sprintf("%.1f", rating)
 	s.logger.Debug("🎬 [豆瓣评分] 原生注入 %s (%s): vote_average → %.1f", title, itemType, rating)
 
@@ -544,16 +529,13 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 }
 
 // ============================================================
-// ✅ 飞牛原生列表接口注入（/v/api/v1/item/list）
-//    海报墙评分（左上角数字）走这里
+// 飞牛原生列表接口注入（/v/api/v1/item/list）
 // ============================================================
 
-// shouldInjectNativeList 判断是否飞牛原生列表接口（海报墙等）
 func (s *Server) shouldInjectNativeList(path string) bool {
 	return strings.HasSuffix(path, "/v/api/v1/item/list")
 }
 
-// injectDoubanNativeList 注入豆瓣评分到飞牛原生列表响应
 func (s *Server) injectDoubanNativeList(body []byte) []byte {
 	defer func() {
 		if r := recover(); r != nil {
@@ -599,7 +581,6 @@ func (s *Server) injectDoubanNativeList(body []byte) []byte {
 			rating, found = s.doubanProvider.GetRating(imdbID, title, 0)
 
 		case "Series", "TV":
-			// ✅ 剧集：优先用 season_number，其次 number_of_seasons，查最新季豆瓣分
 			seriesName := title
 			seasonNum := 0
 			if n, ok := item["season_number"].(float64); ok && n > 0 {
@@ -618,7 +599,6 @@ func (s *Server) injectDoubanNativeList(body []byte) []byte {
 			}
 
 		case "Season":
-			// ✅ 剧名在 tv_title（飞牛的 parent_title 是空字符串）
 			seriesName, _ := item["tv_title"].(string)
 			if seriesName == "" {
 				seriesName, _ = item["parent_title"].(string)
@@ -636,7 +616,6 @@ func (s *Server) injectDoubanNativeList(body []byte) []byte {
 			continue
 		}
 
-		// ✅ vote_average 是字符串，保持类型
 		item["vote_average"] = fmt.Sprintf("%.1f", rating)
 		injected++
 	}
@@ -655,22 +634,18 @@ func (s *Server) injectDoubanNativeList(body []byte) []byte {
 }
 
 // ============================================================
-// ✅ 飞牛原生季列表接口注入（/v/api/v1/season/list/{TV_guid}）
-//    TV 详情页下方横排的季小海报走这里
+// 飞牛原生季列表接口注入（/v/api/v1/season/list/{TV_guid}）
 // ============================================================
 
-// shouldInjectNativeSeasonList 判断是否飞牛原生季列表接口
 func (s *Server) shouldInjectNativeSeasonList(path string) bool {
 	const prefix = "/v/api/v1/season/list/"
 	if !strings.HasPrefix(path, prefix) {
 		return false
 	}
 	rest := path[len(prefix):]
-	// 必须正好是一个 32 位 GUID
 	return rest != "" && !strings.Contains(rest, "/") && len(rest) == 32
 }
 
-// injectDoubanNativeSeasonList 注入豆瓣评分到飞牛原生季列表响应
 func (s *Server) injectDoubanNativeSeasonList(body []byte) []byte {
 	defer func() {
 		if r := recover(); r != nil {
@@ -687,7 +662,6 @@ func (s *Server) injectDoubanNativeSeasonList(body []byte) []byte {
 		return body
 	}
 
-	// ✅ 注意：data 直接是数组
 	list, ok := payload["data"].([]interface{})
 	if !ok || len(list) == 0 {
 		return body
@@ -713,7 +687,6 @@ func (s *Server) injectDoubanNativeSeasonList(body []byte) []byte {
 			continue
 		}
 
-		// 剧名：从 parent_guid 反查缓存
 		parentGUID, _ := item["parent_guid"].(string)
 		if parentGUID == "" {
 			continue
@@ -732,7 +705,6 @@ func (s *Server) injectDoubanNativeSeasonList(body []byte) []byte {
 			continue
 		}
 
-		// ✅ vote_average 是字符串，保持类型
 		item["vote_average"] = fmt.Sprintf("%.1f", rating)
 		injected++
 	}
@@ -752,9 +724,7 @@ func (s *Server) injectDoubanNativeSeasonList(body []byte) []byte {
 
 // handleResponse 处理响应
 func (s *Server) handleResponse(resp *http.Response) error {
-	// ============================================================
-	// ✅ 飞牛原生详情接口注入：/v/api/v1/item/{guid}
-	// ============================================================
+	// 飞牛原生详情接口注入
 	if s.doubanProvider != nil && config.Global.GetEnableDoubanRating() && resp.StatusCode == http.StatusOK && resp.Request != nil {
 		nativePath := resp.Request.URL.Path
 		if s.shouldInjectNative(nativePath) {
@@ -771,9 +741,7 @@ func (s *Server) handleResponse(resp *http.Response) error {
 		}
 	}
 
-	// ============================================================
-	// ✅ 飞牛原生列表接口注入：/v/api/v1/item/list
-	// ============================================================
+	// 飞牛原生列表接口注入
 	if s.doubanProvider != nil && config.Global.GetEnableDoubanRating() && resp.StatusCode == http.StatusOK && resp.Request != nil {
 		listPath := resp.Request.URL.Path
 		if s.shouldInjectNativeList(listPath) {
@@ -790,9 +758,7 @@ func (s *Server) handleResponse(resp *http.Response) error {
 		}
 	}
 
-	// ============================================================
-	// ✅ 飞牛原生季列表接口注入：/v/api/v1/season/list/{TV_guid}
-	// ============================================================
+	// 飞牛原生季列表接口注入
 	if s.doubanProvider != nil && config.Global.GetEnableDoubanRating() && resp.StatusCode == http.StatusOK && resp.Request != nil {
 		seasonListPath := resp.Request.URL.Path
 		if s.shouldInjectNativeSeasonList(seasonListPath) {
@@ -809,9 +775,7 @@ func (s *Server) handleResponse(resp *http.Response) error {
 		}
 	}
 
-	// ============================================================
-	// ✅ 豆瓣评分注入：拦截 /Items 响应（Emby 协议，列表或详情）
-	// ============================================================
+	// Emby 协议注入
 	if s.doubanProvider != nil && config.Global.GetEnableDoubanRating() && resp.StatusCode == http.StatusOK && resp.Request != nil {
 		path := resp.Request.URL.Path
 		if strings.Contains(path, "/Items") && !strings.Contains(path, "/PlaybackInfo") {
@@ -828,7 +792,6 @@ func (s *Server) handleResponse(resp *http.Response) error {
 		}
 	}
 
-	// PlaybackInfo 处理
 	if resp.Request == nil {
 		return nil
 	}
@@ -857,8 +820,6 @@ func (s *Server) handleResponse(resp *http.Response) error {
 		return nil
 	}
 
-	s.logger.Debug("📊 [响应处理] 响应体大小: %d bytes", len(body))
-
 	newBody, err := s.playbackHandler.Handle(resp, body)
 	if err != nil {
 		s.logger.Error("❌ [响应处理] PlaybackInfo处理失败: %v", err)
@@ -869,11 +830,10 @@ func (s *Server) handleResponse(resp *http.Response) error {
 	resp.Header.Del("Transfer-Encoding")
 	resp.Body = io.NopCloser(bytes.NewBuffer(newBody))
 
-	s.logger.Debug("✅ [响应处理] PlaybackInfo处理完成")
 	return nil
 }
 
-// retryPlaybackInfo 主动重试 PlaybackInfo 请求
+// retryPlaybackInfo 主动重试
 func (s *Server) retryPlaybackInfo(originalReq *http.Request) {
 	s.proxyMu.RLock()
 	targetURL := s.targetURL
@@ -901,7 +861,6 @@ func (s *Server) retryPlaybackInfo(originalReq *http.Request) {
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(overallCtx, reqMethod, reqURL, nil)
 		if err != nil {
-			s.logger.Warn("❌ [重试] 创建请求失败: %v", err)
 			return
 		}
 		req.Header = reqHeaders.Clone()
@@ -912,7 +871,6 @@ func (s *Server) retryPlaybackInfo(originalReq *http.Request) {
 			if s.serverCtx.Err() != nil {
 				return
 			}
-			s.logger.Debug("⚠️ [重试] 第%d次请求失败: %v", attempt, err)
 			if attempt < maxAttempts {
 				time.Sleep(playbackProbeRetryInterval(attempt))
 			}
@@ -921,7 +879,6 @@ func (s *Server) retryPlaybackInfo(originalReq *http.Request) {
 
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
-			s.logger.Debug("⚠️ [重试] 第%d次状态码: %d (飞牛probe中)", attempt, resp.StatusCode)
 			if attempt < maxAttempts {
 				time.Sleep(playbackProbeRetryInterval(attempt))
 			}
@@ -930,25 +887,18 @@ func (s *Server) retryPlaybackInfo(originalReq *http.Request) {
 
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 		resp.Body.Close()
-		if err != nil {
-			s.logger.Warn("⚠️ [重试] 读取响应体失败: %v", err)
-			return
-		}
-		if len(body) == 0 {
-			s.logger.Warn("⚠️ [重试] 响应体为空")
+		if err != nil || len(body) == 0 {
 			return
 		}
 
 		if attempt == 1 {
 			s.logger.Info("✅ [重试] 首次成功: %s", reqPath)
 		} else {
-			s.logger.Info("✅ [重试] 第%d次成功: %s (飞牛probe完成)", attempt, reqPath)
+			s.logger.Info("✅ [重试] 第%d次成功: %s", attempt, reqPath)
 		}
 		_, _ = s.playbackHandler.Handle(resp, body)
 		return
 	}
-
-	s.logger.Debug("⚠️ [重试] %d次尝试均未成功(飞牛probe超时): %s", maxAttempts, reqPath)
 }
 
 // proactivePlaybackInfo 主动预请求
@@ -959,7 +909,6 @@ func (s *Server) proactivePlaybackInfo(originalReq *http.Request) {
 	if itemID != "" {
 		if source, found := s.cache.GetByItemID(itemID); found {
 			if _, urlFound := s.cache.GetStreamURL(source.ID); urlFound {
-				s.logger.Debug("⏭️ [主动预请求] 跳过（已缓存且直链已解析）: ItemId=%s", itemID)
 				return
 			}
 		}
@@ -991,7 +940,6 @@ func (s *Server) proactivePlaybackInfo(originalReq *http.Request) {
 	defer reqCancel()
 	req, err := http.NewRequestWithContext(reqCtx, reqMethod, reqURL, nil)
 	if err != nil {
-		s.logger.Warn("❌ [主动] 创建请求失败: %v", err)
 		return
 	}
 
@@ -1003,13 +951,11 @@ func (s *Server) proactivePlaybackInfo(originalReq *http.Request) {
 		if s.serverCtx.Err() != nil {
 			return
 		}
-		s.logger.Debug("⚠️ [主动] 请求失败: %v", err)
 		return
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		s.logger.Debug("⚠️ [主动] 状态码: %d (飞牛准备中)", resp.StatusCode)
 		return
 	}
 
@@ -1057,7 +1003,6 @@ func (s *Server) isItemDetailRequest(req *http.Request) (string, string, bool) {
 		}
 	}
 
-	s.logger.Debug("🎬 [详情页检测] 命中: %s %s (ItemId=%s, UserId=%s)", req.Method, path, itemID, userID)
 	return itemID, userID, true
 }
 
@@ -1094,8 +1039,6 @@ func (s *Server) prefetchForDetailPage(originalReq *http.Request, itemID string,
 	reqHost := targetURL.Host
 
 	time.Sleep(50 * time.Millisecond)
-
-	s.logger.Info("🎬 [详情页] 开始: %s", itemID)
 
 	overallCtx, overallCancel := context.WithTimeout(s.serverCtx, 60*time.Second)
 	defer overallCancel()
@@ -1139,7 +1082,7 @@ func (s *Server) prefetchForDetailPage(originalReq *http.Request, itemID string,
 	}
 }
 
-// prefetchForMediaSourceMiss 流请求发现 MediaSource 未缓存时的同步兜底
+// prefetchForMediaSourceMiss 流请求兜底
 func (s *Server) prefetchForMediaSourceMiss(originalReq *http.Request, itemID string, mediaSourceID string) bool {
 	if itemID == "" {
 		return false
@@ -1653,7 +1596,7 @@ func (s *Server) statsHandler(w http.ResponseWriter, r *http.Request) {
 	if s.libraryScanner != nil {
 		stats["libraryScan"] = s.libraryScanner.GetStatus()
 	}
-	if s.doubanProvider != nil { // ✅
+	if s.doubanProvider != nil {
 		stats["douban"] = s.doubanProvider.GetStats()
 	}
 
