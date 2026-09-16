@@ -49,9 +49,8 @@ type Server struct {
 	// 批量预取相关组件
 	authStore       *AuthStore
 	batchPrefetcher *BatchPrefetcher
-	posterPrefetch  *PosterPrefetcher
 	libraryScanner  *LibraryScanner
-	doubanProvider  *DoubanProvider // ✅ 新增
+	doubanProvider  *DoubanProvider // ✅
 
 	// ✅ TV guid → title 缓存（季列表注入需要）
 	seriesTitleCache sync.Map
@@ -172,10 +171,7 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 	sh.SetMediaSourceMissHandler(s.prefetchForMediaSourceMiss)
 
 	// 初始化批量预取组件
-	initialConcurrency := cfg.GetPosterPrefetchConcurrency()
-	if scanConc := cfg.GetLibraryScanConcurrency(); scanConc > initialConcurrency {
-		initialConcurrency = scanConc
-	}
+	initialConcurrency := cfg.GetLibraryScanConcurrency()
 	s.authStore = NewAuthStore()
 
 	// 主动登录
@@ -194,11 +190,10 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 	}
 
 	s.batchPrefetcher = NewBatchPrefetcher(s, initialConcurrency)
-	s.posterPrefetch = NewPosterPrefetcher(s, s.batchPrefetcher, s.authStore)
-	s.doubanProvider = NewDoubanProvider(s) // ✅ 新增
+	s.doubanProvider = NewDoubanProvider(s) // ✅
 	s.libraryScanner = NewLibraryScanner(s, s.batchPrefetcher, s.authStore)
-	s.logger.Info("📦 [批量预取] 引擎已初始化: 并发=%d (海报墙=%d, 全库扫描=%d)",
-		initialConcurrency, cfg.GetPosterPrefetchConcurrency(), cfg.GetLibraryScanConcurrency())
+	s.logger.Info("📦 [批量预取] 引擎已初始化: 并发=%d (全库扫描=%d)",
+		initialConcurrency, cfg.GetLibraryScanConcurrency())
 
 	return s, nil
 }
@@ -264,20 +259,6 @@ func (s *Server) applyProxyHandlers(p *httputil.ReverseProxy, targetURL *url.URL
 			reqCopy := req.Clone(context.Background())
 			go s.proactivePlaybackInfo(reqCopy)
 		}
-
-		// 拦截 FNOS 原生海报墙请求
-		if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/v/api/v1/item/list") {
-			body, err := io.ReadAll(io.LimitReader(req.Body, 1*1024*1024))
-			if err == nil && len(body) > 0 {
-				req.Body.Close()
-				req.Body = io.NopCloser(bytes.NewReader(body))
-				req.ContentLength = int64(len(body))
-				req.Header.Set("Content-Length", strconv.Itoa(len(body)))
-				if s.posterPrefetch != nil {
-					go s.posterPrefetch.HandleFnosListRequest(body)
-				}
-			}
-		}
 	}
 	p.ModifyResponse = s.handleResponse
 	p.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
@@ -334,7 +315,7 @@ func (s *Server) Stop() error {
 		if s.libraryScanner != nil {
 			s.libraryScanner.Stop()
 		}
-		if s.doubanProvider != nil { // ✅ 新增
+		if s.doubanProvider != nil { // ✅
 			s.doubanProvider.Stop()
 		}
 		if s.batchPrefetcher != nil {
@@ -358,7 +339,7 @@ func (s *Server) GetCache() *cache.Cache                   { return s.cache }
 func (s *Server) GetLogger() *logger.Logger                { return s.logger }
 func (s *Server) GetStreamHandler() *handler.StreamHandler { return s.streamHandler }
 func (s *Server) GetLibraryScanner() *LibraryScanner       { return s.libraryScanner }
-func (s *Server) GetDoubanProvider() *DoubanProvider       { return s.doubanProvider } // ✅ 新增
+func (s *Server) GetDoubanProvider() *DoubanProvider       { return s.doubanProvider } // ✅
 
 // Reload 重新加载配置
 func (s *Server) Reload() {
@@ -401,7 +382,7 @@ func (s *Server) Reload() {
 
 // injectDoubanRatings 解析 JSON，对每个 item 注入豆瓣评分
 //
-// ✅ 新增：豆瓣评分注入（Emby 协议 /Items 响应）
+// ✅ 豆瓣评分注入（Emby 协议 /Items 响应）
 func (s *Server) injectDoubanRatings(body []byte) []byte {
 	var obj map[string]interface{}
 	if err := json.Unmarshal(body, &obj); err != nil {
@@ -454,16 +435,6 @@ func (s *Server) shouldInjectNative(path string) bool {
 }
 
 // injectDoubanNative 注入豆瓣评分到飞牛原生详情响应
-//
-// 响应结构：
-//   { "code":0, "data": { "imdb_id":"ttxxx", "title":"xxx", "type":"Movie",
-//                         "vote_average":"7.2535...", ... } }
-//
-// type 说明：
-//   - "Movie"          → 用 IMDb 查电影评分
-//   - "Series" / "TV"  → 剧集，用 number_of_seasons / season_number 查最新季豆瓣分
-//                       同时缓存 guid → title（供季列表注入用）
-//   - "Season"         → 用 tv_title（剧名）+ season_number 查季分
 func (s *Server) injectDoubanNative(body []byte) []byte {
 	defer func() {
 		if r := recover(); r != nil {
@@ -577,13 +548,6 @@ func (s *Server) shouldInjectNativeList(path string) bool {
 }
 
 // injectDoubanNativeList 注入豆瓣评分到飞牛原生列表响应
-//
-// 响应结构：{ "code":0, "data": { "list": [ {..item..}, ... ] } }
-//
-// type 说明（与详情页一致）：
-//   - "Movie"          → 用 IMDb 查电影评分
-//   - "Series" / "TV"  → 剧集，用 number_of_seasons / season_number 查最新季豆瓣分
-//   - "Season"         → 用 tv_title（剧名）+ season_number 查季分
 func (s *Server) injectDoubanNativeList(body []byte) []byte {
 	defer func() {
 		if r := recover(); r != nil {
@@ -687,12 +651,6 @@ func (s *Server) injectDoubanNativeList(body []byte) []byte {
 // ============================================================
 // ✅ 飞牛原生季列表接口注入（/v/api/v1/season/list/{TV_guid}）
 //    TV 详情页下方横排的季小海报走这里
-//
-// 响应结构：{ "code":0, "data": [ {..season..}, ... ] }
-//    注意：data 是数组，不是 {list: []}
-//
-// 剧名获取：响应里 tv_title / parent_title 都为空，只能靠 parent_guid
-//           从 seriesTitleCache（TV 详情页注入时缓存）反查
 // ============================================================
 
 // shouldInjectNativeSeasonList 判断是否飞牛原生季列表接口
@@ -790,8 +748,6 @@ func (s *Server) injectDoubanNativeSeasonList(body []byte) []byte {
 func (s *Server) handleResponse(resp *http.Response) error {
 	// ============================================================
 	// ✅ 飞牛原生详情接口注入：/v/api/v1/item/{guid}
-	//    放在最前面，避免 resp.Body 被后续逻辑消费
-	//    ✅ 加 config.Global.GetEnableDoubanRating() 判断，开关关闭时跳过
 	// ============================================================
 	if s.doubanProvider != nil && config.Global.GetEnableDoubanRating() && resp.StatusCode == http.StatusOK && resp.Request != nil {
 		nativePath := resp.Request.URL.Path
@@ -811,8 +767,6 @@ func (s *Server) handleResponse(resp *http.Response) error {
 
 	// ============================================================
 	// ✅ 飞牛原生列表接口注入：/v/api/v1/item/list
-	//    海报墙评分（左上角数字）走这里
-	//    ✅ 加 config.Global.GetEnableDoubanRating() 判断，开关关闭时跳过
 	// ============================================================
 	if s.doubanProvider != nil && config.Global.GetEnableDoubanRating() && resp.StatusCode == http.StatusOK && resp.Request != nil {
 		listPath := resp.Request.URL.Path
@@ -832,8 +786,6 @@ func (s *Server) handleResponse(resp *http.Response) error {
 
 	// ============================================================
 	// ✅ 飞牛原生季列表接口注入：/v/api/v1/season/list/{TV_guid}
-	//    TV 详情页下方横排的季小海报走这里
-	//    ✅ 加 config.Global.GetEnableDoubanRating() 判断，开关关闭时跳过
 	// ============================================================
 	if s.doubanProvider != nil && config.Global.GetEnableDoubanRating() && resp.StatusCode == http.StatusOK && resp.Request != nil {
 		seasonListPath := resp.Request.URL.Path
@@ -853,7 +805,6 @@ func (s *Server) handleResponse(resp *http.Response) error {
 
 	// ============================================================
 	// ✅ 豆瓣评分注入：拦截 /Items 响应（Emby 协议，列表或详情）
-	//    ✅ 加 config.Global.GetEnableDoubanRating() 判断，开关关闭时跳过
 	// ============================================================
 	if s.doubanProvider != nil && config.Global.GetEnableDoubanRating() && resp.StatusCode == http.StatusOK && resp.Request != nil {
 		path := resp.Request.URL.Path
@@ -870,43 +821,6 @@ func (s *Server) handleResponse(resp *http.Response) error {
 			}
 		}
 	}
-
-	// ✅ 拦截 Emby Views 响应，缓存媒体库列表
-	if s.posterPrefetch != nil && resp.StatusCode == http.StatusOK &&
-		resp.Request != nil && strings.HasSuffix(resp.Request.URL.Path, "/Views") {
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
-		if err == nil {
-			resp.Body.Close()
-			resp.Body = io.NopCloser(bytes.NewBuffer(body))
-			resp.ContentLength = int64(len(body))
-			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
-			resp.Header.Del("Transfer-Encoding")
-			s.posterPrefetch.CacheEmbyLibraries(body)
-		}
-		return nil
-	}
-
-	// ✅ 拦截 FNOS 媒体库列表响应
-	if s.posterPrefetch != nil && resp.StatusCode == http.StatusOK &&
-		resp.Request != nil && strings.HasSuffix(resp.Request.URL.Path, "/v/api/v1/mediadb/list") {
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
-		if err == nil {
-			resp.Body.Close()
-			resp.Body = io.NopCloser(bytes.NewBuffer(body))
-			resp.ContentLength = int64(len(body))
-			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
-			resp.Header.Del("Transfer-Encoding")
-			s.posterPrefetch.CacheFnosLibraries(body)
-		}
-		return nil
-	}
-
-	// ⚠️ 海报墙预取触发已临时禁用（方案 A）
-	// if s.posterPrefetch != nil && resp.StatusCode == http.StatusOK {
-	// 	if userID, ok := s.posterPrefetch.IsItemListRequest(resp.Request); ok {
-	// 		...
-	// 	}
-	// }
 
 	// PlaybackInfo 处理
 	if resp.Request == nil {
@@ -1733,7 +1647,7 @@ func (s *Server) statsHandler(w http.ResponseWriter, r *http.Request) {
 	if s.libraryScanner != nil {
 		stats["libraryScan"] = s.libraryScanner.GetStatus()
 	}
-	if s.doubanProvider != nil { // ✅ 新增
+	if s.doubanProvider != nil { // ✅
 		stats["douban"] = s.doubanProvider.GetStats()
 	}
 
