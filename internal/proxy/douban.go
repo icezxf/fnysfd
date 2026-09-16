@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -95,13 +96,6 @@ type doubanDBFile struct {
 // DoubanProvider
 // ============================================================
 
-// DoubanProvider 豆瓣评分提供器
-//
-// 职责：
-//   1. FetchMovieOrSeries / FetchSeason：抓取评分（供 LibraryScanner 调用）
-//   2. GetRating / GetSeasonRating：查询评分（供反代注入调用）
-//   3. InjectInto：把评分注入到 item map
-//   4. 磁盘持久化（data/douban_cache.json）
 type DoubanProvider struct {
 	server     *Server
 	httpClient *http.Client
@@ -309,12 +303,6 @@ func (dp *DoubanProvider) GetSeasonRating(seriesName string, seasonNumber int) (
 // 反代注入
 // ============================================================
 
-// InjectInto 把豆瓣评分注入到 item map（供 server.go 的 handleResponse 调用）
-//
-// 策略：
-//   - Movie / Series：覆盖 CommunityRating
-//   - Season：尝试覆盖 CommunityRating（客户端可能不认）+ Overview 前缀兜底
-//   - 其他：跳过
 func (dp *DoubanProvider) InjectInto(item map[string]interface{}) {
 	if !config.Global.GetEnableDoubanRating() {
 		return
@@ -375,10 +363,8 @@ func (dp *DoubanProvider) injectSeason(item map[string]interface{}) {
 		return
 	}
 
-	// 尝试覆盖 CommunityRating（部分客户端可能不认）
 	item["CommunityRating"] = rating
 
-	// Overview 前缀兜底
 	orig, _ := item["Overview"].(string)
 	prefix := fmt.Sprintf("【豆瓣 ⭐%.1f】\n\n", rating)
 	if !strings.HasPrefix(orig, "【豆瓣") {
@@ -483,11 +469,6 @@ func (dp *DoubanProvider) getTVRatingByImdb(ctx context.Context, imdbID string) 
 	return results[0].Rating, nil
 }
 
-// ============================================================
-// searchByTitle —— 按标题搜索（不带季）
-//
-// 注意：豆瓣 suggest 接口对剧集也返回 type="movie"，不能按 type 过滤。
-// ============================================================
 func (dp *DoubanProvider) searchByTitle(ctx context.Context, name string, year int, itemType string) (float64, error) {
 	dp.globalRateLimit(ctx)
 
@@ -517,8 +498,6 @@ func (dp *DoubanProvider) searchByTitle(ctx context.Context, name string, year i
 		return 0, fmt.Errorf("no results")
 	}
 
-	// ✅ 不再按 Type 过滤（豆瓣 suggest 全部返回 "movie"）
-	// 改为按年份匹配
 	var matchedID string
 	for _, r := range results {
 		rYear, _ := strconv.Atoi(r.Year)
@@ -535,22 +514,13 @@ func (dp *DoubanProvider) searchByTitle(ctx context.Context, name string, year i
 	return dp.fetchRatingByDoubanID(ctx, matchedID)
 }
 
-// ============================================================
-// searchSeasonRating —— 季评分搜索（两段式）
-//
-// 第一段：搜「剧名 + 第N季」（美剧场景，每季独立条目）
-// 第二段：搜「剧名」兜底（国产剧场景，整剧只有一条目，无季的概念）
-// ============================================================
 func (dp *DoubanProvider) searchSeasonRating(ctx context.Context, seriesName string, seasonNumber int) (float64, error) {
 	seasonStr := seasonNumberToChinese(seasonNumber)
 
-	// 第一段：带季名搜（美剧场景）
 	if rating, err := dp.searchSeasonByName(ctx, seriesName+" "+seasonStr, seriesName, seasonStr); err == nil {
 		return rating, nil
 	}
 
-	// 第二段：只搜剧名兜底（国产剧场景）
-	// 只有当整剧条目没有带季名时才算命中，避免美剧拿错季
 	if rating, err := dp.searchSeasonByName(ctx, seriesName, seriesName, ""); err == nil {
 		return rating, nil
 	}
@@ -558,10 +528,6 @@ func (dp *DoubanProvider) searchSeasonRating(ctx context.Context, seriesName str
 	return 0, fmt.Errorf("no season match")
 }
 
-// searchSeasonByName 搜一次，按 title 过滤
-//
-// seasonSuffix 为空 → 兜底模式：只匹配「不带季名的整剧条目」（normalize 后完全相等）
-// seasonSuffix 非空 → 季模式：title 必须同时包含季名和剧名
 func (dp *DoubanProvider) searchSeasonByName(ctx context.Context, keyword, seriesName, seasonSuffix string) (float64, error) {
 	dp.globalRateLimit(ctx)
 
@@ -594,10 +560,7 @@ func (dp *DoubanProvider) searchSeasonByName(ctx context.Context, keyword, serie
 	normalizedSeries := normalizeTitle(seriesName)
 
 	for _, r := range results {
-		// ✅ 不再过滤 r.Type（豆瓣 suggest 全部返回 movie）
-
 		if seasonSuffix != "" {
-			// 季模式：title 必须含季名 + 剧名
 			if !strings.Contains(r.Title, seasonSuffix) {
 				continue
 			}
@@ -607,7 +570,6 @@ func (dp *DoubanProvider) searchSeasonByName(ctx context.Context, keyword, serie
 			return dp.fetchRatingByDoubanID(ctx, r.ID)
 		}
 
-		// 兜底模式：normalize 后完全相等（避免命中「XXX 第N季」）
 		if normalizeTitle(r.Title) != normalizedSeries {
 			continue
 		}
@@ -854,6 +816,121 @@ func (dp *DoubanProvider) GetStats() map[string]interface{} {
 		"stat_fetched": dp.statFetched.Load(),
 		"stat_failed":  dp.statFailed.Load(),
 	}
+}
+
+// ============================================================
+// 缓存列表 / 删除（供面板展示与管理）
+// ============================================================
+
+// ListCache 返回去重后的缓存列表（按抓取时间倒序）
+//
+// 同一部片子的多个 key（imdb:xxx + title:xxx）指向同一个 entry 指针，
+// 按指针聚合实现去重；season:xxx 是独立 entry，不会被合并
+func (dp *DoubanProvider) ListCache() []map[string]interface{} {
+	dp.diskMu.RLock()
+	byEntry := make(map[*doubanCacheEntry][]string)
+	for k, e := range dp.diskEntries {
+		if e == nil {
+			continue
+		}
+		byEntry[e] = append(byEntry[e], k)
+	}
+	dp.diskMu.RUnlock()
+
+	items := make([]map[string]interface{}, 0, len(byEntry))
+	for entry, keys := range byEntry {
+		// 选主 key（season: > imdb: > title:）
+		sort.Slice(keys, func(i, j int) bool {
+			return keyPriority(keys[i]) < keyPriority(keys[j])
+		})
+		primary := keys[0]
+
+		itemType := "movie"
+		seasonNum := 0
+		if strings.HasPrefix(primary, "season:") {
+			itemType = "season"
+			if idx := strings.LastIndex(primary, "|"); idx > 0 {
+				if n, err := strconv.Atoi(primary[idx+1:]); err == nil {
+					seasonNum = n
+				}
+			}
+		}
+
+		items = append(items, map[string]interface{}{
+			"key":        primary,
+			"all_keys":   keys,
+			"rating":     entry.Rating,
+			"title":      entry.Title,
+			"type":       itemType,
+			"season_num": seasonNum,
+			"fetched_at": entry.FetchedAt.Format("2006-01-02 15:04:05"),
+		})
+	}
+
+	// 按抓取时间倒序
+	sort.Slice(items, func(i, j int) bool {
+		return items[i]["fetched_at"].(string) > items[j]["fetched_at"].(string)
+	})
+
+	return items
+}
+
+// keyPriority 用于给主 key 排序，数字越小优先级越高
+func keyPriority(k string) int {
+	switch {
+	case strings.HasPrefix(k, "season:"):
+		return 0
+	case strings.HasPrefix(k, "imdb:"):
+		return 1
+	case strings.HasPrefix(k, "title:"):
+		return 2
+	default:
+		return 3
+	}
+}
+
+// DeleteCacheEntry 删除指定 key 集合的所有缓存（一个片子关联的多个 key）
+// 返回实际删除的 key 数量
+func (dp *DoubanProvider) DeleteCacheEntry(keys []string) int {
+	if len(keys) == 0 {
+		return 0
+	}
+
+	deleted := 0
+	dp.indexMu.Lock()
+	for _, k := range keys {
+		if _, ok := dp.index[k]; ok {
+			delete(dp.index, k)
+			deleted++
+		}
+	}
+	dp.indexMu.Unlock()
+
+	dp.diskMu.Lock()
+	for _, k := range keys {
+		delete(dp.diskEntries, k)
+	}
+	dp.diskMu.Unlock()
+
+	if deleted > 0 {
+		dp.dirty.Store(true)
+	}
+	return deleted
+}
+
+// ClearCache 清空所有豆瓣缓存，返回清空的条目数
+func (dp *DoubanProvider) ClearCache() int {
+	dp.indexMu.Lock()
+	n := len(dp.index)
+	dp.index = make(map[string]float32)
+	dp.indexMu.Unlock()
+
+	dp.diskMu.Lock()
+	dp.diskEntries = make(map[string]*doubanCacheEntry)
+	dp.diskMu.Unlock()
+
+	dp.dirty.Store(true)
+	return n
 }
 
 // ============================================================
