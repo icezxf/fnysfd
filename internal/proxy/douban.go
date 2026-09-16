@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"fnysfd/internal/config"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,11 +18,9 @@ import (
 )
 
 // ============================================================
-// 硬编码开关（先不做配置，测试通过后再提取到 config）
+// 豆瓣评分开关由 config.Global.GetEnableDoubanRating() 提供
+// 硬编码 var doubanEnabled 已移除，统一走配置
 // ============================================================
-
-// ✅ 先硬编码为 true，测试用。成功后改成 config.GetEnableDoubanRating()
-var doubanEnabled = true
 
 const (
 	doubanDefaultApiKey      = "0ab215a8b1977939201640fa14c66bab"
@@ -193,7 +192,7 @@ func (dp *DoubanProvider) FetchMovieOrSeries(ctx context.Context, imdbID, name s
 		}
 	}()
 
-	if !doubanEnabled {
+	if !config.Global.GetEnableDoubanRating() {
 		return
 	}
 	if imdbID == "" && name == "" {
@@ -244,7 +243,7 @@ func (dp *DoubanProvider) FetchSeason(ctx context.Context, seriesName string, se
 		}
 	}()
 
-	if !doubanEnabled {
+	if !config.Global.GetEnableDoubanRating() {
 		return
 	}
 	if seriesName == "" || seasonNumber <= 0 {
@@ -317,7 +316,7 @@ func (dp *DoubanProvider) GetSeasonRating(seriesName string, seasonNumber int) (
 //   - Season：尝试覆盖 CommunityRating（客户端可能不认）+ Overview 前缀兜底
 //   - 其他：跳过
 func (dp *DoubanProvider) InjectInto(item map[string]interface{}) {
-	if !doubanEnabled {
+	if !config.Global.GetEnableDoubanRating() {
 		return
 	}
 
@@ -846,7 +845,7 @@ func (dp *DoubanProvider) GetStats() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"enabled":      doubanEnabled,
+		"enabled":      config.Global.GetEnableDoubanRating(),
 		"entries":      entryCount,
 		"file_size_kb": fileSize / 1024,
 		"updated_at":   updatedStr,
