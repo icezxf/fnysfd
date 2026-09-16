@@ -67,7 +67,11 @@ type Config struct {
 	// ✅ Webhook 通知配置（QMS 联动）
 	WebhookNotifyToken        string `mapstructure:"webhook_notify_token"`         // 预共享密钥（空=禁用）
 	WebhookNotifyDelaySeconds int    `mapstructure:"webhook_notify_delay_seconds"` // 延迟秒数（默认15）
-	mutex                     sync.RWMutex
+	// ✅ 豆瓣评分开关（默认开启）
+	//   - true：反代抓取豆瓣评分并注入响应（电影/剧集/季）
+	//   - false：完全禁用豆瓣抓取与注入
+	EnableDoubanRating bool `mapstructure:"enable_douban_rating"`
+	mutex              sync.RWMutex
 }
 
 // Global 全局配置实例
@@ -104,6 +108,8 @@ var Global = &Config{
 	// ✅ Webhook 通知默认值
 	WebhookNotifyToken:        "", // 默认禁用
 	WebhookNotifyDelaySeconds: 15, // 默认延迟 15 秒
+	// ✅ 豆瓣评分默认开启
+	EnableDoubanRating: true,
 }
 
 // Load 加载配置
@@ -152,6 +158,8 @@ func Load(configPath string) error {
 	// ✅ Webhook 通知
 	viper.SetDefault("webhook_notify_token", "")
 	viper.SetDefault("webhook_notify_delay_seconds", 15)
+	// ✅ 豆瓣评分开关
+	viper.SetDefault("enable_douban_rating", true)
 
 	viper.SetEnvPrefix("FNTV")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -559,6 +567,14 @@ func (c *Config) GetWebhookNotifyDelaySeconds() int {
 	return c.WebhookNotifyDelaySeconds
 }
 
+// ✅ 新增：GetEnableDoubanRating 获取是否启用豆瓣评分
+// 默认 true
+func (c *Config) GetEnableDoubanRating() bool {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c.EnableDoubanRating
+}
+
 // SetLogLevel 设置日志级别
 func (c *Config) SetLogLevel(level string) {
 	c.mutex.Lock()
@@ -831,6 +847,14 @@ func (c *Config) UpdateConfigWithStatus(updates map[string]interface{}) (bool, e
 					log.Printf("🔄 检测到 Webhook 延迟变更: %d 秒（热重载生效）", v)
 				}
 			}
+		// ✅ 新增：豆瓣评分开关
+		case "enable_douban_rating":
+			if v, ok := value.(bool); ok {
+				if c.EnableDoubanRating != v {
+					c.EnableDoubanRating = v
+					log.Printf("🔄 检测到豆瓣评分开关变更: %v（热重载生效）", v)
+				}
+			}
 		}
 	}
 
@@ -940,7 +964,7 @@ func validateConfigUpdates(updates map[string]interface{}) error {
 				return fmt.Errorf("library_scan_incremental_minutes 必须在 1-1440 分钟之间（当前: %d）", v)
 			}
 		// bool 开关类配置无需额外校验（类型已由 UpdateConfig 的 type assertion 保证）
-		case "enable_lan_strm", "enable_preload", "enable_smart_ttl", "enable_cdn_warmup":
+		case "enable_lan_strm", "enable_preload", "enable_smart_ttl", "enable_cdn_warmup", "enable_douban_rating":
 			// bool 类型，无额外约束
 		}
 	}
@@ -1051,6 +1075,8 @@ func (c *Config) saveConfigLocked() error {
 	// ✅ Webhook 通知
 	viper.Set("webhook_notify_token", c.WebhookNotifyToken)
 	viper.Set("webhook_notify_delay_seconds", c.WebhookNotifyDelaySeconds)
+	// ✅ 豆瓣评分开关
+	viper.Set("enable_douban_rating", c.EnableDoubanRating)
 
 	// 原子写入：先写临时文件（必须保留 .yaml 扩展名，否则 viper 无法识别格式），
 	// 再通过 os.Rename 原子替换原文件
@@ -1148,6 +1174,8 @@ func (c *Config) ToMap() map[string]interface{} {
 		// ✅ Webhook 通知
 		"webhook_notify_token":         webhookTokenMasked,
 		"webhook_notify_delay_seconds": c.WebhookNotifyDelaySeconds,
+		// ✅ 豆瓣评分开关
+		"enable_douban_rating": c.EnableDoubanRating,
 	}
 }
 
@@ -1340,6 +1368,7 @@ library_scan_episode_count: 5
 library_scan_incremental_minutes: 5
 webhook_notify_token: ""
 webhook_notify_delay_seconds: 15
+enable_douban_rating: true
 listen: :28005
 log_dir: ./logs
 log_level: info
