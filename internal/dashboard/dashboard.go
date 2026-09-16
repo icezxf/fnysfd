@@ -32,6 +32,7 @@ type Dashboard struct {
 	logger         *logger.Logger
 	streamHandler  *handler.StreamHandler
 	libraryScanner LibraryScannerInterface // 全库扫描器接口（可选）
+	doubanProvider DoubanProviderInterface // ✅ 新增：豆瓣评分提供器接口（可选）
 	startTime      time.Time
 	sessions       map[string]session
 	sessionMutex   sync.RWMutex
@@ -46,6 +47,11 @@ type LibraryScannerInterface interface {
 	TriggerScan() error
 	IsRunning() bool
 	GetStatus() map[string]interface{}
+}
+
+// DoubanProviderInterface 豆瓣评分提供器接口（解耦 dashboard 对 proxy 包的依赖）
+type DoubanProviderInterface interface {
+	GetStats() map[string]interface{}
 }
 
 type session struct {
@@ -110,6 +116,11 @@ func (d *Dashboard) SetLibraryScanner(ls LibraryScannerInterface) {
 	d.libraryScanner = ls
 }
 
+// SetDoubanProvider 设置豆瓣评分提供器引用
+func (d *Dashboard) SetDoubanProvider(p DoubanProviderInterface) {
+	d.doubanProvider = p
+}
+
 // Start 启动面板服务（独立端口）
 func (d *Dashboard) Start() error {
 	mux := http.NewServeMux()
@@ -131,8 +142,8 @@ func (d *Dashboard) Start() error {
 	mux.HandleFunc("/api/logs", d.authMiddleware(d.handleLogs))
 	mux.HandleFunc("/api/scan/trigger", d.authMiddleware(d.csrfMiddleware(d.handleScanTrigger)))
 	mux.HandleFunc("/api/scan/status", d.authMiddleware(d.handleScanStatus))
-    mux.HandleFunc("/api/scan/notify", d.handleScanNotify) // ✅ 新增：Webhook 通知端点（不走 session 认证，用 token 认证）
-	
+	mux.HandleFunc("/api/scan/notify", d.handleScanNotify) // ✅ 新增：Webhook 通知端点（不走 session 认证，用 token 认证）
+
 	mux.HandleFunc("/", d.authMiddleware(d.handleIndex))
 
 	d.server = &http.Server{
@@ -404,6 +415,19 @@ func (d *Dashboard) handleStats(w http.ResponseWriter, r *http.Request) {
 		for k, v := range d.streamHandler.GetStats() {
 			data[k] = v
 		}
+	}
+
+	// ✅ 合并豆瓣评分统计
+	if d.doubanProvider != nil {
+		ds := d.doubanProvider.GetStats()
+		data["douban_enabled"] = ds["enabled"]
+		data["douban_entries"] = ds["entries"]
+		data["douban_file_size_kb"] = ds["file_size_kb"]
+		data["douban_updated_at"] = ds["updated_at"]
+		data["douban_stat_hits"] = ds["stat_hits"]
+		data["douban_stat_misses"] = ds["stat_misses"]
+		data["douban_stat_fetched"] = ds["stat_fetched"]
+		data["douban_stat_failed"] = ds["stat_failed"]
 	}
 
 	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: data})
