@@ -32,7 +32,7 @@ type Dashboard struct {
 	logger         *logger.Logger
 	streamHandler  *handler.StreamHandler
 	libraryScanner LibraryScannerInterface // 全库扫描器接口（可选）
-	doubanProvider DoubanProviderInterface // ✅ 新增：豆瓣评分提供器接口（可选）
+	doubanProvider DoubanProviderInterface // ✅ 豆瓣评分提供器接口（可选）
 	startTime      time.Time
 	sessions       map[string]session
 	sessionMutex   sync.RWMutex
@@ -52,6 +52,9 @@ type LibraryScannerInterface interface {
 // DoubanProviderInterface 豆瓣评分提供器接口（解耦 dashboard 对 proxy 包的依赖）
 type DoubanProviderInterface interface {
 	GetStats() map[string]interface{}
+	ListCache() []map[string]interface{}  // ✅ 新增
+	DeleteCacheEntry(keys []string) int   // ✅ 新增
+	ClearCache() int                      // ✅ 新增
 }
 
 type session struct {
@@ -81,7 +84,6 @@ type SystemInfo struct {
 }
 
 // New 创建管理面板
-// version 由 main 包通过 -ldflags "-X main.version=xxx" 注入并传入
 func New(cfg *config.Config, c *cache.Cache, l *logger.Logger, version string) *Dashboard {
 	if version == "" {
 		version = "dev"
@@ -142,7 +144,11 @@ func (d *Dashboard) Start() error {
 	mux.HandleFunc("/api/logs", d.authMiddleware(d.handleLogs))
 	mux.HandleFunc("/api/scan/trigger", d.authMiddleware(d.csrfMiddleware(d.handleScanTrigger)))
 	mux.HandleFunc("/api/scan/status", d.authMiddleware(d.handleScanStatus))
-	mux.HandleFunc("/api/scan/notify", d.handleScanNotify) // ✅ 新增：Webhook 通知端点（不走 session 认证，用 token 认证）
+	mux.HandleFunc("/api/scan/notify", d.handleScanNotify)
+	// ✅ 豆瓣缓存管理
+	mux.HandleFunc("/api/douban/cache", d.authMiddleware(d.handleDoubanCache))
+	mux.HandleFunc("/api/douban/cache/delete", d.authMiddleware(d.csrfMiddleware(d.handleDoubanCacheDelete)))
+	mux.HandleFunc("/api/douban/cache/clear", d.authMiddleware(d.csrfMiddleware(d.handleDoubanCacheClear)))
 
 	mux.HandleFunc("/", d.authMiddleware(d.handleIndex))
 
@@ -162,7 +168,6 @@ func (d *Dashboard) Start() error {
 		}
 	}()
 
-	// 后台定期清理过期 session（每5分钟检查一次，超过24小时的删除）
 	go d.cleanupSessionsLoop()
 
 	return nil
@@ -201,7 +206,6 @@ func (d *Dashboard) cleanupExpiredSessions() {
 
 // Stop 停止面板服务
 func (d *Dashboard) Stop() error {
-	// 关闭 stopChan 通知后台协程退出（仅关闭一次，避免 panic）
 	d.stopOnce.Do(func() {
 		close(d.stopChan)
 	})
@@ -213,7 +217,7 @@ func (d *Dashboard) Stop() error {
 	return nil
 }
 
-// authMiddleware 认证中间件（支持API JSON响应和页面重定向）
+// authMiddleware 认证中间件
 func (d *Dashboard) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("session_id")
@@ -239,8 +243,6 @@ func (d *Dashboard) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// 滑动过期：每次合法请求都刷新 session 的 createdAt，延长有效期
-		// 用写锁确保并发安全；仅更新时间戳，开销极小
 		d.sessionMutex.Lock()
 		if cur, ok := d.sessions[cookie.Value]; ok && time.Since(cur.createdAt) <= 24*time.Hour {
 			cur.createdAt = time.Now()
@@ -253,9 +255,6 @@ func (d *Dashboard) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // csrfMiddleware CSRF 防护中间件
-// 策略：要求写操作（POST/PUT/DELETE）携带自定义 header X-Requested-With
-// 浏览器同源策略保证跨域请求无法携带自定义 header，从而阻止 CSRF 攻击
-// GET 请求不受限（读操作不构成 CSRF 风险）
 func (d *Dashboard) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" && r.Method != "HEAD" {
@@ -272,7 +271,6 @@ func (d *Dashboard) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
 func generateSessionID() string {
 	bytes := make([]byte, 32)
 	if _, err := rand.Read(bytes); err != nil {
-		// 极端情况下 rand.Read 失败，用当前时间作为兜底熵源（仅用于会话ID，安全性可接受）
 		now := time.Now().UnixNano()
 		for i := 0; i < 32; i++ {
 			bytes[i] = byte(now >> (i % 8 * 8))
@@ -283,18 +281,15 @@ func generateSessionID() string {
 
 // handleLogin 处理登录
 func (d *Dashboard) handleLogin(w http.ResponseWriter, r *http.Request) {
-	// /api/login 仅处理 POST；GET 重定向到登录页（/login）
 	if r.Method == "GET" {
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return
 	}
-
 	if r.Method != "POST" {
 		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
 		return
 	}
 
-	// 限制请求体大小，防止恶意大 body 攻击
 	r.Body = http.MaxBytesReader(w, r.Body, 4*1024)
 
 	var req struct {
@@ -309,7 +304,6 @@ func (d *Dashboard) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	expectedUser, expectedPass := d.config.GetDashboardCredentials()
 
-	// 用户名与密码均使用常量时间比较，避免时序攻击泄露长度/前缀信息
 	userOK := subtle.ConstantTimeCompare([]byte(req.Username), []byte(expectedUser)) == 1
 	passOK := subtle.ConstantTimeCompare([]byte(req.Password), []byte(expectedPass)) == 1
 
@@ -330,9 +324,7 @@ func (d *Dashboard) handleLogin(w http.ResponseWriter, r *http.Request) {
 			MaxAge:   86400,
 			HttpOnly: true,
 			SameSite: http.SameSiteLaxMode,
-			// Secure 根据请求是否为 TLS 动态设置：HTTPS 下启用，HTTP 下不启用
-			// 这样既保证生产环境安全，又允许本地 HTTP 调试
-			Secure: r.TLS != nil,
+			Secure:   r.TLS != nil,
 		}
 		http.SetCookie(w, cookie)
 
@@ -342,7 +334,7 @@ func (d *Dashboard) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleLogout 处理登出（仅接受 POST，防止 CSRF 通过 GET 触发登出）
+// handleLogout 处理登出（仅接受 POST）
 func (d *Dashboard) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
@@ -355,7 +347,6 @@ func (d *Dashboard) handleLogout(w http.ResponseWriter, r *http.Request) {
 		d.sessionMutex.Unlock()
 
 		cookie.MaxAge = -1
-		// 同步 Secure 标志，保持与登录一致
 		cookie.Secure = r.TLS != nil
 		http.SetCookie(w, cookie)
 	}
@@ -380,8 +371,6 @@ func (d *Dashboard) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleStats 获取统计信息
-// 顺序说明：必须先 SetExternalCacheCounts 写入外部缓存计数，
-// 再调用 GetStats() 获取快照，否则响应中拿到的是旧值（写入尚未发生）
 func (d *Dashboard) handleStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
@@ -397,7 +386,6 @@ func (d *Dashboard) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	stats := d.cache.GetStats()
 
-	// 转为 map 以便合并 streamHandler 的性能统计（preload_success 等）
 	data := map[string]interface{}{
 		"media_source_count": stats.MediaSourceCount,
 		"stream_url_count":   stats.StreamURLCount,
@@ -410,7 +398,6 @@ func (d *Dashboard) handleStats(w http.ResponseWriter, r *http.Request) {
 		"evicted_count":      stats.EvictedCount,
 	}
 
-	// 合并 streamHandler 性能统计（预加载成功数、总请求数等）
 	if d.streamHandler != nil {
 		for k, v := range d.streamHandler.GetStats() {
 			data[k] = v
@@ -433,6 +420,61 @@ func (d *Dashboard) handleStats(w http.ResponseWriter, r *http.Request) {
 	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: data})
 }
 
+// handleDoubanCache 返回豆瓣缓存列表
+func (d *Dashboard) handleDoubanCache(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
+		return
+	}
+	if d.doubanProvider == nil {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: []interface{}{}})
+		return
+	}
+	items := d.doubanProvider.ListCache()
+	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: items})
+}
+
+// handleDoubanCacheDelete 删除单条豆瓣缓存
+func (d *Dashboard) handleDoubanCacheDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
+		return
+	}
+	if d.doubanProvider == nil {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 500, Message: "豆瓣提供器未初始化"})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 8*1024)
+	var req struct {
+		Keys []string `json:"keys"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 400, Message: "请求格式错误"})
+		return
+	}
+
+	n := d.doubanProvider.DeleteCacheEntry(req.Keys)
+	d.logger.Info("🎬 面板删除豆瓣缓存: %d 条", n)
+	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Message: fmt.Sprintf("已删除 %d 条缓存", n)})
+}
+
+// handleDoubanCacheClear 清空所有豆瓣缓存
+func (d *Dashboard) handleDoubanCacheClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
+		return
+	}
+	if d.doubanProvider == nil {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 500, Message: "豆瓣提供器未初始化"})
+		return
+	}
+
+	n := d.doubanProvider.ClearCache()
+	d.logger.Info("🎬 面板清空豆瓣缓存: %d 条", n)
+	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Message: fmt.Sprintf("已清空 %d 条缓存", n)})
+}
+
 // handleCacheClear 清空缓存
 func (d *Dashboard) handleCacheClear(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -452,8 +494,6 @@ func (d *Dashboard) handleCacheClear(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLogsClear 清空日志文件
-// 安全限制：只清空应用自身日志（按文件名格式 YYYYMMDD.log 或 YYYYMMDD_N.log 过滤），
-// 不删除任意 .log 文件，避免误删用户其他日志
 func (d *Dashboard) handleLogsClear(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
@@ -476,8 +516,6 @@ func (d *Dashboard) handleLogsClear(w http.ResponseWriter, r *http.Request) {
 	skippedCount := 0
 	for _, file := range files {
 		base := filepath.Base(file)
-		// 仅清理应用自身日志（YYYYMMDD.log 或 YYYYMMDD_N.log 格式）
-		// 跳过其他命名规则的 .log 文件，避免误删用户日志
 		if !isAppLogFile(base) {
 			skippedCount++
 			d.logger.Debug("⏭️ 跳过非应用日志文件: %s", base)
@@ -504,18 +542,14 @@ func (d *Dashboard) handleLogsClear(w http.ResponseWriter, r *http.Request) {
 }
 
 // isAppLogFile 判断文件名是否为应用自身日志
-// 支持格式：YYYYMMDD.log（当天）与 YYYYMMDD_N.log（轮转切片）
 func isAppLogFile(name string) bool {
-	// 去除 .log 后缀
 	stem := strings.TrimSuffix(name, ".log")
 	if stem == name {
-		return false // 无 .log 后缀
+		return false
 	}
-	// YYYYMMDD：8 位纯数字
 	if len(stem) == 8 {
 		return isAllDigits(stem)
 	}
-	// YYYYMMDD_N：8 位数字 + 下划线 + 数字
 	if idx := strings.IndexByte(stem, '_'); idx == 8 && len(stem) > 9 {
 		return isAllDigits(stem[:8]) && isAllDigits(stem[9:])
 	}
@@ -579,7 +613,6 @@ func (d *Dashboard) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 限制请求体大小为 16KB，防止恶意大 body 攻击
 	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
 
 	var updates map[string]interface{}
@@ -596,7 +629,6 @@ func (d *Dashboard) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 
 	d.logger.Info("⚙️ 配置已通过面板更新")
 
-	// 使用具名 map 变量持有，避免直接对 response.Data 做类型断言（不安全且可读性差）
 	dataMap := map[string]interface{}{
 		"needs_restart": needsRestart,
 		"message":       "",
@@ -613,8 +645,6 @@ func (d *Dashboard) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLogs 获取日志
-// 支持 limit 查询参数（默认200，最大2000），仅返回最后 limit 行
-// 文件大小超过 1MB 时只读取最后 1MB，避免大文件全量加载导致内存峰值
 func (d *Dashboard) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
@@ -639,7 +669,6 @@ func (d *Dashboard) handleLogs(w http.ResponseWriter, r *http.Request) {
 	today := time.Now().Format("20060102")
 	logFile := filepath.Join(logDir, today+".log")
 
-	// 若今日日志不存在，则回退到目录中最新的 .log 文件
 	if _, statErr := os.Stat(logFile); statErr != nil {
 		files, _ := filepath.Glob(filepath.Join(logDir, "*.log"))
 		if len(files) > 0 {
@@ -665,9 +694,8 @@ func (d *Dashboard) handleLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 // readLastLines 读取文件的最后 limit 行
-// 若文件大于 1MB，仅读取最后 1MB 以控制内存使用
 func readLastLines(path string, limit int) ([]string, error) {
-	const maxTailBytes int64 = 1 * 1024 * 1024 // 1MB
+	const maxTailBytes int64 = 1 * 1024 * 1024
 
 	file, err := os.Open(path)
 	if err != nil {
@@ -680,17 +708,14 @@ func readLastLines(path string, limit int) ([]string, error) {
 		return nil, err
 	}
 
-	// 文件大于 1MB 时定位到末尾 1MB 处，跳过开头（旧日志）
 	if info.Size() > maxTailBytes {
 		if _, seekErr := file.Seek(-maxTailBytes, io.SeekEnd); seekErr != nil {
 			return nil, seekErr
 		}
-		// 定位后首行可能被截断，丢弃到第一个换行符
 		reader := bufio.NewReader(file)
 		if _, err := reader.ReadBytes('\n'); err != nil && err != io.EOF {
 			return nil, err
 		}
-		// 用双端队列保留最后 limit 行
 		var ring []string
 		scanner := bufio.NewScanner(reader)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -706,7 +731,6 @@ func readLastLines(path string, limit int) ([]string, error) {
 		return ring, nil
 	}
 
-	// 小文件直接全量扫描
 	var all []string
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -735,11 +759,6 @@ func (d *Dashboard) handleStrmPathsGet(w http.ResponseWriter, r *http.Request) {
 
 	d.logger.Info("📋 获取STRM路径列表，共 %d 个Volume映射", len(volumes))
 
-	// 仅保留前端实际使用的字段：
-	//   strm_volumes - 字符串列表（向后兼容）
-	//   volumes      - 结构化详情（前端渲染使用，避免 split 解析）
-	// 已移除冗余/空字段：container_mounts（重复 strm_volumes）、
-	//   sync_status（写死空结构）、container_info（永远为空）
 	d.writeJSON(w, http.StatusOK, APIResponse{
 		Code: 200,
 		Data: map[string]interface{}{
@@ -758,7 +777,6 @@ func (d *Dashboard) handleStrmPathAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 限制请求体大小，防止恶意大 body
 	r.Body = http.MaxBytesReader(w, r.Body, 4*1024)
 
 	var req struct {
@@ -775,7 +793,6 @@ func (d *Dashboard) handleStrmPathAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 路径遍历安全校验
 	if err := validatePath(req.HostPath, "主机路径"); err != nil {
 		d.writeJSON(w, http.StatusOK, APIResponse{Code: 400, Message: err.Error()})
 		return
@@ -826,8 +843,7 @@ func (d *Dashboard) handleStrmPathAdd(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// validatePath 校验路径安全性，防止路径遍历攻击
-// 规则：必须以 "/" 开头；规范化后不允许出现 ".."；不允许为系统关键路径
+// validatePath 校验路径安全性
 func validatePath(path, label string) error {
 	p := strings.TrimSpace(path)
 	if p == "" {
@@ -836,16 +852,12 @@ func validatePath(path, label string) error {
 	if !strings.HasPrefix(p, "/") {
 		return fmt.Errorf("%s必须以 / 开头", label)
 	}
-	// 先用 filepath.Clean 规范化路径，再检测 ".."，
-	// 避免简单 Contains 误判（如 /a/..b 这类合法路径名会被误拦）
 	cleaned := filepath.Clean(p)
-	// 规范化后逐段检查是否包含 ".."
 	for _, seg := range strings.Split(cleaned, string(filepath.Separator)) {
 		if seg == ".." {
 			return fmt.Errorf("%s不允许包含 '..' 路径段", label)
 		}
 	}
-	// 系统关键路径黑名单（精确匹配或以此为前缀）
 	systemPaths := []string{"/etc", "/proc", "/sys", "/dev", "/boot"}
 	for _, sp := range systemPaths {
 		if cleaned == sp || strings.HasPrefix(cleaned, sp+"/") {
@@ -862,7 +874,6 @@ func (d *Dashboard) handleStrmPathDelete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// 限制请求体大小，防止恶意大 body
 	r.Body = http.MaxBytesReader(w, r.Body, 4*1024)
 
 	var req struct {
@@ -950,7 +961,7 @@ func generateComposeYAML(volumes []map[string]string) string {
 	return yaml.String()
 }
 
-// handleDockerRestart 一键重启容器（应用新的Volume配置）
+// handleDockerRestart 一键重启容器
 func (d *Dashboard) handleDockerRestart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
@@ -1019,21 +1030,13 @@ func (d *Dashboard) handleScanStatus(w http.ResponseWriter, r *http.Request) {
 	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: d.libraryScanner.GetStatus()})
 }
 
-// handleScanNotify Webhook 端点：接收外部通知触发全库扫描
-//
-// 用途：QMS 完成 strm 生成后，通过 Webhook 通知 fnysfd 立即触发扫描
-// 认证：通过 X-Notify-Token header 或 ?token=xxx 传入预共享密钥
-// 特性：
-//  1. 立即返回 200，扫描在后台异步执行，不阻塞 QMS
-//  2. 延迟 delay_seconds 秒后再触发，给飞牛时间扫到新文件
-//  3. 延迟期间收到新通知会合并（只保留最后一次）
+// handleScanNotify Webhook 端点
 func (d *Dashboard) handleScanNotify(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
 		return
 	}
 
-	// 1. 检查是否配置了 token
 	expectedToken := d.config.GetWebhookNotifyToken()
 	if expectedToken == "" {
 		d.logger.Warn("📚 [Webhook] 未配置 webhook_notify_token，拒绝请求")
@@ -1041,7 +1044,6 @@ func (d *Dashboard) handleScanNotify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. 从 header 或 query 取 token
 	token := r.Header.Get("X-Notify-Token")
 	if token == "" {
 		token = r.URL.Query().Get("token")
@@ -1051,20 +1053,17 @@ func (d *Dashboard) handleScanNotify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. 常量时间比较，防止时序攻击
 	if subtle.ConstantTimeCompare([]byte(token), []byte(expectedToken)) != 1 {
 		d.logger.Warn("📚 [Webhook] token 校验失败，来自 %s", r.RemoteAddr)
 		d.writeJSON(w, http.StatusUnauthorized, APIResponse{Code: 401, Message: "token 无效"})
 		return
 	}
 
-	// 4. 检查扫描器
 	if d.libraryScanner == nil {
 		d.writeJSON(w, http.StatusOK, APIResponse{Code: 500, Message: "全库扫描器未初始化"})
 		return
 	}
 
-	// 5. 延迟触发扫描（给飞牛时间识别新文件）
 	delaySeconds := d.config.GetWebhookNotifyDelaySeconds()
 	d.logger.Info("📚 [Webhook] 收到通知，%d 秒后触发全库扫描", delaySeconds)
 
