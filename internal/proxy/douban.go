@@ -20,7 +20,6 @@ import (
 
 // ============================================================
 // 豆瓣评分开关由 config.Global.GetEnableDoubanRating() 提供
-// 硬编码 var doubanEnabled 已移除，统一走配置
 // ============================================================
 
 const (
@@ -32,14 +31,12 @@ const (
 )
 
 // ============================================================
-// 预编译正则（包级，只编译一次）
+// 预编译正则
 // ============================================================
 
 var (
-	// 匹配标题末尾的 (2023) / （2023）
 	titleYearSuffixRe = regexp.MustCompile(`\s*[\(（]\d{4}[\)）]\s*$`)
-	// 匹配 [xxx] / 【xxx】
-	titleBracketRe = regexp.MustCompile(`\s*[\[【][^\]】]*[\]】]`)
+	titleBracketRe    = regexp.MustCompile(`\s*[\[【][^\]】]*[\]】]`)
 )
 
 // ============================================================
@@ -83,6 +80,7 @@ type doubanSuggestItem struct {
 type doubanCacheEntry struct {
 	Rating    float64   `json:"rating"`
 	Title     string    `json:"title,omitempty"`
+	ItemType  string    `json:"itemType,omitempty"` // ✅ movie / series / season
 	FetchedAt time.Time `json:"fetchedAt"`
 }
 
@@ -101,29 +99,23 @@ type DoubanProvider struct {
 	httpClient *http.Client
 	apiKey     string
 
-	// 极简内存索引：key → rating
 	indexMu sync.RWMutex
 	index   map[string]float32
 
-	// 磁盘数据
 	diskMu      sync.RWMutex
 	diskEntries map[string]*doubanCacheEntry
 	dirty       atomic.Bool
 
-	// 写盘串行锁
 	flushMu sync.Mutex
 
-	// 豆瓣请求全局限速
 	rateMu  sync.Mutex
 	lastReq time.Time
 
-	// 统计
 	statHits    atomic.Int64
 	statMisses  atomic.Int64
 	statFetched atomic.Int64
 	statFailed  atomic.Int64
 
-	// 生命周期
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
@@ -143,7 +135,6 @@ func NewDoubanProvider(s *Server) *DoubanProvider {
 		diskEntries: make(map[string]*doubanCacheEntry),
 		stopCh:      make(chan struct{}),
 	}
-	// 加载磁盘缓存
 	if err := dp.loadDB(); err != nil {
 		s.logger.Warn("%s 加载缓存失败: %v", doubanLogPrefix, err)
 	} else {
@@ -152,7 +143,6 @@ func NewDoubanProvider(s *Server) *DoubanProvider {
 		dp.indexMu.RUnlock()
 		s.logger.Info("%s 缓存已加载: %d 条", doubanLogPrefix, n)
 	}
-	// 启动定期写盘
 	dp.wg.Add(1)
 	go func() {
 		defer dp.wg.Done()
@@ -172,13 +162,10 @@ func (dp *DoubanProvider) Stop() {
 }
 
 // ============================================================
-// 抓取接口（供 LibraryScanner 调用）
+// 抓取接口
 // ============================================================
 
-// FetchMovieOrSeries 抓取电影/剧集评分（异步，调用方应 go 调用）
-//
-// 优先用 IMDb ID 查（官方 API / 第三方 API），
-// 无 IMDb 或查询失败时回退到标题搜索。
+// FetchMovieOrSeries 抓取电影/剧集评分
 func (dp *DoubanProvider) FetchMovieOrSeries(ctx context.Context, imdbID, name string, year int, itemType string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -207,7 +194,7 @@ func (dp *DoubanProvider) FetchMovieOrSeries(ctx context.Context, imdbID, name s
 			rating, err = dp.getMovieRatingByImdb(ctx, imdbID)
 		}
 		if err == nil && rating > 0 {
-			dp.storeCache(imdbID, name, year, rating)
+			dp.storeCache(imdbID, name, year, rating, itemType)
 			dp.statFetched.Add(1)
 			dp.server.logger.Info("%s ✅ %s (IMDb=%s) → %.1f", doubanLogPrefix, name, imdbID, rating)
 			return
@@ -218,7 +205,7 @@ func (dp *DoubanProvider) FetchMovieOrSeries(ctx context.Context, imdbID, name s
 	if name != "" {
 		rating, err = dp.searchByTitle(ctx, name, year, itemType)
 		if err == nil && rating > 0 {
-			dp.storeCache(imdbID, name, year, rating)
+			dp.storeCache(imdbID, name, year, rating, itemType)
 			dp.statFetched.Add(1)
 			dp.server.logger.Info("%s ✅ %s (标题搜) → %.1f", doubanLogPrefix, name, rating)
 			return
@@ -229,7 +216,7 @@ func (dp *DoubanProvider) FetchMovieOrSeries(ctx context.Context, imdbID, name s
 	dp.server.logger.Debug("%s ❌ %s 未匹配", doubanLogPrefix, name)
 }
 
-// FetchSeason 抓取季评分（供 LibraryScanner 调用）
+// FetchSeason 抓取季评分
 func (dp *DoubanProvider) FetchSeason(ctx context.Context, seriesName string, seasonNumber int) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -256,13 +243,13 @@ func (dp *DoubanProvider) FetchSeason(ctx context.Context, seriesName string, se
 		return
 	}
 
-	dp.storeCacheByKey(key, seriesName, rating)
+	dp.storeCacheByKey(key, seriesName, rating, "season")
 	dp.statFetched.Add(1)
 	dp.server.logger.Info("%s ✅ %s 第%d季 → %.1f", doubanLogPrefix, seriesName, seasonNumber, rating)
 }
 
 // ============================================================
-// 查询接口（供反代注入调用）
+// 查询接口
 // ============================================================
 
 func (dp *DoubanProvider) GetRating(imdbID, name string, year int) (float64, bool) {
@@ -642,10 +629,16 @@ func (dp *DoubanProvider) hasCacheKey(key string) bool {
 	return ok
 }
 
-func (dp *DoubanProvider) storeCache(imdbID, name string, year int, rating float64) {
+func (dp *DoubanProvider) storeCache(imdbID, name string, year int, rating float64, itemType string) {
+	normalizedType := strings.ToLower(itemType)
+	if normalizedType == "" {
+		normalizedType = "unknown"
+	}
+
 	entry := &doubanCacheEntry{
 		Rating:    rating,
 		Title:     name,
+		ItemType:  normalizedType,
 		FetchedAt: time.Now(),
 	}
 
@@ -672,10 +665,16 @@ func (dp *DoubanProvider) storeCache(imdbID, name string, year int, rating float
 	dp.dirty.Store(true)
 }
 
-func (dp *DoubanProvider) storeCacheByKey(key, title string, rating float64) {
+func (dp *DoubanProvider) storeCacheByKey(key, title, rating, itemType string) {
+	normalizedType := strings.ToLower(itemType)
+	if normalizedType == "" {
+		normalizedType = "unknown"
+	}
+
 	entry := &doubanCacheEntry{
 		Rating:    rating,
 		Title:     title,
+		ItemType:  normalizedType,
 		FetchedAt: time.Now(),
 	}
 
@@ -779,7 +778,7 @@ func (dp *DoubanProvider) flushLoop() {
 }
 
 // ============================================================
-// 统计 / 工具
+// 统计
 // ============================================================
 
 func (dp *DoubanProvider) GetStats() map[string]interface{} {
@@ -819,20 +818,16 @@ func (dp *DoubanProvider) GetStats() map[string]interface{} {
 }
 
 // ============================================================
-// 缓存列表 / 删除（供面板展示与管理）
+// 缓存列表 / 删除
 // ============================================================
 
 // ListCache 返回去重后的缓存列表（按抓取时间倒序）
 //
-// 同一部片子的多个 key（imdb:xxx + title:xxx）指向同一个 entry 指针，
-// 按指针聚合实现去重；season:xxx 是独立 entry，不会被合并
-// ListCache 返回去重后的缓存列表（按抓取时间倒序）
-//
 // 两层去重：
-//  1. 按 entry 指针聚合（同一 entry 被多个 key 引用 → 合并）
-//  2. 按 (归一化标题, 季号) 聚合（同一部片被不同参数抓取 / 重启后指针分离 → 合并）
+//  1. 按 entry 指针聚合
+//  2. 按 (归一化标题, 季号) 聚合（重启后指针分离也能合并）
 //
-// 关键：第二层不能靠指针，否则重启后 JSON 反序列化会把共享指针拆成独立对象，去重失效
+// itemType 直接从 entry.ItemType 读，不再靠 key 前缀猜
 func (dp *DoubanProvider) ListCache() []map[string]interface{} {
 	dp.diskMu.RLock()
 	byEntry := make(map[*doubanCacheEntry][]string)
@@ -844,7 +839,6 @@ func (dp *DoubanProvider) ListCache() []map[string]interface{} {
 	}
 	dp.diskMu.RUnlock()
 
-	// 第二层：按 (归一化标题, 季号) 聚合
 	type groupKey struct {
 		title     string
 		seasonNum int
@@ -852,16 +846,18 @@ func (dp *DoubanProvider) ListCache() []map[string]interface{} {
 	byGroup := make(map[groupKey]map[string]interface{})
 
 	for entry, keys := range byEntry {
-		// 选主 key（season: > imdb: > title:）
 		sort.Slice(keys, func(i, j int) bool {
 			return keyPriority(keys[i]) < keyPriority(keys[j])
 		})
 		primary := keys[0]
 
-		itemType := "movie"
+		itemType := entry.ItemType
+		if itemType == "" {
+			itemType = "unknown"
+		}
+
 		seasonNum := 0
-		if strings.HasPrefix(primary, "season:") {
-			itemType = "season"
+		if itemType == "season" {
 			if idx := strings.LastIndex(primary, "|"); idx > 0 {
 				if n, err := strconv.Atoi(primary[idx+1:]); err == nil {
 					seasonNum = n
@@ -869,7 +865,6 @@ func (dp *DoubanProvider) ListCache() []map[string]interface{} {
 			}
 		}
 
-		// 归一化标题：trim + 转小写 + 去半角/全角空格，最大程度合并
 		normTitle := strings.ToLower(strings.TrimSpace(entry.Title))
 		normTitle = strings.ReplaceAll(normTitle, " ", "")
 		normTitle = strings.ReplaceAll(normTitle, "　", "")
@@ -882,13 +877,13 @@ func (dp *DoubanProvider) ListCache() []map[string]interface{} {
 		fetchedAt := entry.FetchedAt.Format("2006-01-02 15:04:05")
 
 		if existing, ok := byGroup[gk]; ok {
-			// 已存在 → 合并 all_keys，保留最新的 rating / fetched_at
 			oldKeys, _ := existing["all_keys"].([]string)
 			existing["all_keys"] = append(oldKeys, keys...)
 			if fetchedAt > existing["fetched_at"].(string) {
 				existing["key"] = primary
 				existing["rating"] = entry.Rating
 				existing["fetched_at"] = fetchedAt
+				existing["type"] = itemType
 			}
 		} else {
 			byGroup[gk] = map[string]interface{}{
@@ -908,7 +903,6 @@ func (dp *DoubanProvider) ListCache() []map[string]interface{} {
 		items = append(items, v)
 	}
 
-	// 按抓取时间倒序
 	sort.Slice(items, func(i, j int) bool {
 		return items[i]["fetched_at"].(string) > items[j]["fetched_at"].(string)
 	})
@@ -916,7 +910,6 @@ func (dp *DoubanProvider) ListCache() []map[string]interface{} {
 	return items
 }
 
-// keyPriority 用于给主 key 排序，数字越小优先级越高
 func keyPriority(k string) int {
 	switch {
 	case strings.HasPrefix(k, "season:"):
@@ -930,8 +923,6 @@ func keyPriority(k string) int {
 	}
 }
 
-// DeleteCacheEntry 删除指定 key 集合的所有缓存（一个片子关联的多个 key）
-// 返回实际删除的 key 数量
 func (dp *DoubanProvider) DeleteCacheEntry(keys []string) int {
 	if len(keys) == 0 {
 		return 0
@@ -959,7 +950,6 @@ func (dp *DoubanProvider) DeleteCacheEntry(keys []string) int {
 	return deleted
 }
 
-// ClearCache 清空所有豆瓣缓存，返回清空的条目数
 func (dp *DoubanProvider) ClearCache() int {
 	dp.indexMu.Lock()
 	n := len(dp.index)
