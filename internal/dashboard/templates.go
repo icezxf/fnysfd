@@ -1,6 +1,6 @@
 package dashboard
 
-// loginHTML 登录页面（极简风格）
+// loginHTML 登录页面
 const loginHTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -108,7 +108,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Ar
 
 .sidebar{position:fixed;left:0;top:0;bottom:0;width:200px;background:var(--sidebar-bg);display:flex;flex-direction:column;z-index:100}
 .sidebar-logo{padding:20px 16px;color:#fff;font-size:16px;font-weight:600;letter-spacing:.5px;border-bottom:1px solid #27272a}
-.sidebar-nav{flex:1;padding:8px 0}
+.sidebar-nav{flex:1;padding:8px 0;overflow-y:auto}
 .nav-item{display:block;padding:10px 16px;color:#a1a1aa;font-size:14px;cursor:pointer;user-select:none;border-left:2px solid transparent;transition:all .15s ease;margin:2px 0}
 .nav-item:hover{color:#fff;background:rgba(255,255,255,.03)}
 .nav-item.active{color:#fff;border-left-color:var(--primary);background:rgba(255,255,255,.05)}
@@ -146,8 +146,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Ar
 .form-item{margin-bottom:16px}
 .form-item>label{display:block;font-size:13px;color:#71717a;margin-bottom:6px}
 .form-item>label.switch{display:inline-flex;margin-bottom:0}
-.form-item input[type="text"],.form-item input[type="number"],.form-item input[type="password"],.form-item select{width:100%;height:32px;border:1px solid var(--border);border-radius:4px;padding:0 8px;font-size:14px;color:#18181b;background:#fff;font-family:inherit;transition:all .15s ease}
-.form-item input[type="text"]:focus,.form-item input[type="number"]:focus,.form-item input[type="password"]:focus,.form-item select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
+.form-item input[type="text"],.form-item input[type="number"],.form-item input[type="password"],.form-item select,.form-item input[type="datetime-local"]{width:100%;height:32px;border:1px solid var(--border);border-radius:4px;padding:0 8px;font-size:14px;color:#18181b;background:#fff;font-family:inherit;transition:all .15s ease}
+.form-item input[type="text"]:focus,.form-item input[type="number"]:focus,.form-item input[type="password"]:focus,.form-item select:focus,.form-item input[type="datetime-local"]:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
 .form-item .hint{font-size:12px;color:#a1a1aa;margin-top:4px}
 .form-actions{display:flex;justify-content:flex-end;margin-top:16px}
 .form-actions .btn{border-radius:6px}
@@ -188,7 +188,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Ar
 .log-view .lv-debug{color:#a78bfa}
 .log-view .lv-empty{color:#71717a}
 
-/* 豆瓣缓存 */
 .douban-toolbar{display:flex;align-items:center;gap:12px;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border);flex-wrap:wrap}
 .douban-toolbar input[type="text"]{height:32px;border:1px solid var(--border);border-radius:4px;padding:0 10px;font-size:13px;font-family:inherit;min-width:180px;flex:1;max-width:320px;transition:all .15s ease}
 .douban-toolbar input[type="text"]:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
@@ -217,10 +216,43 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Ar
 .douban-pager button:hover:not(:disabled){border-color:var(--primary);color:var(--primary)}
 .douban-pager button:disabled{opacity:.4;cursor:not-allowed}
 
-@media (max-width:768px){
-.douban-table .col-time{display:none}
-.douban-table .col-title{max-width:160px}
-}
+/* ============ 观看记录 ============ */
+.rec-stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:16px}
+.rec-stat{background:#fff;border:1px solid var(--border);border-radius:6px;padding:20px;text-align:center;transition:all .15s ease}
+.rec-stat:hover{border-color:#d4d4d8}
+.rec-stat .num{font-size:28px;font-weight:700;color:var(--primary);line-height:1.2;font-variant-numeric:tabular-nums}
+.rec-stat .lbl{font-size:13px;color:#71717a;margin-top:4px}
+
+.rec-toolbar{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+.rec-toolbar .form-item{margin-bottom:0;flex:1;min-width:150px}
+.rec-toolbar .form-item label{font-size:12px;margin-bottom:4px}
+.rec-toolbar .btn{height:32px;padding:0 14px;font-size:13px}
+
+.rec-list{display:flex;flex-direction:column}
+.rec-item{display:flex;gap:16px;padding:16px 0;border-bottom:1px solid #f4f4f5;align-items:flex-start}
+.rec-item:last-child{border-bottom:none}
+.rec-item .info{flex:1;min-width:0}
+.rec-item .title{font-size:14px;font-weight:600;color:#18181b;margin-bottom:6px;word-break:break-all}
+.rec-item .tags{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+.rec-item .tag{padding:2px 8px;background:#f4f4f5;color:#52525b;border-radius:10px;font-size:11px}
+.rec-item .tag.done{background:#dcfce7;color:#166534}
+.rec-item .tag.ep{background:#fef3c7;color:#92400e}
+.rec-item .overview{font-size:12px;color:#a1a1aa;margin-bottom:8px;line-height:1.5;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.rec-item .progress-bar{height:4px;background:#f4f4f5;border-radius:2px;overflow:hidden;margin-bottom:4px}
+.rec-item .progress-fill{height:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6);border-radius:2px;transition:width .3s ease}
+.rec-item .progress-text{font-size:11px;color:#a1a1aa;font-variant-numeric:tabular-nums}
+.rec-item .user{text-align:right;min-width:140px;flex-shrink:0}
+.rec-item .user .name{font-size:13px;font-weight:600;color:var(--primary);margin-bottom:4px}
+.rec-item .user .time{font-size:11px;color:#a1a1aa;font-variant-numeric:tabular-nums;line-height:1.6}
+.rec-empty{text-align:center;padding:60px 20px;color:#a1a1aa;font-size:14px}
+.rec-empty .icon{font-size:48px;opacity:.3;margin-bottom:16px}
+.rec-pager{display:flex;justify-content:center;gap:8px;margin-top:20px;padding-top:20px;border-top:1px solid var(--border);align-items:center;flex-wrap:wrap}
+.rec-pager button{min-width:32px;height:32px;padding:0 10px;border:1px solid var(--border);background:#fff;border-radius:4px;cursor:pointer;font-family:inherit;font-size:13px;color:var(--text);transition:all .15s ease}
+.rec-pager button:hover:not(:disabled){border-color:var(--primary);color:var(--primary)}
+.rec-pager button.active{background:var(--primary);border-color:var(--primary);color:#fff}
+.rec-pager button:disabled{opacity:.4;cursor:not-allowed}
+.rec-pager .info{font-size:13px;color:#71717a;margin-right:12px}
+.rec-loading{text-align:center;padding:40px;color:#a1a1aa}
 
 .tab-pane{display:none}
 .tab-pane.active{display:block}
@@ -245,12 +277,17 @@ body.sidebar-open .sidebar-overlay{display:block}
 .topbar .title{font-size:18px}
 .content{padding:16px}
 .stats-grid{grid-template-columns:1fr;gap:12px}
+.rec-stats-grid{grid-template-columns:repeat(2,1fr);gap:12px}
+.rec-item{flex-direction:column;gap:8px}
+.rec-item .user{text-align:left;min-width:auto}
 .path-item{flex-direction:column;align-items:flex-start;gap:8px}
 .path-item .paths{width:100%;white-space:normal;word-break:break-all}
 .add-form{flex-direction:column;align-items:stretch;gap:12px}
 .add-form .btn{width:100%}
 .log-view{max-height:calc(100vh - 240px)}
 .log-toolbar{flex-wrap:wrap;gap:12px}
+.douban-table .col-time{display:none}
+.douban-table .col-title{max-width:160px}
 }
 </style>
 </head>
@@ -264,6 +301,7 @@ body.sidebar-open .sidebar-overlay{display:block}
 <div class="nav-item active" data-tab="overview">概览</div>
 <div class="nav-item" data-tab="config">配置</div>
 <div class="nav-item" data-tab="douban">豆瓣缓存</div>
+<div class="nav-item" data-tab="records">观看记录</div>
 <div class="nav-item" data-tab="paths">路径管理</div>
 <div class="nav-item" data-tab="logs">日志</div>
 </div>
@@ -371,6 +409,55 @@ body.sidebar-open .sidebar-overlay{display:block}
 </div>
 </div>
 
+<!-- 观看记录 -->
+<div class="tab-pane" id="pane-records">
+<div class="rec-stats-grid">
+<div class="rec-stat"><div class="num" id="recTotalUsers">-</div><div class="lbl">总用户数</div></div>
+<div class="rec-stat"><div class="num" id="recActiveUsers">-</div><div class="lbl">活跃用户</div></div>
+<div class="rec-stat"><div class="num" id="recTotalPlays">-</div><div class="lbl">播放记录</div></div>
+<div class="rec-stat"><div class="num" id="recTodayPlays">-</div><div class="lbl">今日播放</div></div>
+</div>
+
+<div class="card">
+<div class="card-title">🔍 筛选条件</div>
+<div class="rec-toolbar">
+<div class="form-item">
+<label>剧集名称搜索</label>
+<input type="text" id="recSearchTitle" placeholder="输入剧名模糊搜索...">
+</div>
+<div class="form-item">
+<label>开始时间</label>
+<input type="datetime-local" id="recStartTime">
+</div>
+<div class="form-item">
+<label>结束时间</label>
+<input type="datetime-local" id="recEndTime">
+</div>
+<div class="form-item">
+<label>选择用户</label>
+<select id="recUserSelect"><option value="">所有用户</option></select>
+</div>
+<div class="form-item">
+<label>每页显示</label>
+<select id="recPerPage">
+<option value="10">10 条</option>
+<option value="20" selected>20 条</option>
+<option value="50">50 条</option>
+<option value="100">100 条</option>
+</select>
+</div>
+<button class="btn btn-primary" id="recSearchBtn">搜索</button>
+<button class="btn btn-text" id="recClearBtn" style="color:var(--warning)">清除</button>
+</div>
+</div>
+
+<div class="card">
+<div class="card-title">📺 观看历史 <span id="recInfo" style="font-size:12px;font-weight:400;color:#a1a1aa;margin-left:8px"></span></div>
+<div id="recList" class="rec-list"><div class="rec-loading">加载中...</div></div>
+<div class="rec-pager" id="recPager" style="display:none"></div>
+</div>
+</div>
+
 <!-- 配置 -->
 <div class="tab-pane" id="pane-config">
 <div class="card">
@@ -403,7 +490,7 @@ body.sidebar-open .sidebar-overlay{display:block}
 <option value="passthrough">passthrough - 透传（全 302 strm 用）</option>
 <option value="always">always - 始终解析（回退行为）</option>
 </select>
-<div class="hint">auto: 自动识别 CDN 直链跳过解析；passthrough: 所有 strm 直接给播放器（适合 openlist/litepan 等工具生成的 302 strm）；always: 强制 HTTP 解析。修改后立即生效，无需重启。</div>
+<div class="hint">auto: 自动识别 CDN 直链跳过解析；passthrough: 所有 strm 直接给播放器；always: 强制 HTTP 解析。修改后立即生效。</div>
 </div>
 <div class="form-item">
 <label>功能开关</label>
@@ -414,7 +501,7 @@ body.sidebar-open .sidebar-overlay{display:block}
 <label class="switch"><input type="checkbox" id="cfgEnableSmartTTL" checked><span class="track"></span><span>智能签名 TTL 检测</span></label>
 <label class="switch"><input type="checkbox" id="cfgEnableDoubanRating" checked><span class="track"></span><span>启用豆瓣评分（反代注入）</span></label>
 </div>
-<div class="hint">内网 strm：关闭后内网地址 strm 直接返回给播放器（适合 bridge 网络）；预加载：关闭后每次播放都需等待解析；CDN 预热：关闭后首次播放加载更慢但节省带宽；智能 TTL：根据 URL 签名有效期动态设置缓存，解决播放中 403 问题；豆瓣评分：关闭后不抓取也不注入豆瓣评分，已有缓存保留。</div>
+<div class="hint">内网 strm：关闭后内网地址 strm 直接返回给播放器；预加载：关闭后每次播放都需等待解析；CDN 预热：关闭后首次播放加载更慢但节省带宽；智能 TTL：根据 URL 签名有效期动态设置缓存；豆瓣评分：关闭后不抓取也不注入豆瓣评分。</div>
 </div>
 <div class="form-item">
 <label>缓存 TTL（分钟）</label>
@@ -423,7 +510,6 @@ body.sidebar-open .sidebar-overlay{display:block}
 </div>
 </div>
 
-<!-- ✅ 飞牛账号 -->
 <div class="card">
 <div class="form-group-title">飞牛账号</div>
 <div class="form-item">
@@ -435,6 +521,15 @@ body.sidebar-open .sidebar-overlay{display:block}
 <label>飞牛密码</label>
 <input type="password" id="cfgFnosPassword" placeholder="未修改请留空">
 <div class="hint">留空表示不修改。修改后需重启生效。留空时回退到环境变量 FNOS_PASSWORD。</div>
+</div>
+</div>
+
+<div class="card">
+<div class="form-group-title">观看记录</div>
+<div class="form-item">
+<label>数据库路径</label>
+<input type="text" id="cfgPlayHistoryDBPath" placeholder="/db/trimmedia.db">
+<div class="hint">飞牛影视数据库在容器内的路径（对应宿主机 /opt/1panel/apps/fn-d/database 挂载到容器 /db:ro）。路径不存在时「观看记录」tab 显示为空。修改后需重启生效。</div>
 </div>
 </div>
 
@@ -473,22 +568,22 @@ body.sidebar-open .sidebar-overlay{display:block}
 </div>
 <div class="form-item">
 <label class="switch"><input type="checkbox" id="cfgLibraryScanOnStart"><span class="track"></span><span>启动后立即扫描</span></label>
-<div class="hint">服务启动后立即执行一次全库扫描（需要认证信息就绪，即用户已访问过飞牛）</div>
+<div class="hint">服务启动后立即执行一次全库扫描</div>
 </div>
 <div class="form-item">
 <label>扫描并发数</label>
 <input type="number" id="cfgLibraryScanConcurrency" min="1" max="20" placeholder="2">
-<div class="hint">同时预取的影片数量（建议 1-4，过高可能卡死容器）</div>
+<div class="hint">同时预取的影片数量（建议 1-4）</div>
 </div>
 <div class="form-item">
 <label>每页间隔（毫秒）</label>
 <input type="number" id="cfgLibraryScanIntervalMs" min="0" max="60000" placeholder="500">
-<div class="hint">每页查询之间的等待时间，避免请求过密（建议 300-1000ms）</div>
+<div class="hint">每页查询之间的等待时间（建议 300-1000ms）</div>
 </div>
 <div class="form-item">
 <label>增量扫描间隔（分钟）</label>
 <input type="number" id="cfgLibraryScanIncrementalMinutes" min="1" max="1440" placeholder="5">
-<div class="hint">每 N 分钟拉一次每个库的"最新 200 项"，只预取飞牛未 probe 的项（1-1440，建议 5-30）。修改后需重启生效。</div>
+<div class="hint">每 N 分钟拉一次每个库的"最新 200 项"，只预取飞牛未 probe 的项。修改后需重启生效。</div>
 </div>
 <div class="form-item">
 <label>手动扫描</label>
@@ -581,6 +676,12 @@ var doubanPage=1;
 var doubanPageSize=100;
 var doubanFilterType='all';
 
+/* 观看记录 */
+var recCurrentPage=1;
+var recTotalPages=1;
+var recLoading=false;
+var recSearchTimer=null;
+
 /* ===== 工具函数 ===== */
 function $(id){return document.getElementById(id)}
 
@@ -639,6 +740,8 @@ if(n>=1000)return (n/1000).toFixed(1)+'K';
 return String(n);
 }
 
+function pad2(n){return String(n).padStart(2,'0')}
+
 /* ===== Tab 切换 ===== */
 function switchTab(name){
 var items=document.querySelectorAll('.nav-item[data-tab]');
@@ -651,7 +754,7 @@ for(var k=0;k<items.length;k++){
 if(items[k].getAttribute('data-tab')===name){items[k].classList.add('active');break}
 }
 currentTab=name;
-var titles={overview:'概览',config:'配置',douban:'豆瓣缓存',paths:'路径管理',logs:'日志'};
+var titles={overview:'概览',config:'配置',douban:'豆瓣缓存',records:'观看记录',paths:'路径管理',logs:'日志'};
 $('pageTitle').textContent=titles[name]||'';
 if(name==='logs'){loadLogs();startLogTimer()}
 else{stopLogTimer()}
@@ -660,6 +763,7 @@ else{stopStatsTimer()}
 if(name==='config'){loadConfig()}
 if(name==='paths'){loadPaths()}
 if(name==='douban'){loadDoubanCache()}
+if(name==='records'){loadRecordTab()}
 }
 
 function startLogTimer(){
@@ -869,7 +973,7 @@ toast((d&&d.message)||'删除失败','error');
 }
 
 function clearDoubanCache(){
-if(!confirm('确定要清空全部豆瓣缓存吗？\n\n清空后所有评分会在下次扫描时重新抓取，这可能需要较长时间。'))return;
+if(!confirm('确定要清空全部豆瓣缓存吗？\n\n清空后所有评分会在下次扫描时重新抓取。'))return;
 ajax('/api/douban/cache/clear','POST',null,function(err,d){
 if(err){toast('清空失败: '+err,'error');return}
 if(d&&d.code===200){
@@ -880,6 +984,184 @@ loadStats();
 toast((d&&d.message)||'清空失败','error');
 }
 });
+}
+
+/* ===== 观看记录 ===== */
+function loadRecordTab(){
+loadRecordUsers();
+loadRecordStats();
+loadRecordHistory(true);
+}
+
+function loadRecordUsers(){
+ajax('/api/record/users','GET',null,function(err,d){
+if(err||!d||d.code!==200)return;
+var users=Array.isArray(d.data)?d.data:[];
+var sel=$('recUserSelect');
+var cur=sel.value;
+var html='<option value="">所有用户</option>';
+for(var i=0;i<users.length;i++){
+var u=users[i];
+var label=u.username+(u.is_admin?' (管理员)':'');
+html+='<option value="'+esc(u.guid)+'">'+esc(label)+'</option>';
+}
+sel.innerHTML=html;
+sel.value=cur;
+});
+}
+
+function loadRecordStats(){
+ajax('/api/record/stats','GET',null,function(err,d){
+if(err||!d||d.code!==200||!d.data)return;
+var s=d.data;
+$('recTotalUsers').textContent=fmtNum(s.total_users||0);
+$('recActiveUsers').textContent=fmtNum(s.active_users||0);
+$('recTotalPlays').textContent=fmtNum(s.total_plays||0);
+$('recTodayPlays').textContent=fmtNum(s.today_plays||0);
+});
+}
+
+function loadRecordHistory(showLoading){
+if(recLoading)return;
+recLoading=true;
+var list=$('recList');
+var info=$('recInfo');
+
+if(showLoading){
+list.innerHTML='<div class="rec-loading">加载中...</div>';
+}else{
+info.innerHTML='<span style="color:#3b82f6">搜索中...</span>';
+}
+
+var params=new URLSearchParams();
+params.set('page',recCurrentPage);
+params.set('per_page',$('recPerPage').value);
+var ug=$('recUserSelect').value; if(ug)params.set('user_guid',ug);
+var st=$('recSearchTitle').value.trim(); if(st)params.set('search_title',st);
+var start=$('recStartTime').value; if(start){params.set('start_time',formatRecTime(start))}
+var end=$('recEndTime').value; if(end){params.set('end_time',formatRecTime(end))}
+
+ajax('/api/record/history?'+params.toString(),'GET',null,function(err,d){
+recLoading=false;
+if(err||!d||d.code!==200||!d.data){
+list.innerHTML='<div class="rec-empty"><div class="icon">❌</div><div>加载失败</div></div>';
+return;
+}
+var data=d.data;
+recTotalPages=data.pages||1;
+
+var activeFilters=[];
+if(ug)activeFilters.push('用户: '+$('recUserSelect').selectedOptions[0].textContent);
+if(st)activeFilters.push('搜索: "'+st+'"');
+if(start)activeFilters.push('开始: '+start);
+if(end)activeFilters.push('结束: '+end);
+var filterStr=activeFilters.length?' ('+activeFilters.join(', ')+')':'';
+info.textContent='共 '+data.total+' 条记录，第 '+data.page+'/'+data.pages+' 页'+filterStr;
+
+var items=data.data||[];
+if(items.length===0){
+list.innerHTML='<div class="rec-empty"><div class="icon">📺</div><div>暂无观看记录</div>'+(activeFilters.length?'<div style="margin-top:8px;font-size:12px">请尝试调整筛选条件</div>':'')+'</div>';
+$('recPager').style.display='none';
+return;
+}
+
+var html='';
+for(var i=0;i<items.length;i++){
+var it=items[i];
+var tags=[];
+if(it.is_episode){
+var epTag='';
+if(it.season_number!=null)epTag+='S'+pad2(it.season_number);
+if(it.episode_number!=null)epTag+='E'+pad2(it.episode_number);
+if(epTag)tags.push('<span class="tag ep">'+esc(epTag)+'</span>');
+}
+if(it.type)tags.push('<span class="tag">'+esc(it.type)+'</span>');
+if(it.resolution)tags.push('<span class="tag">'+esc(it.resolution)+'</span>');
+if(it.watched)tags.push('<span class="tag done">已完成</span>');
+
+var progressWidth=it.watched?100:(it.progress||0);
+
+html+='<div class="rec-item">';
+html+='<div class="info">';
+html+='<div class="title">'+esc(it.title)+'</div>';
+html+='<div class="tags">'+tags.join('')+'</div>';
+if(it.overview){
+var ov=it.overview.length>120?it.overview.substring(0,120)+'...':it.overview;
+html+='<div class="overview">'+esc(ov)+'</div>';
+}
+html+='<div class="progress-bar"><div class="progress-fill" style="width:'+progressWidth+'%"></div></div>';
+html+='<div class="progress-text">'+(it.watched?'已观看完成':('进度: '+esc(it.position_formatted)+' / '+esc(it.runtime_formatted)+' ('+it.progress+'%)'))+'</div>';
+html+='</div>';
+html+='<div class="user">';
+html+='<div class="name">'+esc(it.username)+'</div>';
+html+='<div class="time">开始: '+esc(it.create_time||'-')+'</div>';
+html+='<div class="time">最近: '+esc(it.update_time||'-')+'</div>';
+html+='</div>';
+html+='</div>';
+}
+list.innerHTML=html;
+
+renderRecPagination(data.page,data.pages);
+});
+}
+
+function renderRecPagination(page,pages){
+var el=$('recPager');
+if(pages<=1){el.style.display='none';return}
+el.style.display='flex';
+var h='<span class="info">第 '+page+' / '+pages+' 页</span>';
+h+='<button '+(page<=1?'disabled':'')+' data-page="'+(page-1)+'">«</button>';
+
+var start=Math.max(1,page-2);
+var end=Math.min(pages,page+2);
+if(start>1){
+h+='<button data-page="1">1</button>';
+if(start>2)h+='<span style="color:#a1a1aa">...</span>';
+}
+for(var i=start;i<=end;i++){
+h+='<button class="'+(i===page?'active':'')+'" data-page="'+i+'">'+i+'</button>';
+}
+if(end<pages){
+if(end<pages-1)h+='<span style="color:#a1a1aa">...</span>';
+h+='<button data-page="'+pages+'">'+pages+'</button>';
+}
+h+='<button '+(page>=pages?'disabled':'')+' data-page="'+(page+1)+'">»</button>';
+el.innerHTML=h;
+
+var btns=el.querySelectorAll('button[data-page]');
+for(var j=0;j<btns.length;j++){
+(function(b){
+b.onclick=function(){
+var p=parseInt(b.getAttribute('data-page'),10);
+if(p<1||p>recTotalPages||p===recCurrentPage)return;
+recCurrentPage=p;
+window.scrollTo(0,0);
+loadRecordHistory(false);
+};
+})(btns[j]);
+}
+}
+
+function recPerformSearch(){
+if(recSearchTimer){clearTimeout(recSearchTimer);recSearchTimer=null}
+recCurrentPage=1;
+loadRecordHistory(false);
+}
+
+function recClearFilters(){
+$('recSearchTitle').value='';
+$('recStartTime').value='';
+$('recEndTime').value='';
+$('recUserSelect').value='';
+recCurrentPage=1;
+loadRecordUsers();
+loadRecordStats();
+loadRecordHistory(true);
+}
+
+function formatRecTime(localStr){
+var d=new Date(localStr);
+return d.getFullYear()+'-'+pad2(d.getMonth()+1)+'-'+pad2(d.getDate())+' '+pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds());
 }
 
 /* ===== 配置 ===== */
@@ -895,9 +1177,9 @@ $('cfgCacheTTL').value=data.cache_ttl||'';
 $('cfgMaxItems').value=data.max_cache_items||10000;
 $('cfgUser').value=data.dashboard_user||'admin';
 $('cfgPass').value='';
-// ✅ 飞牛账号
 $('cfgFnosUsername').value=data.fnos_username||'';
 $('cfgFnosPassword').value='';
+$('cfgPlayHistoryDBPath').value=data.play_history_db_path||'/db/trimmedia.db';
 
 $('cfgEnableLanStrm').checked = data.enable_lan_strm !== false;
 $('cfgEnablePreload').checked = data.enable_preload !== false;
@@ -941,11 +1223,10 @@ library_scan_on_start:$('cfgLibraryScanOnStart').checked,
 library_scan_concurrency:parseInt($('cfgLibraryScanConcurrency').value.trim(),10)||2,
 library_scan_interval_ms:parseInt($('cfgLibraryScanIntervalMs').value.trim(),10)||500,
 library_scan_incremental_minutes:parseInt($('cfgLibraryScanIncrementalMinutes').value.trim(),10)||5,
-// ✅ 飞牛账号
-fnos_username:$('cfgFnosUsername').value.trim()
+fnos_username:$('cfgFnosUsername').value.trim(),
+play_history_db_path:$('cfgPlayHistoryDBPath').value.trim()
 };
 if(pass&&pass!==''&&pass!=='****'){data.dashboard_pass=pass}
-// 飞牛密码：仅在输入非空且非占位符时提交
 if(fnosPass&&fnosPass!==''&&fnosPass!=='****'){data.fnos_password=fnosPass}
 ajax('/api/config/update','POST',data,function(err,r){
 if(err){toast('保存失败: '+err,'error');return}
@@ -1243,7 +1524,6 @@ applyDoubanFilterAndRender();
 })(sortThs[s]);
 }
 
-// ✅ 类型筛选 chip
 var chips=document.querySelectorAll('.douban-chip');
 for(var c=0;c<chips.length;c++){
 (function(chip){
@@ -1257,6 +1537,23 @@ applyDoubanFilterAndRender();
 };
 })(chips[c]);
 }
+
+// 观看记录
+$('recSearchBtn').onclick=recPerformSearch;
+$('recClearBtn').onclick=recClearFilters;
+$('recSearchTitle').onkeypress=function(e){
+if(e.key==='Enter')recPerformSearch();
+};
+$('recStartTime').onkeypress=function(e){
+if(e.key==='Enter')recPerformSearch();
+};
+$('recEndTime').onkeypress=function(e){
+if(e.key==='Enter')recPerformSearch();
+};
+$('recPerPage').onchange=function(){
+recCurrentPage=1;
+loadRecordHistory(true);
+};
 
 var menuToggle=$('menuToggle');
 if(menuToggle){
