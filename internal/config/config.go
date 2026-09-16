@@ -16,25 +16,24 @@ import (
 
 // Config 配置结构
 type Config struct {
-	ListenAddr    string        `mapstructure:"listen"`
-	TargetAddr    string        `mapstructure:"target"`
-	LogLevel      string        `mapstructure:"log_level"`
-	LogDir        string        `mapstructure:"log_dir"`
-	CacheTTL      time.Duration `mapstructure:"cache_ttl"`
-	DashboardAddr string        `mapstructure:"dashboard_addr"`
-	DashboardUser string        `mapstructure:"dashboard_user"`
-	DashboardPass string        `mapstructure:"dashboard_pass"`
-	MaxCacheItems int           `mapstructure:"max_cache_items"`
-	StrmPaths     []string      `mapstructure:"strm_paths"`
-	StrmVolumes   []string      `mapstructure:"strm_volumes"`
-	StatsToken    string        `mapstructure:"stats_token"`
-	StrmResolveMode string      `mapstructure:"strm_resolve_mode"`
-	EnableLanStrm   bool        `mapstructure:"enable_lan_strm"`
-	EnablePreload   bool        `mapstructure:"enable_preload"`
-	EnableSmartTTL  bool        `mapstructure:"enable_smart_ttl"`
-	EnableCDNWarmup bool        `mapstructure:"enable_cdn_warmup"`
+	ListenAddr     string        `mapstructure:"listen"`
+	TargetAddr     string        `mapstructure:"target"`
+	LogLevel       string        `mapstructure:"log_level"`
+	LogDir         string        `mapstructure:"log_dir"`
+	CacheTTL       time.Duration `mapstructure:"cache_ttl"`
+	DashboardAddr  string        `mapstructure:"dashboard_addr"`
+	DashboardUser  string        `mapstructure:"dashboard_user"`
+	DashboardPass  string        `mapstructure:"dashboard_pass"`
+	MaxCacheItems  int           `mapstructure:"max_cache_items"`
+	StrmPaths      []string      `mapstructure:"strm_paths"`
+	StrmVolumes    []string      `mapstructure:"strm_volumes"`
+	StatsToken     string        `mapstructure:"stats_token"`
+	StrmResolveMode string       `mapstructure:"strm_resolve_mode"`
+	EnableLanStrm   bool         `mapstructure:"enable_lan_strm"`
+	EnablePreload   bool         `mapstructure:"enable_preload"`
+	EnableSmartTTL  bool         `mapstructure:"enable_smart_ttl"`
+	EnableCDNWarmup bool         `mapstructure:"enable_cdn_warmup"`
 
-	// 全库扫描
 	EnableLibraryScan             bool   `mapstructure:"enable_library_scan"`
 	LibraryScanCron               string `mapstructure:"library_scan_cron"`
 	LibraryScanOnStart            bool   `mapstructure:"library_scan_on_start"`
@@ -42,16 +41,16 @@ type Config struct {
 	LibraryScanIntervalMs         int    `mapstructure:"library_scan_interval_ms"`
 	LibraryScanIncrementalMinutes int    `mapstructure:"library_scan_incremental_minutes"`
 
-	// Webhook
 	WebhookNotifyToken        string `mapstructure:"webhook_notify_token"`
 	WebhookNotifyDelaySeconds int    `mapstructure:"webhook_notify_delay_seconds"`
 
-	// 豆瓣评分
 	EnableDoubanRating bool `mapstructure:"enable_douban_rating"`
 
-	// ✅ 飞牛账号（用于启动时主动登录，替代环境变量）
 	FnosUsername string `mapstructure:"fnos_username"`
 	FnosPassword string `mapstructure:"fnos_password"`
+
+	// ✅ 观看记录数据库路径（空=禁用「观看记录」tab）
+	PlayHistoryDBPath string `mapstructure:"play_history_db_path"`
 
 	mutex sync.RWMutex
 }
@@ -89,6 +88,8 @@ var Global = &Config{
 
 	FnosUsername: "",
 	FnosPassword: "",
+
+	PlayHistoryDBPath: "/db/trimmedia.db",
 }
 
 // Load 加载配置
@@ -130,9 +131,10 @@ func Load(configPath string) error {
 	viper.SetDefault("webhook_notify_token", "")
 	viper.SetDefault("webhook_notify_delay_seconds", 15)
 	viper.SetDefault("enable_douban_rating", true)
-	// ✅ 飞牛账号默认空（空则回退环境变量）
 	viper.SetDefault("fnos_username", "")
 	viper.SetDefault("fnos_password", "")
+	// ✅ 观看记录
+	viper.SetDefault("play_history_db_path", "/db/trimmedia.db")
 
 	viper.SetEnvPrefix("FNTV")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -376,7 +378,6 @@ func (c *Config) GetEnableDoubanRating() bool {
 	return c.EnableDoubanRating
 }
 
-// ✅ 飞牛账号 Getter
 func (c *Config) GetFnosUsername() string {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
@@ -387,6 +388,13 @@ func (c *Config) GetFnosPassword() string {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 	return c.FnosPassword
+}
+
+// ✅ 观看记录数据库路径
+func (c *Config) GetPlayHistoryDBPath() string {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c.PlayHistoryDBPath
 }
 
 func (c *Config) SetLogLevel(level string) {
@@ -447,8 +455,7 @@ func (c *Config) UpdateConfigWithStatus(updates map[string]interface{}) (bool, e
 				}
 			}
 			if ttlMinutes > 0 {
-				newTTL := time.Duration(ttlMinutes) * time.Minute
-				c.CacheTTL = newTTL
+				c.CacheTTL = time.Duration(ttlMinutes) * time.Minute
 			}
 		case "dashboard_addr":
 			if v, ok := value.(string); ok && c.DashboardAddr != v {
@@ -589,7 +596,6 @@ func (c *Config) UpdateConfigWithStatus(updates map[string]interface{}) (bool, e
 					log.Printf("🔄 检测到豆瓣评分开关变更: %v（热重载生效）", v)
 				}
 			}
-		// ✅ 飞牛账号（热重载不生效，需重启）
 		case "fnos_username":
 			if v, ok := value.(string); ok {
 				if c.FnosUsername != v {
@@ -607,6 +613,15 @@ func (c *Config) UpdateConfigWithStatus(updates map[string]interface{}) (bool, e
 					c.FnosPassword = v
 					needsRestart = true
 					log.Println("🔄 检测到飞牛密码变更（需重启生效）")
+				}
+			}
+		// ✅ 观看记录数据库路径
+		case "play_history_db_path":
+			if v, ok := value.(string); ok {
+				if c.PlayHistoryDBPath != v {
+					c.PlayHistoryDBPath = v
+					needsRestart = true
+					log.Println("🔄 检测到观看记录数据库路径变更（需重启生效）")
 				}
 			}
 		}
@@ -799,9 +814,10 @@ func (c *Config) saveConfigLocked() error {
 	viper.Set("webhook_notify_token", c.WebhookNotifyToken)
 	viper.Set("webhook_notify_delay_seconds", c.WebhookNotifyDelaySeconds)
 	viper.Set("enable_douban_rating", c.EnableDoubanRating)
-	// ✅ 飞牛账号
 	viper.Set("fnos_username", c.FnosUsername)
 	viper.Set("fnos_password", c.FnosPassword)
+	// ✅ 观看记录
+	viper.Set("play_history_db_path", c.PlayHistoryDBPath)
 
 	dir := filepath.Dir(configFile)
 	tmpFile, err := os.CreateTemp(dir, ".fnysfd-config-*.yaml")
@@ -850,7 +866,6 @@ func (c *Config) ToMap() map[string]interface{} {
 	if c.WebhookNotifyToken != "" {
 		webhookTokenMasked = "****"
 	}
-	// ✅ 飞牛密码脱敏
 	fnosPassMasked := ""
 	if c.FnosPassword != "" {
 		fnosPassMasked = "****"
@@ -883,9 +898,10 @@ func (c *Config) ToMap() map[string]interface{} {
 		"webhook_notify_token":         webhookTokenMasked,
 		"webhook_notify_delay_seconds": c.WebhookNotifyDelaySeconds,
 		"enable_douban_rating": c.EnableDoubanRating,
-		// ✅ 飞牛账号
 		"fnos_username": c.FnosUsername,
 		"fnos_password": fnosPassMasked,
+		// ✅ 观看记录
+		"play_history_db_path": c.PlayHistoryDBPath,
 	}
 }
 
@@ -1053,6 +1069,7 @@ webhook_notify_delay_seconds: 15
 enable_douban_rating: true
 fnos_username: ""
 fnos_password: ""
+play_history_db_path: "/db/trimmedia.db"
 listen: :28005
 log_dir: ./logs
 log_level: info
