@@ -174,9 +174,15 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 	initialConcurrency := cfg.GetLibraryScanConcurrency()
 	s.authStore = NewAuthStore()
 
-	// 主动登录
-	fnosUser := os.Getenv("FNOS_USERNAME")
-	fnosPass := os.Getenv("FNOS_PASSWORD")
+		// 主动登录（优先读 config，config 空则回退环境变量）
+	fnosUser := config.Global.GetFnosUsername()
+	fnosPass := config.Global.GetFnosPassword()
+	if fnosUser == "" {
+		fnosUser = os.Getenv("FNOS_USERNAME")
+	}
+	if fnosPass == "" {
+		fnosPass = os.Getenv("FNOS_PASSWORD")
+	}
 	if fnosUser != "" && fnosPass != "" {
 		serverAddr := targetURL.Scheme + "://" + targetURL.Host
 		if err := s.authStore.LoginViaEmby(fnosUser, fnosPass, serverAddr); err != nil {
@@ -186,7 +192,7 @@ func NewServer(cfg *config.Config, version string) (*Server, error) {
 			log.Info("✅ [主动登录] 飞牛影视登录成功，UserID=%s", uid)
 		}
 	} else {
-		log.Info("ℹ️ [主动登录] 未配置 FNOS_USERNAME/FNOS_PASSWORD，依赖被动捕获")
+		log.Info("ℹ️ [主动登录] 未配置飞牛账号（面板/环境变量均未设置），依赖被动捕获")
 	}
 
 	s.batchPrefetcher = NewBatchPrefetcher(s, initialConcurrency)
