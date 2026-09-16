@@ -17,6 +17,11 @@ ENV GO111MODULE=on
 # 复制源代码
 COPY . .
 
+# ✅ 新增：拉取 modernc.org/sqlite 依赖（观看记录功能需要）
+#    因为仓库里的 go.mod 还没包含这个依赖，构建时动态加入
+RUN go get modernc.org/sqlite@v1.34.5
+RUN go mod tidy
+
 # 下载并校验 Go 依赖
 RUN go mod download
 
@@ -61,9 +66,10 @@ RUN chmod +x /app/fnysfd /app/entrypoint.sh
 # 暴露端口
 EXPOSE 28005 28006
 
-# 健康检查
+# ✅ 修正：健康检查走 /health（28005，不需要登录）
+#    原版走 28006/api/system 会因为需要 session 而永远 401
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:28006/api/system || exit 1
+    CMD curl -fsS http://localhost:28005/health || exit 1
 
 # 启动命令
 ENTRYPOINT ["/app/entrypoint.sh"]
