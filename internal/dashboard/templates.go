@@ -318,6 +318,16 @@ body.sidebar-open .sidebar-overlay{display:block}
 </div>
 
 <div class="card">
+<div class="card-title">豆瓣评分</div>
+<div class="sys-row"><div class="k">状态</div><div class="v" id="doubanStatus">-</div></div>
+<div class="sys-row"><div class="k">缓存条目</div><div class="v" id="doubanEntries">-</div></div>
+<div class="sys-row"><div class="k">缓存文件大小</div><div class="v" id="doubanFileSize">-</div></div>
+<div class="sys-row"><div class="k">命中 / 未命中</div><div class="v" id="doubanHits">-</div></div>
+<div class="sys-row"><div class="k">抓取成功 / 失败</div><div class="v" id="doubanFetched">-</div></div>
+<div class="sys-row"><div class="k">最后更新</div><div class="v" id="doubanUpdated">-</div></div>
+</div>
+
+<div class="card">
 <div class="card-title">系统信息</div>
 <div class="sys-row"><div class="k">版本</div><div class="v" id="sysVersion">-</div></div>
 <div class="sys-row"><div class="k">Go 版本</div><div class="v" id="sysGo">-</div></div>
@@ -371,8 +381,9 @@ body.sidebar-open .sidebar-overlay{display:block}
 <label class="switch"><input type="checkbox" id="cfgEnablePreload" checked><span class="track"></span><span>启用预加载</span></label>
 <label class="switch"><input type="checkbox" id="cfgEnableCDNWarmup" checked><span class="track"></span><span>CDN 预热（首播更快）</span></label>
 <label class="switch"><input type="checkbox" id="cfgEnableSmartTTL" checked><span class="track"></span><span>智能签名 TTL 检测</span></label>
+<label class="switch"><input type="checkbox" id="cfgEnableDoubanRating" checked><span class="track"></span><span>启用豆瓣评分（反代注入）</span></label>
 </div>
-<div class="hint">内网 strm：关闭后内网地址 strm 直接返回给播放器（适合 bridge 网络）；预加载：关闭后每次播放都需等待解析；CDN 预热：关闭后首次播放加载更慢但节省带宽；智能 TTL：根据 URL 签名有效期动态设置缓存，解决播放中 403 问题。</div>
+<div class="hint">内网 strm：关闭后内网地址 strm 直接返回给播放器（适合 bridge 网络）；预加载：关闭后每次播放都需等待解析；CDN 预热：关闭后首次播放加载更慢但节省带宽；智能 TTL：根据 URL 签名有效期动态设置缓存，解决播放中 403 问题；豆瓣评分：关闭后不抓取也不注入豆瓣评分，已有缓存保留。</div>
 </div>
 <div class="form-item">
 <label>缓存 TTL（分钟）</label>
@@ -662,6 +673,20 @@ $('statUrl').textContent=fmtNum(s.url_cache_count||0);
 $('statHit').textContent=fmtNum(s.hit_count||0);
 $('statMiss').textContent=fmtNum(s.miss_count||0);
 $('statEvict').textContent=fmtNum(s.evicted_count||0);
+// 豆瓣评分统计（后端 handleStats 合并的字段，前缀 douban_）
+if(s.douban_enabled!==undefined){
+var de=s.douban_enabled;
+var st=$('doubanStatus');
+if(st){
+st.textContent=de?'已启用':'已禁用';
+st.style.color=de?'#16a34a':'#dc2626';
+}
+$('doubanEntries').textContent=fmtNum(s.douban_entries||0);
+$('doubanFileSize').textContent=(s.douban_file_size_kb||0)+' KB';
+$('doubanHits').textContent=fmtNum(s.douban_stat_hits||0)+' / '+fmtNum(s.douban_stat_misses||0);
+$('doubanFetched').textContent=fmtNum(s.douban_stat_fetched||0)+' / '+fmtNum(s.douban_stat_failed||0);
+$('doubanUpdated').textContent=s.douban_updated_at||'-';
+}
 });
 }
 
@@ -699,6 +724,8 @@ $('cfgEnableLanStrm').checked = data.enable_lan_strm !== false;
 $('cfgEnablePreload').checked = data.enable_preload !== false;
 $('cfgEnableCDNWarmup').checked = data.enable_cdn_warmup !== false;
 $('cfgEnableSmartTTL').checked = data.enable_smart_ttl !== false;
+// 豆瓣评分开关（默认打开）
+$('cfgEnableDoubanRating').checked = data.enable_douban_rating !== false;
 // 海报墙预取
 $('cfgEnablePosterPrefetch').checked = data.enable_poster_prefetch === true;
 $('cfgPosterPrefetchConcurrency').value = data.poster_prefetch_concurrency || 4;
@@ -737,6 +764,8 @@ enable_lan_strm:$('cfgEnableLanStrm').checked,
 enable_preload:$('cfgEnablePreload').checked,
 enable_cdn_warmup:$('cfgEnableCDNWarmup').checked,
 enable_smart_ttl:$('cfgEnableSmartTTL').checked,
+// 豆瓣评分开关
+enable_douban_rating:$('cfgEnableDoubanRating').checked,
 // 海报墙预取
 enable_poster_prefetch:$('cfgEnablePosterPrefetch').checked,
 poster_prefetch_concurrency:parseInt($('cfgPosterPrefetchConcurrency').value.trim(),10)||4,
