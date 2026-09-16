@@ -415,24 +415,6 @@ body.sidebar-open .sidebar-overlay{display:block}
 </div>
 
 <div class="card">
-<div class="form-group-title">海报墙预取</div>
-<div class="form-item">
-<label class="switch"><input type="checkbox" id="cfgEnablePosterPrefetch"><span class="track"></span><span>启用海报墙预取</span></label>
-<div class="hint">用户浏览海报墙时，自动批量预取电影的 PlaybackInfo，进入详情页即可秒播</div>
-</div>
-<div class="form-item">
-<label>预取并发数</label>
-<input type="number" id="cfgPosterPrefetchConcurrency" min="1" max="20" placeholder="4">
-<div class="hint">同时预取的影片数量（建议 2-8，过高可能影响飞牛性能）</div>
-</div>
-<div class="form-item">
-<label>单次预取上限</label>
-<input type="number" id="cfgPosterPrefetchMaxItems" min="1" max="500" placeholder="50">
-<div class="hint">每次海报墙列表最多预取的影片数</div>
-</div>
-</div>
-
-<div class="card">
 <div class="form-group-title">全库扫描预取</div>
 <div class="form-item">
 <label class="switch"><input type="checkbox" id="cfgEnableLibraryScan"><span class="track"></span><span>启用全库扫描</span></label>
@@ -456,11 +438,6 @@ body.sidebar-open .sidebar-overlay{display:block}
 <label>每页间隔（毫秒）</label>
 <input type="number" id="cfgLibraryScanIntervalMs" min="0" max="60000" placeholder="500">
 <div class="hint">每页查询之间的等待时间，避免请求过密（建议 300-1000ms）</div>
-</div>
-<div class="form-item">
-<label>每季预取集数</label>
-<input type="number" id="cfgLibraryScanEpisodeCount" min="1" max="50" placeholder="5">
-<div class="hint">每部电视剧预取前 N 集（建议 3-10，避免预取过多占用资源）</div>
 </div>
 <div class="form-item">
 <label>增量扫描间隔（分钟）</label>
@@ -726,17 +703,12 @@ $('cfgEnableCDNWarmup').checked = data.enable_cdn_warmup !== false;
 $('cfgEnableSmartTTL').checked = data.enable_smart_ttl !== false;
 // 豆瓣评分开关（默认打开）
 $('cfgEnableDoubanRating').checked = data.enable_douban_rating !== false;
-// 海报墙预取
-$('cfgEnablePosterPrefetch').checked = data.enable_poster_prefetch === true;
-$('cfgPosterPrefetchConcurrency').value = data.poster_prefetch_concurrency || 4;
-$('cfgPosterPrefetchMaxItems').value = data.poster_prefetch_max_items || 50;
 // 全库扫描
 $('cfgEnableLibraryScan').checked = data.enable_library_scan === true;
 $('cfgLibraryScanCron').value = data.library_scan_cron || '';
 $('cfgLibraryScanOnStart').checked = data.library_scan_on_start === true;
 $('cfgLibraryScanConcurrency').value = data.library_scan_concurrency || 2;
 $('cfgLibraryScanIntervalMs').value = data.library_scan_interval_ms != null ? data.library_scan_interval_ms : 500;
-$('cfgLibraryScanEpisodeCount').value = data.library_scan_episode_count || 5;
 $('cfgLibraryScanIncrementalMinutes').value = data.library_scan_incremental_minutes || 5;
 // 扫描状态
 loadScanStatus();
@@ -766,17 +738,12 @@ enable_cdn_warmup:$('cfgEnableCDNWarmup').checked,
 enable_smart_ttl:$('cfgEnableSmartTTL').checked,
 // 豆瓣评分开关
 enable_douban_rating:$('cfgEnableDoubanRating').checked,
-// 海报墙预取
-enable_poster_prefetch:$('cfgEnablePosterPrefetch').checked,
-poster_prefetch_concurrency:parseInt($('cfgPosterPrefetchConcurrency').value.trim(),10)||4,
-poster_prefetch_max_items:parseInt($('cfgPosterPrefetchMaxItems').value.trim(),10)||50,
 // 全库扫描
 enable_library_scan:$('cfgEnableLibraryScan').checked,
 library_scan_cron:$('cfgLibraryScanCron').value.trim(),
 library_scan_on_start:$('cfgLibraryScanOnStart').checked,
 library_scan_concurrency:parseInt($('cfgLibraryScanConcurrency').value.trim(),10)||2,
 library_scan_interval_ms:parseInt($('cfgLibraryScanIntervalMs').value.trim(),10)||500,
-library_scan_episode_count:parseInt($('cfgLibraryScanEpisodeCount').value.trim(),10)||5,
 library_scan_incremental_minutes:parseInt($('cfgLibraryScanIncrementalMinutes').value.trim(),10)||5
 };
 // 仅当用户输入了非占位符的新密码时才提交
