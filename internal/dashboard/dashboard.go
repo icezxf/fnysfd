@@ -12,6 +12,7 @@ import (
 	"fnysfd/internal/docker"
 	"fnysfd/internal/handler"
 	"fnysfd/internal/logger"
+	"fnysfd/internal/proxy" // ✅ 新增：观看记录服务类型
 	"fmt"
 	"io"
 	"net/http"
@@ -31,30 +32,31 @@ type Dashboard struct {
 	cache          *cache.Cache
 	logger         *logger.Logger
 	streamHandler  *handler.StreamHandler
-	libraryScanner LibraryScannerInterface // 全库扫描器接口（可选）
-	doubanProvider DoubanProviderInterface // ✅ 豆瓣评分提供器接口（可选）
+	libraryScanner LibraryScannerInterface
+	doubanProvider DoubanProviderInterface
+	recordProvider *proxy.RecordService // ✅ 观看记录服务（nil=禁用）
 	startTime      time.Time
 	sessions       map[string]session
 	sessionMutex   sync.RWMutex
 	server         *http.Server
-	version        string // 由 main 包注入的版本号
+	version        string
 	stopChan       chan struct{}
 	stopOnce       sync.Once
 }
 
-// LibraryScannerInterface 全库扫描器接口（解耦 dashboard 对 proxy 包的依赖）
+// LibraryScannerInterface 全库扫描器接口
 type LibraryScannerInterface interface {
 	TriggerScan() error
 	IsRunning() bool
 	GetStatus() map[string]interface{}
 }
 
-// DoubanProviderInterface 豆瓣评分提供器接口（解耦 dashboard 对 proxy 包的依赖）
+// DoubanProviderInterface 豆瓣评分提供器接口
 type DoubanProviderInterface interface {
 	GetStats() map[string]interface{}
-	ListCache() []map[string]interface{}  // ✅ 新增
-	DeleteCacheEntry(keys []string) int   // ✅ 新增
-	ClearCache() int                      // ✅ 新增
+	ListCache() []map[string]interface{}
+	DeleteCacheEntry(keys []string) int
+	ClearCache() int
 }
 
 type session struct {
@@ -99,7 +101,7 @@ func New(cfg *config.Config, c *cache.Cache, l *logger.Logger, version string) *
 	}
 }
 
-// writeJSON 统一的 JSON 响应辅助方法，记录编码错误日志
+// writeJSON 统一的 JSON 响应辅助方法
 func (d *Dashboard) writeJSON(w http.ResponseWriter, code int, resp APIResponse) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
@@ -123,7 +125,12 @@ func (d *Dashboard) SetDoubanProvider(p DoubanProviderInterface) {
 	d.doubanProvider = p
 }
 
-// Start 启动面板服务（独立端口）
+// ✅ SetRecordProvider 设置观看记录服务引用
+func (d *Dashboard) SetRecordProvider(rs *proxy.RecordService) {
+	d.recordProvider = rs
+}
+
+// Start 启动面板服务
 func (d *Dashboard) Start() error {
 	mux := http.NewServeMux()
 
@@ -145,10 +152,14 @@ func (d *Dashboard) Start() error {
 	mux.HandleFunc("/api/scan/trigger", d.authMiddleware(d.csrfMiddleware(d.handleScanTrigger)))
 	mux.HandleFunc("/api/scan/status", d.authMiddleware(d.handleScanStatus))
 	mux.HandleFunc("/api/scan/notify", d.handleScanNotify)
-	// ✅ 豆瓣缓存管理
+	// 豆瓣缓存管理
 	mux.HandleFunc("/api/douban/cache", d.authMiddleware(d.handleDoubanCache))
 	mux.HandleFunc("/api/douban/cache/delete", d.authMiddleware(d.csrfMiddleware(d.handleDoubanCacheDelete)))
 	mux.HandleFunc("/api/douban/cache/clear", d.authMiddleware(d.csrfMiddleware(d.handleDoubanCacheClear)))
+	// ✅ 观看记录
+	mux.HandleFunc("/api/record/stats", d.authMiddleware(d.handleRecordStats))
+	mux.HandleFunc("/api/record/users", d.authMiddleware(d.handleRecordUsers))
+	mux.HandleFunc("/api/record/history", d.authMiddleware(d.handleRecordHistory))
 
 	mux.HandleFunc("/", d.authMiddleware(d.handleIndex))
 
@@ -173,7 +184,7 @@ func (d *Dashboard) Start() error {
 	return nil
 }
 
-// cleanupSessionsLoop 定期清理过期 session（支持优雅停止）
+// cleanupSessionsLoop 定期清理过期 session
 func (d *Dashboard) cleanupSessionsLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -188,7 +199,6 @@ func (d *Dashboard) cleanupSessionsLoop() {
 	}
 }
 
-// cleanupExpiredSessions 清理超过24小时的过期 session
 func (d *Dashboard) cleanupExpiredSessions() {
 	d.sessionMutex.Lock()
 	defer d.sessionMutex.Unlock()
@@ -267,7 +277,6 @@ func (d *Dashboard) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// generateSessionID 生成会话ID
 func generateSessionID() string {
 	bytes := make([]byte, 32)
 	if _, err := rand.Read(bytes); err != nil {
@@ -334,7 +343,7 @@ func (d *Dashboard) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleLogout 处理登出（仅接受 POST）
+// handleLogout 处理登出
 func (d *Dashboard) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
@@ -354,7 +363,7 @@ func (d *Dashboard) handleLogout(w http.ResponseWriter, r *http.Request) {
 	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Message: "已登出"})
 }
 
-// showLoginPage 显示登录页面（不需要认证）
+// showLoginPage 显示登录页面
 func (d *Dashboard) showLoginPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(loginHTML))
@@ -404,7 +413,6 @@ func (d *Dashboard) handleStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// ✅ 合并豆瓣评分统计
 	if d.doubanProvider != nil {
 		ds := d.doubanProvider.GetStats()
 		data["douban_enabled"] = ds["enabled"]
@@ -420,7 +428,10 @@ func (d *Dashboard) handleStats(w http.ResponseWriter, r *http.Request) {
 	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: data})
 }
 
-// handleDoubanCache 返回豆瓣缓存列表
+// ============================================================
+// 豆瓣缓存管理
+// ============================================================
+
 func (d *Dashboard) handleDoubanCache(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
@@ -434,7 +445,6 @@ func (d *Dashboard) handleDoubanCache(w http.ResponseWriter, r *http.Request) {
 	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: items})
 }
 
-// handleDoubanCacheDelete 删除单条豆瓣缓存
 func (d *Dashboard) handleDoubanCacheDelete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
@@ -459,7 +469,6 @@ func (d *Dashboard) handleDoubanCacheDelete(w http.ResponseWriter, r *http.Reque
 	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Message: fmt.Sprintf("已删除 %d 条缓存", n)})
 }
 
-// handleDoubanCacheClear 清空所有豆瓣缓存
 func (d *Dashboard) handleDoubanCacheClear(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
@@ -475,6 +484,91 @@ func (d *Dashboard) handleDoubanCacheClear(w http.ResponseWriter, r *http.Reques
 	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Message: fmt.Sprintf("已清空 %d 条缓存", n)})
 }
 
+// ============================================================
+// ✅ 观看记录
+// ============================================================
+
+// handleRecordStats 统计数据
+func (d *Dashboard) handleRecordStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
+		return
+	}
+	if d.recordProvider == nil || !d.recordProvider.Available() {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: map[string]interface{}{
+			"total_users": 0, "total_plays": 0, "active_users": 0, "today_plays": 0, "latest_play": "",
+		}})
+		return
+	}
+	stats, err := d.recordProvider.GetStats()
+	if err != nil {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 500, Message: err.Error()})
+		return
+	}
+	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: stats})
+}
+
+// handleRecordUsers 用户列表
+func (d *Dashboard) handleRecordUsers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
+		return
+	}
+	if d.recordProvider == nil || !d.recordProvider.Available() {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: []interface{}{}})
+		return
+	}
+	users, err := d.recordProvider.GetUsers()
+	if err != nil {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 500, Message: err.Error()})
+		return
+	}
+	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: users})
+}
+
+// handleRecordHistory 播放历史
+func (d *Dashboard) handleRecordHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
+		return
+	}
+	if d.recordProvider == nil || !d.recordProvider.Available() {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: map[string]interface{}{
+			"total": 0, "page": 1, "per_page": 20, "pages": 0, "data": []interface{}{},
+		}})
+		return
+	}
+
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	perPage, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
+	if perPage < 1 || perPage > 200 {
+		perPage = 20
+	}
+
+	q := proxy.HistoryQuery{
+		UserGUID:    r.URL.Query().Get("user_guid"),
+		Page:        page,
+		PerPage:     perPage,
+		SearchTitle: strings.TrimSpace(r.URL.Query().Get("search_title")),
+		StartTime:   r.URL.Query().Get("start_time"),
+		EndTime:     r.URL.Query().Get("end_time"),
+	}
+
+	result, err := d.recordProvider.GetHistory(q)
+	if err != nil {
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 500, Message: err.Error()})
+		return
+	}
+	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: result})
+}
+
+// ============================================================
+// 其他 handler（清缓存、日志、路径管理、扫描、Docker 等）
+// ============================================================
+
 // handleCacheClear 清空缓存
 func (d *Dashboard) handleCacheClear(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -489,7 +583,6 @@ func (d *Dashboard) handleCacheClear(w http.ResponseWriter, r *http.Request) {
 	}
 
 	d.logger.Info("🗑️ 通过管理面板清空缓存")
-
 	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Message: "缓存已清空"})
 }
 
@@ -518,7 +611,6 @@ func (d *Dashboard) handleLogsClear(w http.ResponseWriter, r *http.Request) {
 		base := filepath.Base(file)
 		if !isAppLogFile(base) {
 			skippedCount++
-			d.logger.Debug("⏭️ 跳过非应用日志文件: %s", base)
 			continue
 		}
 		if err := os.Remove(file); err != nil {
@@ -529,11 +621,6 @@ func (d *Dashboard) handleLogsClear(w http.ResponseWriter, r *http.Request) {
 		d.logger.Info("🗑️ 已删除日志文件: %s", base)
 	}
 
-	if skippedCount > 0 {
-		d.logger.Info("ℹ️ 跳过 %d 个非应用日志文件", skippedCount)
-	}
-	d.logger.Info("🗑️ 通过管理面板清空日志，共删除 %d 个文件", deletedCount)
-
 	d.writeJSON(w, http.StatusOK, APIResponse{
 		Code:    200,
 		Message: fmt.Sprintf("已清除 %d 个日志文件", deletedCount),
@@ -541,7 +628,6 @@ func (d *Dashboard) handleLogsClear(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// isAppLogFile 判断文件名是否为应用自身日志
 func isAppLogFile(name string) bool {
 	stem := strings.TrimSuffix(name, ".log")
 	if stem == name {
@@ -556,7 +642,6 @@ func isAppLogFile(name string) bool {
 	return false
 }
 
-// isAllDigits 判断字符串是否全部为数字字符
 func isAllDigits(s string) bool {
 	if s == "" {
 		return false
@@ -600,9 +685,7 @@ func (d *Dashboard) handleConfigGet(w http.ResponseWriter, r *http.Request) {
 		d.writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Code: 405, Message: "方法不允许"})
 		return
 	}
-
 	cfg := d.config.ToMap()
-
 	d.writeJSON(w, http.StatusOK, APIResponse{Code: 200, Data: cfg})
 }
 
@@ -757,8 +840,6 @@ func (d *Dashboard) handleStrmPathsGet(w http.ResponseWriter, r *http.Request) {
 	volumes := d.config.GetStrmVolumes()
 	volumeDetails := d.config.GenerateDockerVolumes()
 
-	d.logger.Info("📋 获取STRM路径列表，共 %d 个Volume映射", len(volumes))
-
 	d.writeJSON(w, http.StatusOK, APIResponse{
 		Code: 200,
 		Data: map[string]interface{}{
@@ -785,11 +866,10 @@ func (d *Dashboard) handleStrmPathAdd(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bodyBytes, _ := io.ReadAll(r.Body)
-	d.logger.Debug("📥 收到添加路径请求: %s", string(bodyBytes))
 
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		d.logger.Error("❌ JSON解析失败: %v, 原始数据: %s", err, string(bodyBytes))
-		d.writeJSON(w, http.StatusOK, APIResponse{Code: 400, Message: fmt.Sprintf("JSON格式错误: %v，请检查输入内容", err)})
+		d.logger.Error("❌ JSON解析失败: %v", err)
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 400, Message: fmt.Sprintf("JSON格式错误: %v", err)})
 		return
 	}
 
@@ -810,14 +890,12 @@ func (d *Dashboard) handleStrmPathAdd(w http.ResponseWriter, r *http.Request) {
 	}
 
 	volumeFormat := req.HostPath + ":" + req.ContainerPath + ":ro"
-	d.logger.Info("✅ 成功添加STRM Volume: %s (立即可用=%v)", volumeFormat, availableNow)
 
 	composeUpdated := false
 	if err := d.config.UpdateComposeFile(); err != nil {
 		d.logger.Warn("⚠️  Compose文件更新失败（不影响功能）: %v", err)
 	} else {
 		composeUpdated = true
-		d.logger.Info("📝 Docker Compose文件已自动更新")
 	}
 
 	msg := "Volume映射添加成功"
@@ -881,11 +959,10 @@ func (d *Dashboard) handleStrmPathDelete(w http.ResponseWriter, r *http.Request)
 	}
 
 	bodyBytes, _ := io.ReadAll(r.Body)
-	d.logger.Debug("📥 收到删除路径请求: %s", string(bodyBytes))
 
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		d.logger.Error("❌ JSON解析失败: %v, 原始数据: %s", err, string(bodyBytes))
-		d.writeJSON(w, http.StatusOK, APIResponse{Code: 400, Message: fmt.Sprintf("JSON格式错误: %v，请检查输入内容", err)})
+		d.logger.Error("❌ JSON解析失败: %v", err)
+		d.writeJSON(w, http.StatusOK, APIResponse{Code: 400, Message: fmt.Sprintf("JSON格式错误: %v", err)})
 		return
 	}
 
@@ -919,8 +996,6 @@ func (d *Dashboard) handleStrmPathsVolumes(w http.ResponseWriter, r *http.Reques
 	volumes := d.config.GetStrmVolumes()
 	volumeDetails := d.config.GenerateDockerVolumes()
 
-	d.logger.Info("📋 生成Docker Volumes配置，共 %d 个挂载点", len(volumes))
-
 	d.writeJSON(w, http.StatusOK, APIResponse{
 		Code: 200,
 		Data: map[string]interface{}{
@@ -941,22 +1016,12 @@ func generateComposeYAML(volumes []map[string]string) string {
 
 	var yaml strings.Builder
 	yaml.WriteString("# Docker Compose - Volumes 配置（自动生成）\n")
-	yaml.WriteString("# ============================================\n")
-	yaml.WriteString("# ⚠️ 以下配置已包含完整的主机路径和容器路径映射\n")
-	yaml.WriteString("# ✅ 可直接复制到 docker-compose.yml 的 volumes 部分\n\n")
 	yaml.WriteString("volumes:\n")
 
 	for i, vol := range volumes {
 		yaml.WriteString(fmt.Sprintf("  # %d. %s\n", i+1, vol["description"]))
-		yaml.WriteString(fmt.Sprintf("  # 主机路径: %s | 容器路径: %s | 权限: %s\n", vol["host_path"], vol["container_path"], vol["permission"]))
 		yaml.WriteString(fmt.Sprintf("  - %s\n", vol["volume_format"]))
 	}
-
-	yaml.WriteString("\n# 📝 使用说明：\n")
-	yaml.WriteString("# 1. 复制以上volumes配置到docker-compose.yml\n")
-	yaml.WriteString("# 2. 确保主机路径（冒号左侧）在NAS上存在\n")
-	yaml.WriteString("# 3. 点击面板'重启容器'按钮，或执行: docker compose restart\n")
-	yaml.WriteString("# 4. 重启后在容器详情的'存储'中查看挂载情况\n")
 
 	return yaml.String()
 }
@@ -1039,7 +1104,6 @@ func (d *Dashboard) handleScanNotify(w http.ResponseWriter, r *http.Request) {
 
 	expectedToken := d.config.GetWebhookNotifyToken()
 	if expectedToken == "" {
-		d.logger.Warn("📚 [Webhook] 未配置 webhook_notify_token，拒绝请求")
 		d.writeJSON(w, http.StatusForbidden, APIResponse{Code: 403, Message: "服务端未配置 webhook_notify_token"})
 		return
 	}
@@ -1054,7 +1118,6 @@ func (d *Dashboard) handleScanNotify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if subtle.ConstantTimeCompare([]byte(token), []byte(expectedToken)) != 1 {
-		d.logger.Warn("📚 [Webhook] token 校验失败，来自 %s", r.RemoteAddr)
 		d.writeJSON(w, http.StatusUnauthorized, APIResponse{Code: 401, Message: "token 无效"})
 		return
 	}
