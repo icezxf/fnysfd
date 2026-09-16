@@ -351,11 +351,11 @@ func (s *Server) Stop() error {
 	return err
 }
 
-func (s *Server) GetCache() *cache.Cache                  { return s.cache }
-func (s *Server) GetLogger() *logger.Logger               { return s.logger }
+func (s *Server) GetCache() *cache.Cache                   { return s.cache }
+func (s *Server) GetLogger() *logger.Logger                { return s.logger }
 func (s *Server) GetStreamHandler() *handler.StreamHandler { return s.streamHandler }
-func (s *Server) GetLibraryScanner() *LibraryScanner      { return s.libraryScanner }
-func (s *Server) GetDoubanProvider() *DoubanProvider      { return s.doubanProvider } // ✅ 新增
+func (s *Server) GetLibraryScanner() *LibraryScanner       { return s.libraryScanner }
+func (s *Server) GetDoubanProvider() *DoubanProvider       { return s.doubanProvider } // ✅ 新增
 
 // Reload 重新加载配置
 func (s *Server) Reload() {
@@ -398,7 +398,7 @@ func (s *Server) Reload() {
 
 // injectDoubanRatings 解析 JSON，对每个 item 注入豆瓣评分
 //
-// ✅ 新增：豆瓣评分注入
+// ✅ 新增：豆瓣评分注入（Emby 协议 /Items 响应）
 func (s *Server) injectDoubanRatings(body []byte) []byte {
 	var obj map[string]interface{}
 	if err := json.Unmarshal(body, &obj); err != nil {
@@ -432,8 +432,110 @@ func (s *Server) injectDoubanRatings(body []byte) []byte {
 	return newBody
 }
 
+// ============================================================
+// ✅ 飞牛原生详情接口注入（/v/api/v1/item/{guid}）
+// ============================================================
+
+// shouldInjectNative 判断是否飞牛原生详情接口 /v/api/v1/item/{guid}
+func (s *Server) shouldInjectNative(path string) bool {
+	const prefix = "/v/api/v1/item/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	rest := path[len(prefix):]
+	// 必须正好是一个 32 位 GUID，后面不带任何子路径
+	if rest == "" || strings.Contains(rest, "/") || len(rest) != 32 {
+		return false
+	}
+	return true
+}
+
+// injectDoubanNative 注入豆瓣评分到飞牛原生详情响应
+//
+// 响应结构：
+//   { "code":0, "data": { "imdb_id":"ttxxx", "title":"xxx", "type":"Movie",
+//                         "vote_average":"7.2535...", ... } }
+func (s *Server) injectDoubanNative(body []byte) []byte {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Warn("🎬 [豆瓣评分] 原生注入 panic: %v", r)
+		}
+	}()
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+
+	// 只处理 code==0 的成功响应
+	if code, ok := payload["code"].(float64); ok && code != 0 {
+		return body
+	}
+
+	data, ok := payload["data"].(map[string]interface{})
+	if !ok || data == nil {
+		return body
+	}
+
+	imdbID, _ := data["imdb_id"].(string)
+	title, _ := data["title"].(string)
+	itemType, _ := data["type"].(string)
+
+	var rating float64
+	var found bool
+
+	switch itemType {
+	case "Movie", "Series":
+		rating, found = s.doubanProvider.GetRating(imdbID, title, 0)
+	case "Season":
+		// 季：用 parent_title（剧名）+ season_number
+		seriesName, _ := data["parent_title"].(string)
+		seasonNum := 0
+		if n, ok := data["season_number"].(float64); ok {
+			seasonNum = int(n)
+		}
+		if seriesName != "" && seasonNum > 0 {
+			rating, found = s.doubanProvider.GetSeasonRating(seriesName, seasonNum)
+		}
+	}
+
+	if !found || rating <= 0 {
+		return body
+	}
+
+	// ✅ vote_average 是字符串，保持类型
+	data["vote_average"] = fmt.Sprintf("%.1f", rating)
+	s.logger.Debug("🎬 [豆瓣评分] 原生注入 %s: vote_average → %.1f", title, rating)
+
+	newBody, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return newBody
+}
+
 // handleResponse 处理响应
 func (s *Server) handleResponse(resp *http.Response) error {
+	// ============================================================
+	// ✅ 飞牛原生详情接口注入：/v/api/v1/item/{guid}
+	//    放在最前面，避免 resp.Body 被后续逻辑消费
+	// ============================================================
+	if s.doubanProvider != nil && resp.StatusCode == http.StatusOK && resp.Request != nil {
+		nativePath := resp.Request.URL.Path
+		if s.shouldInjectNative(nativePath) {
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+			if err == nil && len(body) > 0 {
+				resp.Body.Close()
+				newBody := s.injectDoubanNative(body)
+				resp.Body = io.NopCloser(bytes.NewBuffer(newBody))
+				resp.ContentLength = int64(len(newBody))
+				resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
+				resp.Header.Del("Transfer-Encoding")
+				return nil
+			}
+		}
+	}
+
 	// ============================================================
 	// ✅ 豆瓣评分注入：拦截 /Items 响应（列表或详情）
 	// ============================================================
