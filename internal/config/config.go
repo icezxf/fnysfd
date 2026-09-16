@@ -49,18 +49,13 @@ type Config struct {
 	//   - true：解析 URL 后异步预热 CDN 边缘节点，首播更快
 	//   - false：禁用 CDN 预热，仅做 URL 解析（适合节省带宽或资源受限场景）
 	EnableCDNWarmup bool `mapstructure:"enable_cdn_warmup"`
-	// 海报墙预取（用户浏览海报墙时，拦截列表响应，批量预取 Movie 的 PlaybackInfo）
-	EnablePosterPrefetch      bool `mapstructure:"enable_poster_prefetch"`
-	PosterPrefetchConcurrency int  `mapstructure:"poster_prefetch_concurrency"` // 海报墙预取并发数
-	PosterPrefetchMaxItems    int  `mapstructure:"poster_prefetch_max_items"`    // 单次预取上限
 	// 全库扫描预取（定时扫描整个媒体库，批量预取 PlaybackInfo）
-	EnableLibraryScan       bool   `mapstructure:"enable_library_scan"`
-	LibraryScanCron         string `mapstructure:"library_scan_cron"`         // 定时扫描时间 "HH:MM"
-	LibraryScanOnStart      bool   `mapstructure:"library_scan_on_start"`     // 启动后立即扫描
-	LibraryScanConcurrency  int    `mapstructure:"library_scan_concurrency"`   // 扫描并发数
-	LibraryScanIntervalMs   int    `mapstructure:"library_scan_interval_ms"`  // 每页间隔（毫秒）
-	LibraryScanEpisodeCount int    `mapstructure:"library_scan_episode_count"` // 每季预取前N集
-	// ✅ 新增：增量扫描间隔（分钟）
+	EnableLibraryScan      bool   `mapstructure:"enable_library_scan"`
+	LibraryScanCron        string `mapstructure:"library_scan_cron"`        // 定时扫描时间 "HH:MM"
+	LibraryScanOnStart     bool   `mapstructure:"library_scan_on_start"`    // 启动后立即扫描
+	LibraryScanConcurrency int    `mapstructure:"library_scan_concurrency"` // 扫描并发数
+	LibraryScanIntervalMs  int    `mapstructure:"library_scan_interval_ms"` // 每页间隔（毫秒）
+	// ✅ 增量扫描间隔（分钟）
 	//   - 每 N 分钟拉一次每个媒体库的"最新 200 项"，只预取飞牛未 probe 的项
 	//   - 默认 5 分钟，最小 1 分钟，最大 1440 分钟（24 小时）
 	LibraryScanIncrementalMinutes int `mapstructure:"library_scan_incremental_minutes"`
@@ -76,33 +71,28 @@ type Config struct {
 
 // Global 全局配置实例
 var Global = &Config{
-	ListenAddr:     ":28005",
-	TargetAddr:     "http://127.0.0.1:8005",
-	LogLevel:       "info",
-	LogDir:         "./logs",
-	CacheTTL:       30 * time.Minute, // 默认 30 分钟（配合智能签名 TTL，避免缓存过期晚于签名过期）
-	DashboardAddr:  ":28006",
-	DashboardUser:  "admin",
-	DashboardPass:  "admin",
-	MaxCacheItems:  10000,
-	StrmPaths:      []string{"/vol00"},
-	StrmVolumes:    []string{"/vol00:/vol00:ro"},
+	ListenAddr:      ":28005",
+	TargetAddr:      "http://127.0.0.1:8005",
+	LogLevel:        "info",
+	LogDir:          "./logs",
+	CacheTTL:        30 * time.Minute, // 默认 30 分钟（配合智能签名 TTL，避免缓存过期晚于签名过期）
+	DashboardAddr:   ":28006",
+	DashboardUser:   "admin",
+	DashboardPass:   "admin",
+	MaxCacheItems:   10000,
+	StrmPaths:       []string{"/vol00"},
+	StrmVolumes:     []string{"/vol00:/vol00:ro"},
 	StrmResolveMode: "auto", // 默认智能模式
-	EnableLanStrm:  true,    // 默认支持内网 strm
-	EnablePreload:  true,    // 默认启用预加载
-	EnableSmartTTL: true,    // 默认启用智能签名 TTL
+	EnableLanStrm:   true,   // 默认支持内网 strm
+	EnablePreload:   true,   // 默认启用预加载
+	EnableSmartTTL:  true,   // 默认启用智能签名 TTL
 	EnableCDNWarmup: true,   // 默认启用 CDN 预热
-	// 海报墙预取默认关闭（需用户确认后开启，避免意外流量）
-	EnablePosterPrefetch:      false,
-	PosterPrefetchConcurrency: 4,
-	PosterPrefetchMaxItems:    50,
 	// 全库扫描默认关闭（需用户确认后开启）
 	EnableLibraryScan:       false,
 	LibraryScanCron:         "03:00",
 	LibraryScanOnStart:      false,
 	LibraryScanConcurrency:  2,
 	LibraryScanIntervalMs:   500,
-	LibraryScanEpisodeCount: 5,
 	// ✅ 增量扫描间隔默认 5 分钟
 	LibraryScanIncrementalMinutes: 5,
 	// ✅ Webhook 通知默认值
@@ -142,17 +132,12 @@ func Load(configPath string) error {
 	viper.SetDefault("enable_preload", true)
 	viper.SetDefault("enable_smart_ttl", true)
 	viper.SetDefault("enable_cdn_warmup", true)
-	// 海报墙预取
-	viper.SetDefault("enable_poster_prefetch", false)
-	viper.SetDefault("poster_prefetch_concurrency", 4)
-	viper.SetDefault("poster_prefetch_max_items", 50)
 	// 全库扫描预取
 	viper.SetDefault("enable_library_scan", false)
 	viper.SetDefault("library_scan_cron", "03:00")
 	viper.SetDefault("library_scan_on_start", false)
 	viper.SetDefault("library_scan_concurrency", 2)
 	viper.SetDefault("library_scan_interval_ms", 500)
-	viper.SetDefault("library_scan_episode_count", 5)
 	// ✅ 增量扫描间隔
 	viper.SetDefault("library_scan_incremental_minutes", 5)
 	// ✅ Webhook 通知
@@ -453,33 +438,6 @@ func (c *Config) GetEnableCDNWarmup() bool {
 	return c.EnableCDNWarmup
 }
 
-// GetEnablePosterPrefetch 获取是否启用海报墙预取
-func (c *Config) GetEnablePosterPrefetch() bool {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-	return c.EnablePosterPrefetch
-}
-
-// GetPosterPrefetchConcurrency 获取海报墙预取并发数
-func (c *Config) GetPosterPrefetchConcurrency() int {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-	if c.PosterPrefetchConcurrency < 1 {
-		return 4
-	}
-	return c.PosterPrefetchConcurrency
-}
-
-// GetPosterPrefetchMaxItems 获取海报墙预取单次上限
-func (c *Config) GetPosterPrefetchMaxItems() int {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-	if c.PosterPrefetchMaxItems < 1 {
-		return 50
-	}
-	return c.PosterPrefetchMaxItems
-}
-
 // GetEnableLibraryScan 获取是否启用全库扫描
 func (c *Config) GetEnableLibraryScan() bool {
 	c.mutex.RLock()
@@ -521,17 +479,7 @@ func (c *Config) GetLibraryScanIntervalMs() int {
 	return c.LibraryScanIntervalMs
 }
 
-// GetLibraryScanEpisodeCount 获取每季预取前N集
-func (c *Config) GetLibraryScanEpisodeCount() int {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-	if c.LibraryScanEpisodeCount < 1 {
-		return 5
-	}
-	return c.LibraryScanEpisodeCount
-}
-
-// ✅ 新增：GetLibraryScanIncrementalMinutes 获取增量扫描间隔（分钟）
+// GetLibraryScanIncrementalMinutes 获取增量扫描间隔（分钟）
 // 默认 5 分钟，最小 1 分钟，最大 1440 分钟（24 小时）
 func (c *Config) GetLibraryScanIncrementalMinutes() int {
 	c.mutex.RLock()
@@ -567,7 +515,7 @@ func (c *Config) GetWebhookNotifyDelaySeconds() int {
 	return c.WebhookNotifyDelaySeconds
 }
 
-// ✅ 新增：GetEnableDoubanRating 获取是否启用豆瓣评分
+// GetEnableDoubanRating 获取是否启用豆瓣评分
 // 默认 true
 func (c *Config) GetEnableDoubanRating() bool {
 	c.mutex.RLock()
@@ -777,21 +725,6 @@ func (c *Config) UpdateConfigWithStatus(updates map[string]interface{}) (bool, e
 					log.Printf("🔄 检测到CDN预热开关变更: %v（热重载生效）", v)
 				}
 			}
-		case "enable_poster_prefetch":
-			if v, ok := value.(bool); ok {
-				if c.EnablePosterPrefetch != v {
-					c.EnablePosterPrefetch = v
-					log.Printf("🔄 检测到海报墙预取开关变更: %v（热重载生效）", v)
-				}
-			}
-		case "poster_prefetch_concurrency":
-			if v := toInt(value); v >= 1 && v <= 20 {
-				c.PosterPrefetchConcurrency = v
-			}
-		case "poster_prefetch_max_items":
-			if v := toInt(value); v >= 1 && v <= 500 {
-				c.PosterPrefetchMaxItems = v
-			}
 		case "enable_library_scan":
 			if v, ok := value.(bool); ok {
 				if c.EnableLibraryScan != v {
@@ -816,11 +749,7 @@ func (c *Config) UpdateConfigWithStatus(updates map[string]interface{}) (bool, e
 			if v := toInt(value); v >= 0 && v <= 60000 {
 				c.LibraryScanIntervalMs = v
 			}
-		case "library_scan_episode_count":
-			if v := toInt(value); v >= 1 && v <= 50 {
-				c.LibraryScanEpisodeCount = v
-			}
-		// ✅ 新增：增量扫描间隔
+		// ✅ 增量扫描间隔
 		case "library_scan_incremental_minutes":
 			if v := toInt(value); v >= 1 && v <= 1440 {
 				if c.LibraryScanIncrementalMinutes != v {
@@ -847,7 +776,7 @@ func (c *Config) UpdateConfigWithStatus(updates map[string]interface{}) (bool, e
 					log.Printf("🔄 检测到 Webhook 延迟变更: %d 秒（热重载生效）", v)
 				}
 			}
-		// ✅ 新增：豆瓣评分开关
+		// ✅ 豆瓣评分开关
 		case "enable_douban_rating":
 			if v, ok := value.(bool); ok {
 				if c.EnableDoubanRating != v {
@@ -958,7 +887,6 @@ func validateConfigUpdates(updates map[string]interface{}) error {
 					return fmt.Errorf("strm_resolve_mode 必须是 auto/passthrough/always 之一（当前: %s）", v)
 				}
 			}
-		// ✅ 新增：增量扫描间隔校验
 		case "library_scan_incremental_minutes":
 			if v := toInt(value); v < 1 || v > 1440 {
 				return fmt.Errorf("library_scan_incremental_minutes 必须在 1-1440 分钟之间（当前: %d）", v)
@@ -1059,17 +987,12 @@ func (c *Config) saveConfigLocked() error {
 	viper.Set("enable_preload", c.EnablePreload)
 	viper.Set("enable_smart_ttl", c.EnableSmartTTL)
 	viper.Set("enable_cdn_warmup", c.EnableCDNWarmup)
-	// 海报墙预取
-	viper.Set("enable_poster_prefetch", c.EnablePosterPrefetch)
-	viper.Set("poster_prefetch_concurrency", c.PosterPrefetchConcurrency)
-	viper.Set("poster_prefetch_max_items", c.PosterPrefetchMaxItems)
 	// 全库扫描预取
 	viper.Set("enable_library_scan", c.EnableLibraryScan)
 	viper.Set("library_scan_cron", c.LibraryScanCron)
 	viper.Set("library_scan_on_start", c.LibraryScanOnStart)
 	viper.Set("library_scan_concurrency", c.LibraryScanConcurrency)
 	viper.Set("library_scan_interval_ms", c.LibraryScanIntervalMs)
-	viper.Set("library_scan_episode_count", c.LibraryScanEpisodeCount)
 	// ✅ 增量扫描间隔
 	viper.Set("library_scan_incremental_minutes", c.LibraryScanIncrementalMinutes)
 	// ✅ Webhook 通知
@@ -1158,17 +1081,12 @@ func (c *Config) ToMap() map[string]interface{} {
 		"enable_preload":    c.EnablePreload,
 		"enable_smart_ttl":  c.EnableSmartTTL,
 		"enable_cdn_warmup": c.EnableCDNWarmup,
-		// 海报墙预取
-		"enable_poster_prefetch":      c.EnablePosterPrefetch,
-		"poster_prefetch_concurrency": c.PosterPrefetchConcurrency,
-		"poster_prefetch_max_items":   c.PosterPrefetchMaxItems,
 		// 全库扫描预取
 		"enable_library_scan":        c.EnableLibraryScan,
 		"library_scan_cron":          c.LibraryScanCron,
 		"library_scan_on_start":      c.LibraryScanOnStart,
 		"library_scan_concurrency":   c.LibraryScanConcurrency,
 		"library_scan_interval_ms":   c.LibraryScanIntervalMs,
-		"library_scan_episode_count": c.LibraryScanEpisodeCount,
 		// ✅ 增量扫描间隔
 		"library_scan_incremental_minutes": c.LibraryScanIncrementalMinutes,
 		// ✅ Webhook 通知
@@ -1356,15 +1274,11 @@ enable_lan_strm: true
 enable_preload: true
 enable_smart_ttl: true
 enable_cdn_warmup: true
-enable_poster_prefetch: false
-poster_prefetch_concurrency: 4
-poster_prefetch_max_items: 50
 enable_library_scan: false
 library_scan_cron: "03:00"
 library_scan_on_start: false
 library_scan_concurrency: 2
 library_scan_interval_ms: 500
-library_scan_episode_count: 5
 library_scan_incremental_minutes: 5
 webhook_notify_token: ""
 webhook_notify_delay_seconds: 15
