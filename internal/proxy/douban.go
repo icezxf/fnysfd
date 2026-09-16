@@ -259,7 +259,7 @@ func (dp *DoubanProvider) FetchSeason(ctx context.Context, seriesName string, se
 	rating, err := dp.searchSeasonRating(ctx, seriesName, seasonNumber)
 	if err != nil || rating <= 0 {
 		dp.statFailed.Add(1)
-		dp.server.logger.Debug("%s ❌ 季 %s 第%d季 未匹配", doubanLogPrefix, seriesName, seasonNumber)
+		dp.server.logger.Debug("%s ❌ 季 %s 第%d季 未匹配 (%v)", doubanLogPrefix, seriesName, seasonNumber, err)
 		return
 	}
 
@@ -484,6 +484,11 @@ func (dp *DoubanProvider) getTVRatingByImdb(ctx context.Context, imdbID string) 
 	return results[0].Rating, nil
 }
 
+// ============================================================
+// searchByTitle —— 按标题搜索（不带季）
+//
+// 注意：豆瓣 suggest 接口对剧集也返回 type="movie"，不能按 type 过滤。
+// ============================================================
 func (dp *DoubanProvider) searchByTitle(ctx context.Context, name string, year int, itemType string) (float64, error) {
 	dp.globalRateLimit(ctx)
 
@@ -513,16 +518,10 @@ func (dp *DoubanProvider) searchByTitle(ctx context.Context, name string, year i
 		return 0, fmt.Errorf("no results")
 	}
 
-	wantType := "movie"
-	if itemType == "Series" {
-		wantType = "tv"
-	}
-
+	// ✅ 不再按 Type 过滤（豆瓣 suggest 全部返回 "movie"）
+	// 改为按年份匹配
 	var matchedID string
 	for _, r := range results {
-		if r.Type != wantType {
-			continue
-		}
 		rYear, _ := strconv.Atoi(r.Year)
 		if year > 0 && rYear > 0 && absInt(year-rYear) > 1 {
 			continue
@@ -537,11 +536,35 @@ func (dp *DoubanProvider) searchByTitle(ctx context.Context, name string, year i
 	return dp.fetchRatingByDoubanID(ctx, matchedID)
 }
 
+// ============================================================
+// searchSeasonRating —— 季评分搜索（两段式）
+//
+// 第一段：搜「剧名 + 第N季」（美剧场景，每季独立条目）
+// 第二段：搜「剧名」兜底（国产剧场景，整剧只有一条目，无季的概念）
+// ============================================================
 func (dp *DoubanProvider) searchSeasonRating(ctx context.Context, seriesName string, seasonNumber int) (float64, error) {
-	dp.globalRateLimit(ctx)
-
 	seasonStr := seasonNumberToChinese(seasonNumber)
-	keyword := seriesName + " " + seasonStr
+
+	// 第一段：带季名搜（美剧场景）
+	if rating, err := dp.searchSeasonByName(ctx, seriesName+" "+seasonStr, seriesName, seasonStr); err == nil {
+		return rating, nil
+	}
+
+	// 第二段：只搜剧名兜底（国产剧场景）
+	// 只有当整剧条目没有带季名时才算命中，避免美剧拿错季
+	if rating, err := dp.searchSeasonByName(ctx, seriesName, seriesName, ""); err == nil {
+		return rating, nil
+	}
+
+	return 0, fmt.Errorf("no season match")
+}
+
+// searchSeasonByName 搜一次，按 title 过滤
+//
+// seasonSuffix 为空 → 兜底模式：只匹配「不带季名的整剧条目」（normalize 后完全相等）
+// seasonSuffix 非空 → 季模式：title 必须同时包含季名和剧名
+func (dp *DoubanProvider) searchSeasonByName(ctx context.Context, keyword, seriesName, seasonSuffix string) (float64, error) {
+	dp.globalRateLimit(ctx)
 
 	searchURL := "https://movie.douban.com/j/subject_suggest?q=" + url.QueryEscape(keyword)
 	req, err := http.NewRequestWithContext(ctx, "GET", searchURL, nil)
@@ -565,21 +588,34 @@ func (dp *DoubanProvider) searchSeasonRating(ctx context.Context, seriesName str
 	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
 		return 0, err
 	}
+	if len(results) == 0 {
+		return 0, fmt.Errorf("no results")
+	}
 
 	normalizedSeries := normalizeTitle(seriesName)
+
 	for _, r := range results {
-		if r.Type != "tv" {
-			continue
+		// ✅ 不再过滤 r.Type（豆瓣 suggest 全部返回 movie）
+
+		if seasonSuffix != "" {
+			// 季模式：title 必须含季名 + 剧名
+			if !strings.Contains(r.Title, seasonSuffix) {
+				continue
+			}
+			if !strings.Contains(normalizeTitle(r.Title), normalizedSeries) {
+				continue
+			}
+			return dp.fetchRatingByDoubanID(ctx, r.ID)
 		}
-		if !strings.Contains(r.Title, seasonStr) {
-			continue
-		}
-		if !strings.Contains(normalizeTitle(r.Title), normalizedSeries) {
+
+		// 兜底模式：normalize 后完全相等（避免命中「XXX 第N季」）
+		if normalizeTitle(r.Title) != normalizedSeries {
 			continue
 		}
 		return dp.fetchRatingByDoubanID(ctx, r.ID)
 	}
-	return 0, fmt.Errorf("no season match")
+
+	return 0, fmt.Errorf("no match")
 }
 
 func (dp *DoubanProvider) fetchRatingByDoubanID(ctx context.Context, doubanID string) (float64, error) {
