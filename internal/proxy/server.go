@@ -53,6 +53,9 @@ type Server struct {
 	libraryScanner  *LibraryScanner
 	doubanProvider  *DoubanProvider // ✅ 新增
 
+	// ✅ TV guid → title 缓存（季列表注入需要）
+	seriesTitleCache sync.Map
+
 	// 服务级 context：Stop 时取消，用于中断内部长任务
 	serverCtx    context.Context
 	serverCancel context.CancelFunc
@@ -459,7 +462,8 @@ func (s *Server) shouldInjectNative(path string) bool {
 // type 说明：
 //   - "Movie"          → 用 IMDb 查电影评分
 //   - "Series" / "TV"  → 剧集，用 number_of_seasons / season_number 查最新季豆瓣分
-//   - "Season"         → 用 parent_title + season_number 查季分
+//                       同时缓存 guid → title（供季列表注入用）
+//   - "Season"         → 用 tv_title（剧名）+ season_number 查季分
 func (s *Server) injectDoubanNative(body []byte) []byte {
 	defer func() {
 		if r := recover(); r != nil {
@@ -485,6 +489,13 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 	imdbID, _ := data["imdb_id"].(string)
 	title, _ := data["title"].(string)
 	itemType, _ := data["type"].(string)
+
+	// ✅ 缓存 TV guid → title（供季列表注入用）
+	if itemType == "TV" || itemType == "Series" {
+		if guid, ok := data["guid"].(string); ok && guid != "" && title != "" {
+			s.seriesTitleCache.Store(guid, title)
+		}
+	}
 
 	var rating float64
 	var found bool
@@ -514,8 +525,12 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 		}
 
 	case "Season":
-		// 季：用 parent_title（剧名）+ season_number
-		seriesName, _ := data["parent_title"].(string)
+		// ✅ 剧名在 tv_title（飞牛的 parent_title 是空字符串）
+		seriesName, _ := data["tv_title"].(string)
+		if seriesName == "" {
+			// 兜底：万一某些接口用 parent_title
+			seriesName, _ = data["parent_title"].(string)
+		}
 		seasonNum := 0
 		if n, ok := data["season_number"].(float64); ok {
 			seasonNum = int(n)
@@ -557,7 +572,7 @@ func (s *Server) shouldInjectNativeList(path string) bool {
 // type 说明（与详情页一致）：
 //   - "Movie"          → 用 IMDb 查电影评分
 //   - "Series" / "TV"  → 剧集，用 number_of_seasons / season_number 查最新季豆瓣分
-//   - "Season"         → 用 parent_title + season_number 查季分
+//   - "Season"         → 用 tv_title（剧名）+ season_number 查季分
 func (s *Server) injectDoubanNativeList(body []byte) []byte {
 	defer func() {
 		if r := recover(); r != nil {
@@ -622,7 +637,11 @@ func (s *Server) injectDoubanNativeList(body []byte) []byte {
 			}
 
 		case "Season":
-			seriesName, _ := item["parent_title"].(string)
+			// ✅ 剧名在 tv_title（飞牛的 parent_title 是空字符串）
+			seriesName, _ := item["tv_title"].(string)
+			if seriesName == "" {
+				seriesName, _ = item["parent_title"].(string)
+			}
 			seasonNum := 0
 			if n, ok := item["season_number"].(float64); ok {
 				seasonNum = int(n)
@@ -646,6 +665,108 @@ func (s *Server) injectDoubanNativeList(body []byte) []byte {
 	}
 
 	s.logger.Debug("🎬 [豆瓣评分] 原生列表注入: %d 项", injected)
+
+	newBody, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return newBody
+}
+
+// ============================================================
+// ✅ 飞牛原生季列表接口注入（/v/api/v1/season/list/{TV_guid}）
+//    TV 详情页下方横排的季小海报走这里
+//
+// 响应结构：{ "code":0, "data": [ {..season..}, ... ] }
+//    注意：data 是数组，不是 {list: []}
+//
+// 剧名获取：响应里 tv_title / parent_title 都为空，只能靠 parent_guid
+//           从 seriesTitleCache（TV 详情页注入时缓存）反查
+// ============================================================
+
+// shouldInjectNativeSeasonList 判断是否飞牛原生季列表接口
+func (s *Server) shouldInjectNativeSeasonList(path string) bool {
+	const prefix = "/v/api/v1/season/list/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	rest := path[len(prefix):]
+	// 必须正好是一个 32 位 GUID
+	return rest != "" && !strings.Contains(rest, "/") && len(rest) == 32
+}
+
+// injectDoubanNativeSeasonList 注入豆瓣评分到飞牛原生季列表响应
+func (s *Server) injectDoubanNativeSeasonList(body []byte) []byte {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Warn("🎬 [豆瓣评分] 原生季列表注入 panic: %v", r)
+		}
+	}()
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+
+	if code, ok := payload["code"].(float64); ok && code != 0 {
+		return body
+	}
+
+	// ✅ 注意：data 直接是数组
+	list, ok := payload["data"].([]interface{})
+	if !ok || len(list) == 0 {
+		return body
+	}
+
+	injected := 0
+	for _, it := range list {
+		item, ok := it.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		itemType, _ := item["type"].(string)
+		if itemType != "Season" {
+			continue
+		}
+
+		seasonNum := 0
+		if n, ok := item["season_number"].(float64); ok {
+			seasonNum = int(n)
+		}
+		if seasonNum <= 0 {
+			continue
+		}
+
+		// 剧名：从 parent_guid 反查缓存
+		parentGUID, _ := item["parent_guid"].(string)
+		if parentGUID == "" {
+			continue
+		}
+		titleVal, ok := s.seriesTitleCache.Load(parentGUID)
+		if !ok {
+			continue
+		}
+		seriesName, _ := titleVal.(string)
+		if seriesName == "" {
+			continue
+		}
+
+		rating, found := s.doubanProvider.GetSeasonRating(seriesName, seasonNum)
+		if !found || rating <= 0 {
+			continue
+		}
+
+		// ✅ vote_average 是字符串，保持类型
+		item["vote_average"] = fmt.Sprintf("%.1f", rating)
+		injected++
+	}
+
+	if injected == 0 {
+		return body
+	}
+
+	s.logger.Debug("🎬 [豆瓣评分] 原生季列表注入: %d 项", injected)
 
 	newBody, err := json.Marshal(payload)
 	if err != nil {
@@ -687,6 +808,26 @@ func (s *Server) handleResponse(resp *http.Response) error {
 			if err == nil && len(body) > 0 {
 				resp.Body.Close()
 				newBody := s.injectDoubanNativeList(body)
+				resp.Body = io.NopCloser(bytes.NewBuffer(newBody))
+				resp.ContentLength = int64(len(newBody))
+				resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
+				resp.Header.Del("Transfer-Encoding")
+				return nil
+			}
+		}
+	}
+
+	// ============================================================
+	// ✅ 飞牛原生季列表接口注入：/v/api/v1/season/list/{TV_guid}
+	//    TV 详情页下方横排的季小海报走这里
+	// ============================================================
+	if s.doubanProvider != nil && resp.StatusCode == http.StatusOK && resp.Request != nil {
+		seasonListPath := resp.Request.URL.Path
+		if s.shouldInjectNativeSeasonList(seasonListPath) {
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+			if err == nil && len(body) > 0 {
+				resp.Body.Close()
+				newBody := s.injectDoubanNativeSeasonList(body)
 				resp.Body = io.NopCloser(bytes.NewBuffer(newBody))
 				resp.ContentLength = int64(len(newBody))
 				resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
