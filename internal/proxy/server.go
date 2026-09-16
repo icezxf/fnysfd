@@ -523,7 +523,17 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 			// 兜底：IMDb 查整剧（当前缓存里可能没有）
 			rating, found = s.doubanProvider.GetRating(imdbID, title, 0)
 		}
-
+		// ✅ TV 详情页前端不渲染 vote_average，把评分附加到 content_ratings
+		if found && rating > 0 {
+			if cr, ok := data["content_ratings"].(string); ok && !strings.Contains(cr, "⭐") {
+				if cr == "" {
+					data["content_ratings"] = fmt.Sprintf("⭐%.1f", rating)
+				} else {
+					data["content_ratings"] = fmt.Sprintf("%s · ⭐%.1f", cr, rating)
+				}
+			}
+		}
+		
 	case "Season":
 		// ✅ 剧名在 tv_title（飞牛的 parent_title 是空字符串）
 		seriesName, _ := data["tv_title"].(string)
