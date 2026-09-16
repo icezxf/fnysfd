@@ -534,7 +534,7 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 				}
 			}
 		}
-		
+
 	case "Season":
 		// ✅ 剧名在 tv_title（飞牛的 parent_title 是空字符串）
 		seriesName, _ := data["tv_title"].(string)
@@ -791,8 +791,9 @@ func (s *Server) handleResponse(resp *http.Response) error {
 	// ============================================================
 	// ✅ 飞牛原生详情接口注入：/v/api/v1/item/{guid}
 	//    放在最前面，避免 resp.Body 被后续逻辑消费
+	//    ✅ 加 config.Global.GetEnableDoubanRating() 判断，开关关闭时跳过
 	// ============================================================
-	if s.doubanProvider != nil && resp.StatusCode == http.StatusOK && resp.Request != nil {
+	if s.doubanProvider != nil && config.Global.GetEnableDoubanRating() && resp.StatusCode == http.StatusOK && resp.Request != nil {
 		nativePath := resp.Request.URL.Path
 		if s.shouldInjectNative(nativePath) {
 			body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
@@ -811,8 +812,9 @@ func (s *Server) handleResponse(resp *http.Response) error {
 	// ============================================================
 	// ✅ 飞牛原生列表接口注入：/v/api/v1/item/list
 	//    海报墙评分（左上角数字）走这里
+	//    ✅ 加 config.Global.GetEnableDoubanRating() 判断，开关关闭时跳过
 	// ============================================================
-	if s.doubanProvider != nil && resp.StatusCode == http.StatusOK && resp.Request != nil {
+	if s.doubanProvider != nil && config.Global.GetEnableDoubanRating() && resp.StatusCode == http.StatusOK && resp.Request != nil {
 		listPath := resp.Request.URL.Path
 		if s.shouldInjectNativeList(listPath) {
 			body, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
@@ -831,8 +833,9 @@ func (s *Server) handleResponse(resp *http.Response) error {
 	// ============================================================
 	// ✅ 飞牛原生季列表接口注入：/v/api/v1/season/list/{TV_guid}
 	//    TV 详情页下方横排的季小海报走这里
+	//    ✅ 加 config.Global.GetEnableDoubanRating() 判断，开关关闭时跳过
 	// ============================================================
-	if s.doubanProvider != nil && resp.StatusCode == http.StatusOK && resp.Request != nil {
+	if s.doubanProvider != nil && config.Global.GetEnableDoubanRating() && resp.StatusCode == http.StatusOK && resp.Request != nil {
 		seasonListPath := resp.Request.URL.Path
 		if s.shouldInjectNativeSeasonList(seasonListPath) {
 			body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
@@ -850,8 +853,9 @@ func (s *Server) handleResponse(resp *http.Response) error {
 
 	// ============================================================
 	// ✅ 豆瓣评分注入：拦截 /Items 响应（Emby 协议，列表或详情）
+	//    ✅ 加 config.Global.GetEnableDoubanRating() 判断，开关关闭时跳过
 	// ============================================================
-	if s.doubanProvider != nil && resp.StatusCode == http.StatusOK && resp.Request != nil {
+	if s.doubanProvider != nil && config.Global.GetEnableDoubanRating() && resp.StatusCode == http.StatusOK && resp.Request != nil {
 		path := resp.Request.URL.Path
 		if strings.Contains(path, "/Items") && !strings.Contains(path, "/PlaybackInfo") {
 			body, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
