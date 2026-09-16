@@ -11,23 +11,18 @@ const loginHTML = `<!DOCTYPE html>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;background:#f4f4f5;display:flex;align-items:center;justify-content:center;color:#18181b}
-/* 登录卡片：白底 + 圆角 + 微妙阴影 */
 .wrap{width:360px;background:#fff;padding:40px;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,.08),0 4px 12px rgba(0,0,0,.04)}
 .brand{text-align:center;margin-bottom:32px}
 .brand h1{font-size:20px;font-weight:600;color:#18181b;letter-spacing:.5px}
 .brand .sub{font-size:14px;color:#71717a;margin-top:6px}
-/* 标题下方蓝色分隔线 */
 .brand-divider{width:32px;height:1px;background:#2563eb;margin:12px auto}
 .form-group{margin-bottom:20px}
-/* 输入框：底部 1px 边框，聚焦时通过 inset shadow 视觉加粗为 2px */
 .form-group input{width:100%;height:36px;border:none;border-bottom:1px solid #e4e4e7;background:transparent;font-size:14px;color:#18181b;font-family:inherit;padding:0 2px;transition:all .15s ease}
 .form-group input:focus{outline:none;border-bottom-color:#2563eb;box-shadow:inset 0 -1px 0 #2563eb}
 .form-group input::placeholder{color:#a1a1aa}
 .btn{width:100%;height:36px;background:#2563eb;color:#fff;border:none;border-radius:4px;font-size:14px;font-weight:500;cursor:pointer;font-family:inherit;transition:all .15s ease}
 .btn:hover{background:#1d4ed8;transform:translateY(-1px);box-shadow:0 2px 4px rgba(0,0,0,.06)}
 .err{color:#dc2626;text-align:center;margin-top:12px;font-size:13px;display:none}
-
-/* 移动端响应式：登录卡片宽度改为 90%，padding 减小 */
 @media (max-width:768px){
 .wrap{width:90%;padding:24px}
 .brand{margin-bottom:24px}
@@ -61,10 +56,8 @@ ev.preventDefault();
 var u=document.getElementById('username').value.trim();
 var p=document.getElementById('password').value;
 if(!u||!p){showErr('请输入用户名和密码');return}
-// 不使用 loading 状态，保持简单
 fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify({username:u,password:p})})
 .then(function(r){
-// 先检查 HTTP 状态，避免响应非 JSON 时 r.json() 抛异常
 if(!r.ok){showErr('登录请求失败（HTTP '+r.status+'）');return null}
 return r.json();
 })
@@ -80,7 +73,7 @@ else{showErr(d.message||'登录失败')}
 </body>
 </html>`
 
-// indexHTML 主界面（极简风格，参考 Linear/Vercel 设计语言，细节质感优化）
+// indexHTML 主界面
 const indexHTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -106,39 +99,31 @@ const indexHTML = `<!DOCTYPE html>
 html,body{height:100%}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.5}
 
-/* 滚动条样式：6px 宽 + 灰色圆角 */
 ::-webkit-scrollbar{width:6px;height:6px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:#d4d4d8;border-radius:3px}
 ::-webkit-scrollbar-thumb:hover{background:#a1a1aa}
 
-/* 侧边栏：固定 200px，深色背景 */
 .sidebar{position:fixed;left:0;top:0;bottom:0;width:200px;background:var(--sidebar-bg);display:flex;flex-direction:column;z-index:100}
-/* logo 区域：底部 1px 边框分隔 */
 .sidebar-logo{padding:20px 16px;color:#fff;font-size:16px;font-weight:600;letter-spacing:.5px;border-bottom:1px solid #27272a}
 .sidebar-nav{flex:1;padding:8px 0}
-/* 导航项：10px 16px 内边距，2px 间距 */
 .nav-item{display:block;padding:10px 16px;color:#a1a1aa;font-size:14px;cursor:pointer;user-select:none;border-left:2px solid transparent;transition:all .15s ease;margin:2px 0}
 .nav-item:hover{color:#fff;background:rgba(255,255,255,.03)}
 .nav-item.active{color:#fff;border-left-color:var(--primary);background:rgba(255,255,255,.05)}
 .sidebar-footer{padding:8px 0}
 .nav-item.danger:hover{color:#f87171}
 
-/* 主内容区：白色背景，padding 32px */
 .main{margin-left:200px;min-height:100vh}
 .topbar{display:flex;align-items:center;justify-content:space-between;padding:24px 32px 0}
 .topbar .title{font-size:20px;font-weight:600;color:var(--text)}
 .topbar .right{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-muted)}
-/* 状态点：呼吸动画 */
 .status-dot{width:8px;height:8px;border-radius:50%;background:var(--success);display:inline-block;animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
 .content{padding:24px 32px 32px}
 
-/* 通用卡片：白底 + 1px 边框 + 6px 圆角 */
 .card{background:#fff;border:1px solid var(--border);border-radius:6px;padding:20px;margin-bottom:16px;transition:all .15s ease}
 .card-title{font-size:16px;font-weight:600;color:var(--text);margin-bottom:16px}
 
-/* 概览：4 个统计卡片，2x2 网格，顶部 3px 彩色边框 */
 .stats-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-bottom:16px}
 .stat-card{background:#fff;border:1px solid var(--border);border-top:3px solid var(--border);border-radius:6px;padding:20px;transition:all .15s ease}
 .stat-card:hover{border-color:#d4d4d8}
@@ -146,45 +131,36 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Ar
 .stat-card.stat-green{border-top-color:#16a34a}
 .stat-card.stat-purple{border-top-color:#9333ea}
 .stat-card.stat-orange{border-top-color:#ea580c}
-/* 数字：等宽数字 tabular-nums */
 .stat-card .num{font-size:28px;font-weight:700;color:#18181b;line-height:1.2;font-variant-numeric:tabular-nums}
 .stat-card .lbl{font-size:13px;color:#71717a;margin-top:4px}
 
-/* 系统信息 / 缓存详情：flex 行，底部虚线分隔 */
 .sys-row{display:flex;align-items:center;height:40px;border-bottom:1px dashed var(--border)}
 .sys-row:last-child{border-bottom:none}
 .sys-row .k{font-size:13px;color:#71717a;width:140px;flex-shrink:0}
 .sys-row .v{font-size:14px;color:#18181b;flex:1;word-break:break-all;font-variant-numeric:tabular-nums}
 .card-actions{display:flex;justify-content:flex-end;margin-top:16px}
 
-/* 配置表单：分组标题左侧 3px 蓝色竖线 */
 .form-group-title{font-size:15px;font-weight:600;color:var(--text);margin-bottom:16px;border-left:3px solid var(--primary);padding-left:8px}
 .form-item{margin-bottom:16px}
 .form-item>label{display:block;font-size:13px;color:#71717a;margin-bottom:6px}
 .form-item>label.switch{display:inline-flex;margin-bottom:0}
 .form-item input[type="text"],.form-item input[type="number"],.form-item input[type="password"],.form-item select{width:100%;height:32px;border:1px solid var(--border);border-radius:4px;padding:0 8px;font-size:14px;color:#18181b;background:#fff;font-family:inherit;transition:all .15s ease}
-/* 聚焦：蓝色边框 + 微妙外发光 */
 .form-item input[type="text"]:focus,.form-item input[type="number"]:focus,.form-item input[type="password"]:focus,.form-item select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
 .form-item .hint{font-size:12px;color:#a1a1aa;margin-top:4px}
 .form-actions{display:flex;justify-content:flex-end;margin-top:16px}
-/* 保存按钮：圆角 6px */
 .form-actions .btn{border-radius:6px}
 
-/* 按钮：4px 圆角，hover 微微上浮 + 阴影 */
 .btn{height:36px;padding:0 16px;border:none;border-radius:4px;font-size:14px;font-weight:500;cursor:pointer;font-family:inherit;transition:all .15s ease}
 .btn-primary{background:var(--primary);color:#fff}
 .btn-primary:hover{background:var(--primary-hover);transform:translateY(-1px);box-shadow:0 2px 4px rgba(0,0,0,.06)}
 .btn-text{background:transparent;border:none;color:var(--text-muted);font-size:14px;cursor:pointer;padding:0;font-family:inherit;transition:all .15s ease}
 .btn-text:hover{color:var(--text)}
 .btn-text.danger{color:var(--danger)}
-/* 删除按钮 hover：文字加粗 */
 .btn-text.danger:hover{color:#b91c1c;font-weight:600}
 
-/* 路径管理 */
 .notice{background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;padding:12px;font-size:13px;color:#9a3412;margin-bottom:16px;line-height:1.6}
 .notice code{font-family:"SF Mono",Monaco,"Cascadia Code","Roboto Mono",Consolas,monospace;background:#fff;color:#9a3412;padding:1px 5px;border-radius:3px;border:1px solid #fed7aa}
 .path-item{display:flex;align-items:center;justify-content:space-between;background:#fff;border:1px solid var(--border);border-radius:6px;padding:12px 16px;margin-bottom:8px;gap:12px;transition:all .15s ease}
-/* Volume 列表项 hover：浅灰背景 */
 .path-item:hover{background:#fafafa}
 .path-item .paths{font-family:"SF Mono",Monaco,"Cascadia Code","Roboto Mono",Consolas,monospace;font-size:13px;color:var(--text);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .path-item .paths .arrow{color:var(--text-muted);margin:0 8px}
@@ -192,21 +168,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Ar
 .add-form{display:flex;gap:12px;align-items:flex-end}
 .add-form .form-item{flex:1;margin-bottom:0}
 
-/* 日志 */
-/* 工具栏：底部 1px 边框分隔 */
 .log-toolbar{display:flex;align-items:center;gap:16px;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border)}
 .log-toolbar .spacer{flex:1}
-/* 精致 toggle 开关样式 */
-/* 用 .switch-list .switch 提高特异性，避免被 .form-item label 的 display:block 覆盖 */
 .switch,.switch-list .switch{position:relative;display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--text-muted);cursor:pointer;user-select:none;margin-bottom:0}
 .switch input,.switch-list .switch input{position:absolute;opacity:0;width:0;height:0;margin:0}
 .switch .track,.switch-list .switch .track{width:32px;height:18px;background:#d4d4d8;border-radius:9px;position:relative;transition:background .15s ease;flex-shrink:0}
 .switch .track::after,.switch-list .switch .track::after{content:'';position:absolute;top:2px;left:2px;width:14px;height:14px;background:#fff;border-radius:50%;transition:transform .15s ease;box-shadow:0 1px 2px rgba(0,0,0,.2)}
 .switch input:checked + .track,.switch-list .switch input:checked + .track{background:var(--primary)}
 .switch input:checked + .track::after,.switch-list .switch input:checked + .track::after{transform:translateX(14px)}
-/* 开关列表容器 - 垂直排列多个开关 */
 .switch-list{display:flex;flex-direction:column;gap:10px;padding:4px 0}
-/* 日志区：自适应高度 + 滚动 */
 .log-view{background:#0a0a0a;color:#e4e4e7;border-radius:6px;padding:16px;font-family:"SF Mono",Monaco,"Cascadia Code","Roboto Mono",Consolas,monospace;font-size:12px;line-height:1.6;max-height:calc(100vh - 280px);overflow-y:auto;white-space:pre-wrap;word-break:break-all}
 .log-view::-webkit-scrollbar-thumb{background:#3f3f46}
 .log-view::-webkit-scrollbar-thumb:hover{background:#52525b}
@@ -216,56 +186,70 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Ar
 .log-view .lv-debug{color:#a78bfa}
 .log-view .lv-empty{color:#71717a}
 
-/* Tab 切换：直接 display none/block，无动画 */
+/* 豆瓣缓存表格 */
+.douban-toolbar{display:flex;align-items:center;gap:12px;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.douban-toolbar input[type="text"]{height:32px;border:1px solid var(--border);border-radius:4px;padding:0 10px;font-size:13px;font-family:inherit;min-width:180px;flex:1;max-width:320px;transition:all .15s ease}
+.douban-toolbar input[type="text"]:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
+.douban-toolbar .spacer{flex:1}
+.douban-table{width:100%;border-collapse:collapse;font-size:13px}
+.douban-table thead th{text-align:left;padding:10px 8px;border-bottom:2px solid var(--border);color:#71717a;font-weight:600;font-size:12px;user-select:none;white-space:nowrap}
+.douban-table thead th.sortable{cursor:pointer}
+.douban-table thead th.sortable:hover{color:var(--text)}
+.douban-table thead th .sort-arrow{color:#a1a1aa;margin-left:4px;font-size:10px}
+.douban-table tbody tr{border-bottom:1px solid #f4f4f5;transition:background .1s ease}
+.douban-table tbody tr:hover{background:#fafafa}
+.douban-table tbody td{padding:9px 8px;vertical-align:middle}
+.douban-table .col-title{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.douban-table .col-rating{font-weight:600;color:#ea580c;font-variant-numeric:tabular-nums;white-space:nowrap}
+.douban-table .col-type{color:#71717a;white-space:nowrap}
+.douban-table .col-type .tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;background:#f4f4f5;color:#52525b}
+.douban-table .col-type .tag.season{background:#fef3c7;color:#92400e}
+.douban-table .col-time{color:#a1a1aa;white-space:nowrap;font-variant-numeric:tabular-nums;font-size:12px}
+.douban-table .col-action{text-align:right;width:60px}
+.douban-pager{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:16px;font-size:13px;color:#71717a}
+.douban-pager button{height:30px;padding:0 12px;border:1px solid var(--border);background:#fff;border-radius:4px;cursor:pointer;font-family:inherit;font-size:13px;color:var(--text);transition:all .15s ease}
+.douban-pager button:hover:not(:disabled){border-color:var(--primary);color:var(--primary)}
+.douban-pager button:disabled{opacity:.4;cursor:not-allowed}
+
+@media (max-width:768px){
+.douban-table .col-time{display:none}
+.douban-table .col-title{max-width:160px}
+}
+
 .tab-pane{display:none}
 .tab-pane.active{display:block}
 
-/* Toast：右上角，白底 + 左边 4px 彩色条 */
 .toast-wrap{position:fixed;top:16px;right:16px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none}
 .toast{background:#fff;border-left:4px solid var(--primary);padding:10px 16px;font-size:13px;color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,.08),0 4px 12px rgba(0,0,0,.06);min-width:220px;max-width:340px;pointer-events:auto;border-radius:0 4px 4px 0}
 .toast.success{border-left-color:var(--success)}
 .toast.error{border-left-color:var(--danger)}
 .toast.warning{border-left-color:var(--warning)}
 
-/* 移动端汉堡菜单按钮（默认隐藏，仅 <=768px 显示） */
 .menu-toggle{display:none;flex-direction:column;justify-content:center;width:24px;height:24px;gap:5px;cursor:pointer;margin-right:8px;flex-shrink:0;padding:0;background:transparent;border:none}
 .menu-toggle span{display:block;width:20px;height:2px;background:var(--text);border-radius:1px;transition:all .15s ease}
-/* 移动端侧边栏遮罩层（默认隐藏，body.sidebar-open 时显示） */
 .sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:999}
 
-/* ===== 移动端响应式适配（<=768px） ===== */
 @media (max-width:768px){
-/* 显示汉堡按钮 */
 .menu-toggle{display:flex}
-/* 侧边栏默认滑出到屏幕左侧外 */
 .sidebar{transform:translateX(-100%);transition:transform .2s ease;z-index:1000}
-/* body.sidebar-open 时侧边栏滑入显示 */
 body.sidebar-open .sidebar{transform:translateX(0)}
-/* body.sidebar-open 时显示遮罩层 */
 body.sidebar-open .sidebar-overlay{display:block}
-/* 主内容区：去掉左 margin，缩小 padding */
 .main{margin-left:0}
 .topbar{padding:16px 16px 0}
 .topbar .title{font-size:18px}
 .content{padding:16px}
-/* 概览页统计卡片：1 列，gap 12px */
 .stats-grid{grid-template-columns:1fr;gap:12px}
-/* 路径管理 Volume 列表项：纵向排列（路径和删除按钮分行） */
 .path-item{flex-direction:column;align-items:flex-start;gap:8px}
 .path-item .paths{width:100%;white-space:normal;word-break:break-all}
-/* 路径管理添加表单：纵向排列 */
 .add-form{flex-direction:column;align-items:stretch;gap:12px}
 .add-form .btn{width:100%}
-/* 日志区高度调整 */
 .log-view{max-height:calc(100vh - 240px)}
-/* 日志工具栏按钮换行 */
 .log-toolbar{flex-wrap:wrap;gap:12px}
 }
 </style>
 </head>
 <body>
 
-<!-- 移动端侧边栏遮罩层（点击关闭侧边栏） -->
 <div class="sidebar-overlay" id="sidebarOverlay"></div>
 
 <div class="sidebar" id="sidebar">
@@ -273,6 +257,7 @@ body.sidebar-open .sidebar-overlay{display:block}
 <div class="sidebar-nav">
 <div class="nav-item active" data-tab="overview">概览</div>
 <div class="nav-item" data-tab="config">配置</div>
+<div class="nav-item" data-tab="douban">豆瓣缓存</div>
 <div class="nav-item" data-tab="paths">路径管理</div>
 <div class="nav-item" data-tab="logs">日志</div>
 </div>
@@ -283,7 +268,6 @@ body.sidebar-open .sidebar-overlay{display:block}
 
 <div class="main">
 <div class="topbar">
-<!-- 移动端汉堡菜单按钮（纯 CSS 三横线，仅 <=768px 显示） -->
 <div class="menu-toggle" id="menuToggle"><span></span><span></span><span></span></div>
 <span class="title" id="pageTitle">概览</span>
 <div class="right">
@@ -325,6 +309,9 @@ body.sidebar-open .sidebar-overlay{display:block}
 <div class="sys-row"><div class="k">命中 / 未命中</div><div class="v" id="doubanHits">-</div></div>
 <div class="sys-row"><div class="k">抓取成功 / 失败</div><div class="v" id="doubanFetched">-</div></div>
 <div class="sys-row"><div class="k">最后更新</div><div class="v" id="doubanUpdated">-</div></div>
+<div class="card-actions">
+<button class="btn-text" id="viewDoubanCacheBtn">查看缓存清单 →</button>
+</div>
 </div>
 
 <div class="card">
@@ -337,6 +324,37 @@ body.sidebar-open .sidebar-overlay{display:block}
 <div class="sys-row"><div class="k">CPU 核心数</div><div class="v" id="sysCPU">-</div></div>
 <div class="sys-row"><div class="k">启动时间</div><div class="v" id="sysStartTime">-</div></div>
 <div class="sys-row"><div class="k">架构</div><div class="v" id="sysArch">-</div></div>
+</div>
+</div>
+
+<!-- 豆瓣缓存 -->
+<div class="tab-pane" id="pane-douban">
+<div class="card">
+<div class="card-title">豆瓣缓存清单（<span id="doubanCacheCount">0</span> 条）</div>
+<div class="douban-toolbar">
+<input type="text" id="doubanSearchBox" placeholder="搜索名称...">
+<div class="spacer"></div>
+<button class="btn-text" id="refreshDoubanCacheBtn">刷新</button>
+<button class="btn-text danger" id="clearDoubanCacheBtn">清空全部</button>
+</div>
+<div id="doubanCacheEmpty" class="path-empty" style="display:none">暂无缓存</div>
+<table class="douban-table" id="doubanCacheTable" style="display:none">
+<thead>
+<tr>
+<th class="sortable" data-sort="title">名称<span class="sort-arrow"></span></th>
+<th class="sortable" data-sort="rating">评分<span class="sort-arrow"></span></th>
+<th>类型</th>
+<th class="sortable" data-sort="fetched_at">抓取时间<span class="sort-arrow"></span></th>
+<th class="col-action"></th>
+</tr>
+</thead>
+<tbody id="doubanCacheTbody"></tbody>
+</table>
+<div class="douban-pager" id="doubanPager" style="display:none">
+<button id="doubanPrevBtn">上一页</button>
+<span id="doubanPageInfo">-</span>
+<button id="doubanNextBtn">下一页</button>
+</div>
 </div>
 </div>
 
@@ -526,10 +544,17 @@ var logAutoRefresh=true;
 var logTimer=null;
 var statsTimer=null;
 
+/* 豆瓣缓存 tab 状态 */
+var doubanAllItems=[];
+var doubanFiltered=[];
+var doubanSortKey='fetched_at';
+var doubanSortAsc=false;
+var doubanPage=1;
+var doubanPageSize=100;
+
 /* ===== 工具函数 ===== */
 function $(id){return document.getElementById(id)}
 
-// HTML 转义，避免路径渲染时的 XSS 与属性注入
 function esc(s){
 if(s==null)return '';
 var d=document.createElement('div');
@@ -537,8 +562,6 @@ d.appendChild(document.createTextNode(String(s)));
 return d.innerHTML.replace(/"/g,'&quot;').replace(/'/g,'&#39;')
 }
 
-// Toast：右上角，白底 + 左边 4px 彩色条，无动画
-// success 3s，error/warning 5s
 function toast(msg,type){
 var wrap=$('toastWrap');
 var el=document.createElement('div');
@@ -552,19 +575,16 @@ if(el.parentNode)el.parentNode.removeChild(el);
 },dur);
 }
 
-// AJAX 基于 fetch：检查 d.code===401 时跳转登录页
 function ajax(url,method,data,cb){
 var opt={method:method||'GET',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'}};
 if(data!==null&&data!==undefined)opt.body=JSON.stringify(data);
 fetch(url,opt)
 .then(function(r){
-// 先检查 HTTP 状态，避免非 JSON 响应导致 r.json() 抛异常
 if(!r.ok){cb('HTTP '+r.status,null);return null}
 return r.json();
 })
 .then(function(d){
 if(d==null)return;
-// 401 会话过期：跳转登录页
 if(d.code===401){location.href='/login';return}
 cb(null,d);
 })
@@ -590,7 +610,7 @@ if(n>=1000)return (n/1000).toFixed(1)+'K';
 return String(n);
 }
 
-/* ===== Tab 切换：直接 display none/block，无动画 ===== */
+/* ===== Tab 切换 ===== */
 function switchTab(name){
 var items=document.querySelectorAll('.nav-item[data-tab]');
 var panes=document.querySelectorAll('.tab-pane');
@@ -602,19 +622,17 @@ for(var k=0;k<items.length;k++){
 if(items[k].getAttribute('data-tab')===name){items[k].classList.add('active');break}
 }
 currentTab=name;
-var titles={overview:'概览',config:'配置',paths:'路径管理',logs:'日志'};
+var titles={overview:'概览',config:'配置',douban:'豆瓣缓存',paths:'路径管理',logs:'日志'};
 $('pageTitle').textContent=titles[name]||'';
-// 仅日志 tab 激活时启动 5 秒刷新
 if(name==='logs'){loadLogs();startLogTimer()}
 else{stopLogTimer()}
-// 概览页 30 秒刷新
 if(name==='overview'){loadStats();loadSystem();startStatsTimer()}
 else{stopStatsTimer()}
 if(name==='config'){loadConfig()}
 if(name==='paths'){loadPaths()}
+if(name==='douban'){loadDoubanCache()}
 }
 
-// 日志定时器：5 秒刷新，仅日志 tab 激活且开关开启时运行
 function startLogTimer(){
 stopLogTimer();
 if(logAutoRefresh){logTimer=setInterval(loadLogs,5000)}
@@ -623,7 +641,6 @@ function stopLogTimer(){
 if(logTimer){clearInterval(logTimer);logTimer=null}
 }
 
-// 统计定时器：30 秒刷新，仅在概览页运行
 function startStatsTimer(){
 stopStatsTimer();
 statsTimer=setInterval(function(){loadStats();loadSystem()},30000);
@@ -637,10 +654,8 @@ function loadStats(){
 ajax('/api/stats','GET',null,function(err,d){
 if(err||!d||d.code!==200||!d.data)return;
 var s=d.data;
-// hit_count/miss_count 之和为缓存查找次数；hit_rate 为命中率
 $('statTotal').textContent=fmtNum((s.hit_count||0)+(s.miss_count||0));
 $('statHitRate').textContent=(s.hit_rate||0).toFixed(1)+'%';
-// 优先使用 streamHandler 的 preload_success；缺失时回退显示外部缓存条目数
 $('statPreload').textContent=fmtNum(s.preload_success!=null?s.preload_success:((s.strm_cache_count||0)+(s.url_cache_count||0)));
 $('statMem').textContent=(s.memory_usage_mb||0).toFixed(1)+' MB';
 $('statMedia').textContent=fmtNum(s.media_source_count||0);
@@ -650,7 +665,6 @@ $('statUrl').textContent=fmtNum(s.url_cache_count||0);
 $('statHit').textContent=fmtNum(s.hit_count||0);
 $('statMiss').textContent=fmtNum(s.miss_count||0);
 $('statEvict').textContent=fmtNum(s.evicted_count||0);
-// 豆瓣评分统计（后端 handleStats 合并的字段，前缀 douban_）
 if(s.douban_enabled!==undefined){
 var de=s.douban_enabled;
 var st=$('doubanStatus');
@@ -682,6 +696,161 @@ $('sysArch').textContent=s.arch||'-';
 });
 }
 
+/* ===== 豆瓣缓存 ===== */
+function loadDoubanCache(){
+ajax('/api/douban/cache','GET',null,function(err,d){
+if(err){toast('加载豆瓣缓存失败: '+err,'error');return}
+if(!d||d.code!==200){
+toast('加载豆瓣缓存失败','error');
+return
+}
+doubanAllItems=Array.isArray(d.data)?d.data:[];
+doubanPage=1;
+applyDoubanFilterAndRender();
+});
+}
+
+function applyDoubanFilterAndRender(){
+var q=($('doubanSearchBox').value||'').trim().toLowerCase();
+doubanFiltered=doubanAllItems.filter(function(it){
+if(!q)return true;
+var t=(it.title||'').toLowerCase();
+return t.indexOf(q)>-1;
+});
+
+// 排序
+var key=doubanSortKey;
+var asc=doubanSortAsc;
+doubanFiltered.sort(function(a,b){
+var va,vb;
+if(key==='rating'){
+va=Number(a.rating)||0;
+vb=Number(b.rating)||0;
+}else{
+va=String(a[key]||'');
+vb=String(b[key]||'');
+}
+if(va<vb)return asc?-1:1;
+if(va>vb)return asc?1:-1;
+return 0;
+});
+
+// 更新表头箭头
+var ths=document.querySelectorAll('#doubanCacheTable thead th.sortable');
+for(var i=0;i<ths.length;i++){
+var th=ths[i];
+var k=th.getAttribute('data-sort');
+var arrow=th.querySelector('.sort-arrow');
+if(!arrow)continue;
+if(k===doubanSortKey){
+arrow.textContent=doubanSortAsc?'▲':'▼';
+}else{
+arrow.textContent='';
+}
+}
+
+renderDoubanPage();
+}
+
+function renderDoubanPage(){
+var tbody=$('doubanCacheTbody');
+var table=$('doubanCacheTable');
+var empty=$('doubanCacheEmpty');
+var pager=$('doubanPager');
+$('doubanCacheCount').textContent=doubanFiltered.length;
+
+if(!doubanFiltered.length){
+table.style.display='none';
+pager.style.display='none';
+empty.style.display='block';
+empty.textContent=doubanAllItems.length?'无匹配结果':'暂无缓存';
+return;
+}
+empty.style.display='none';
+table.style.display='';
+pager.style.display='';
+
+var totalPages=Math.max(1,Math.ceil(doubanFiltered.length/doubanPageSize));
+if(doubanPage>totalPages)doubanPage=totalPages;
+if(doubanPage<1)doubanPage=1;
+
+var start=(doubanPage-1)*doubanPageSize;
+var end=Math.min(start+doubanPageSize,doubanFiltered.length);
+
+var h='';
+for(var i=start;i<end;i++){
+var it=doubanFiltered[i];
+var typeLabel, typeCls;
+if(it.type==='season'){
+typeLabel='第'+it.season_num+'季';
+typeCls='tag season';
+}else{
+typeLabel='电影/剧集';
+typeCls='tag';
+}
+var ratingText=(it.rating!=null)?Number(it.rating).toFixed(1):'-';
+
+// 用 key 作为 data-key，删除时把 all_keys 一起传给后端
+var allKeysJson=esc(JSON.stringify(it.all_keys||[it.key]));
+
+h+='<tr>';
+h+='<td class="col-title" title="'+esc(it.title||it.key)+'">'+esc(it.title||'(无名称)')+'</td>';
+h+='<td class="col-rating">⭐ '+ratingText+'</td>';
+h+='<td class="col-type"><span class="'+typeCls+'">'+esc(typeLabel)+'</span></td>';
+h+='<td class="col-time">'+esc(it.fetched_at||'-')+'</td>';
+h+='<td class="col-action"><button type="button" class="btn-text danger douban-del-btn" data-keys="'+allKeysJson+'">删除</button></td>';
+h+='</tr>';
+}
+tbody.innerHTML=h;
+
+$('doubanPageInfo').textContent='第 '+doubanPage+' / '+totalPages+' 页';
+$('doubanPrevBtn').disabled=(doubanPage<=1);
+$('doubanNextBtn').disabled=(doubanPage>=totalPages);
+
+// 绑定删除按钮
+var btns=tbody.querySelectorAll('button.douban-del-btn');
+for(var j=0;j<btns.length;j++){
+(function(b){
+b.onclick=function(){
+var raw=b.getAttribute('data-keys');
+var keys=[];
+try{keys=JSON.parse(raw)}catch(e){keys=[]}
+if(!keys.length)return;
+deleteDoubanCache(keys);
+};
+})(btns[j]);
+}
+}
+
+function deleteDoubanCache(keys){
+if(!confirm('确定要删除这条豆瓣缓存吗？\n\n删除后下次扫描时会重新抓取。'))return;
+ajax('/api/douban/cache/delete','POST',{keys:keys},function(err,d){
+if(err){toast('删除失败: '+err,'error');return}
+if(d&&d.code===200){
+toast(d.message||'已删除','success');
+loadDoubanCache();
+// 概览页的统计也刷新一下
+loadStats();
+}else{
+toast((d&&d.message)||'删除失败','error');
+}
+});
+}
+
+function clearDoubanCache(){
+if(!confirm('确定要清空全部豆瓣缓存吗？\n\n清空后所有评分会在下次扫描时重新抓取，这可能需要较长时间。'))return;
+ajax('/api/douban/cache/clear','POST',null,function(err,d){
+if(err){toast('清空失败: '+err,'error');return}
+if(d&&d.code===200){
+toast(d.message||'已清空','success');
+loadDoubanCache();
+loadStats();
+}else{
+toast((d&&d.message)||'清空失败','error');
+}
+});
+}
+
 /* ===== 配置 ===== */
 function loadConfig(){
 ajax('/api/config/get','GET',null,function(err,d){
@@ -694,23 +863,18 @@ $('cfgStrmResolveMode').value=data.strm_resolve_mode||'auto';
 $('cfgCacheTTL').value=data.cache_ttl||'';
 $('cfgMaxItems').value=data.max_cache_items||10000;
 $('cfgUser').value=data.dashboard_user||'admin';
-// 密码不回填：后端返回占位符，前端保持输入框为空，用 placeholder 提示
 $('cfgPass').value='';
-// 功能开关回填（默认打开，未配置时为 true）
 $('cfgEnableLanStrm').checked = data.enable_lan_strm !== false;
 $('cfgEnablePreload').checked = data.enable_preload !== false;
 $('cfgEnableCDNWarmup').checked = data.enable_cdn_warmup !== false;
 $('cfgEnableSmartTTL').checked = data.enable_smart_ttl !== false;
-// 豆瓣评分开关（默认打开）
 $('cfgEnableDoubanRating').checked = data.enable_douban_rating !== false;
-// 全库扫描
 $('cfgEnableLibraryScan').checked = data.enable_library_scan === true;
 $('cfgLibraryScanCron').value = data.library_scan_cron || '';
 $('cfgLibraryScanOnStart').checked = data.library_scan_on_start === true;
 $('cfgLibraryScanConcurrency').value = data.library_scan_concurrency || 2;
 $('cfgLibraryScanIntervalMs').value = data.library_scan_interval_ms != null ? data.library_scan_interval_ms : 500;
 $('cfgLibraryScanIncrementalMinutes').value = data.library_scan_incremental_minutes || 5;
-// 扫描状态
 loadScanStatus();
 });
 }
@@ -718,7 +882,6 @@ loadScanStatus();
 function saveConfig(){
 var pass=$('cfgPass').value;
 var ttlInput=$('cfgCacheTTL').value.trim();
-// cache_ttl 空值校验：避免 parseInt('')||60 把空值静默回退到 60
 if(ttlInput===''){toast('缓存 TTL 不能为空','warning');return}
 var ttlVal=parseInt(ttlInput,10);
 if(isNaN(ttlVal)||ttlVal<1){toast('缓存 TTL 必须是大于 0 的整数','warning');return}
@@ -731,14 +894,11 @@ strm_resolve_mode:$('cfgStrmResolveMode').value,
 cache_ttl:ttlVal,
 dashboard_user:$('cfgUser').value.trim(),
 max_cache_items:maxItemsVal,
-// 功能开关
 enable_lan_strm:$('cfgEnableLanStrm').checked,
 enable_preload:$('cfgEnablePreload').checked,
 enable_cdn_warmup:$('cfgEnableCDNWarmup').checked,
 enable_smart_ttl:$('cfgEnableSmartTTL').checked,
-// 豆瓣评分开关
 enable_douban_rating:$('cfgEnableDoubanRating').checked,
-// 全库扫描
 enable_library_scan:$('cfgEnableLibraryScan').checked,
 library_scan_cron:$('cfgLibraryScanCron').value.trim(),
 library_scan_on_start:$('cfgLibraryScanOnStart').checked,
@@ -746,15 +906,12 @@ library_scan_concurrency:parseInt($('cfgLibraryScanConcurrency').value.trim(),10
 library_scan_interval_ms:parseInt($('cfgLibraryScanIntervalMs').value.trim(),10)||500,
 library_scan_incremental_minutes:parseInt($('cfgLibraryScanIncrementalMinutes').value.trim(),10)||5
 };
-// 仅当用户输入了非占位符的新密码时才提交
 if(pass&&pass!==''&&pass!=='****'){data.dashboard_pass=pass}
 ajax('/api/config/update','POST',data,function(err,r){
 if(err){toast('保存失败: '+err,'error');return}
 if(r&&r.code===200){
 toast(r.message||'配置已保存','success');
-// 清空密码字段，避免重复提交
 $('cfgPass').value='';
-// 检查是否需要重启
 if(r.data&&r.data.needs_restart){
 toast(r.data.message||'检测到需要重启的配置变更，请重启服务生效','warning');
 }
@@ -774,7 +931,6 @@ ajax('/api/scan/trigger','POST',null,function(err,r){
 if(err){toast('扫描触发失败: '+err,'error');btn.disabled=false;btn.textContent='立即扫描';return}
 if(r&&r.code===200){
 toast(r.message||'扫描已启动','success');
-// 开始轮询状态
 pollScanStatus();
 }else{
 toast((r&&r.message)||'扫描触发失败','error');
@@ -789,7 +945,6 @@ function loadScanStatus(){
 ajax('/api/scan/status','GET',null,function(err,d){
 if(err||!d||d.code!==200||!d.data){updateScanStatusUI(null);return}
 updateScanStatusUI(d.data);
-// 轮询模式：扫描完成后停止
 if(scanStatusTimer&&!d.data.running){
 clearInterval(scanStatusTimer);scanStatusTimer=null;
 var btn=$('triggerScanBtn');
@@ -834,11 +989,8 @@ if(btn){btn.disabled=false;btn.textContent='立即扫描'}
 function loadPaths(){
 ajax('/api/strm_paths/get','GET',null,function(err,d){
 if(err||!d||d.code!==200||!d.data)return;
-// 优先使用后端返回的结构化 volumes（含 host_path/container_path），
-// 避免前端用 split(':') 解析 strm_volumes 字符串（路径含冒号时会出错）
 var vols=d.data.volumes||[];
 if(!vols.length&&d.data.strm_volumes){
-// 回退：从字符串列表解析（兼容旧后端）
 for(var i=0;i<d.data.strm_volumes.length;i++){
 var parts=d.data.strm_volumes[i].split(':');
 vols.push({host_path:parts[0]||'',container_path:parts[1]||'',volume_format:d.data.strm_volumes[i]});
@@ -860,7 +1012,6 @@ var vol=volumes[i];
 var hostPath=vol.host_path||'';
 var containerPath=vol.container_path||'';
 var volFormat=vol.volume_format||(hostPath+':'+containerPath+':ro');
-// 左侧：主机路径 → 容器路径（等宽字体）；右侧：删除文字链接
 h+='<div class="path-item">';
 h+='<div class="paths">'+esc(hostPath)+' <span class="arrow">→</span> '+esc(containerPath)+'</div>';
 h+='<button type="button" class="btn-text danger" data-vol="'+esc(volFormat)+'">删除</button>';
@@ -895,7 +1046,6 @@ toast(d.message||'Volume 已添加并立即生效','success');
 }else{
 toast(d.message||'Volume 已添加，建议重启容器生效','warning');
 }
-// 检查 compose 文件是否更新成功，未更新时额外提示
 if(d.data&&d.data.compose_updated===false){
 toast('docker-compose.yml 未自动更新，请手动修改','warning');
 }
@@ -994,11 +1144,9 @@ toast((d&&d.message)||'操作失败','error');
 /* ===== 退出登录 ===== */
 function logout(){
 if(!confirm('确定要退出登录吗？'))return;
-// 退出前停止定时器，避免 confirm 阻塞期间后台请求干扰
 stopStatsTimer();
 stopLogTimer();
 fetch('/api/logout',{method:'POST',headers:{'X-Requested-With':'XMLHttpRequest'}}).then(function(){
-// 无论响应如何都跳转登录页
 location.href='/login';
 }).catch(function(){location.href='/login'});
 }
@@ -1009,7 +1157,6 @@ var navItems=document.querySelectorAll('.nav-item[data-tab]');
 for(var i=0;i<navItems.length;i++){
 navItems[i].onclick=function(){
 switchTab(this.getAttribute('data-tab'));
-// 移动端点击导航后自动关闭侧边栏
 if(window.innerWidth<=768){document.body.classList.remove('sidebar-open')}
 };
 }
@@ -1027,19 +1174,47 @@ logAutoRefresh=this.checked;
 if(currentTab==='logs'&&logAutoRefresh)startLogTimer();
 else stopLogTimer();
 };
-// 移动端汉堡菜单：点击切换 body.sidebar-open
+
+// 豆瓣缓存 tab 的交互
+$('viewDoubanCacheBtn').onclick=function(){switchTab('douban')};
+$('refreshDoubanCacheBtn').onclick=loadDoubanCache;
+$('clearDoubanCacheBtn').onclick=clearDoubanCache;
+$('doubanSearchBox').oninput=function(){doubanPage=1;applyDoubanFilterAndRender()};
+$('doubanPrevBtn').onclick=function(){if(doubanPage>1){doubanPage--;renderDoubanPage()}};
+$('doubanNextBtn').onclick=function(){
+var totalPages=Math.max(1,Math.ceil(doubanFiltered.length/doubanPageSize));
+if(doubanPage<totalPages){doubanPage++;renderDoubanPage()}
+};
+
+// 表头排序
+var sortThs=document.querySelectorAll('#doubanCacheTable thead th.sortable');
+for(var s=0;s<sortThs.length;s++){
+(function(th){
+th.onclick=function(){
+var k=th.getAttribute('data-sort');
+if(doubanSortKey===k){
+doubanSortAsc=!doubanSortAsc;
+}else{
+doubanSortKey=k;
+doubanSortAsc=false;
+}
+applyDoubanFilterAndRender();
+};
+})(sortThs[s]);
+}
+
+// 移动端汉堡菜单
 var menuToggle=$('menuToggle');
 if(menuToggle){
 menuToggle.onclick=function(){document.body.classList.toggle('sidebar-open')};
 }
-// 点击遮罩层关闭侧边栏
 var sidebarOverlay=$('sidebarOverlay');
 if(sidebarOverlay){
 sidebarOverlay.onclick=function(){document.body.classList.remove('sidebar-open')};
 }
 }
 
-/* ===== 初始化：默认概览页，加载数据并启动 30 秒刷新 ===== */
+/* ===== 初始化 ===== */
 function init(){
 bindEvents();
 loadStats();
