@@ -32,6 +32,17 @@ const (
 )
 
 // ============================================================
+// 预编译正则（包级，只编译一次）
+// ============================================================
+
+var (
+	// 匹配标题末尾的 (2023) / （2023）
+	titleYearSuffixRe = regexp.MustCompile(`\s*[\(（]\d{4}[\)）]\s*$`)
+	// 匹配 [xxx] / 【xxx】
+	titleBracketRe = regexp.MustCompile(`\s*[\[【][^\]】]*[\]】]`)
+)
+
+// ============================================================
 // API 响应结构
 // ============================================================
 
@@ -176,6 +187,12 @@ func (dp *DoubanProvider) Stop() {
 // 优先用 IMDb ID 查（官方 API / 第三方 API），
 // 无 IMDb 或查询失败时回退到标题搜索。
 func (dp *DoubanProvider) FetchMovieOrSeries(ctx context.Context, imdbID, name string, year int, itemType string) {
+	defer func() {
+		if r := recover(); r != nil {
+			dp.server.logger.Warn("%s panic recovered in FetchMovieOrSeries: %v", doubanLogPrefix, r)
+		}
+	}()
+
 	if !doubanEnabled {
 		return
 	}
@@ -221,6 +238,12 @@ func (dp *DoubanProvider) FetchMovieOrSeries(ctx context.Context, imdbID, name s
 
 // FetchSeason 抓取季评分（供 LibraryScanner 调用）
 func (dp *DoubanProvider) FetchSeason(ctx context.Context, seriesName string, seasonNumber int) {
+	defer func() {
+		if r := recover(); r != nil {
+			dp.server.logger.Warn("%s panic recovered in FetchSeason: %v", doubanLogPrefix, r)
+		}
+	}()
+
 	if !doubanEnabled {
 		return
 	}
@@ -803,10 +826,8 @@ func (dp *DoubanProvider) GetStats() map[string]interface{} {
 // ============================================================
 
 func cleanTitle(name string) string {
-	re := regexp.MustCompile(`\s*[\(\（]\d{4}[\)\）]\s*$`)
-	name = re.ReplaceAllString(name, "")
-	re2 := regexp.MustCompile(`\s*[\[\【][^\]\】]*[\]\】]`)
-	name = re2.ReplaceAllString(name, "")
+	name = titleYearSuffixRe.ReplaceAllString(name, "")
+	name = titleBracketRe.ReplaceAllString(name, "")
 	return strings.TrimSpace(name)
 }
 
