@@ -455,6 +455,11 @@ func (s *Server) shouldInjectNative(path string) bool {
 // 响应结构：
 //   { "code":0, "data": { "imdb_id":"ttxxx", "title":"xxx", "type":"Movie",
 //                         "vote_average":"7.2535...", ... } }
+//
+// type 说明：
+//   - "Movie"          → 用 IMDb 查电影评分
+//   - "Series" / "TV"  → 剧集，用 number_of_seasons / season_number 查最新季豆瓣分
+//   - "Season"         → 用 parent_title + season_number 查季分
 func (s *Server) injectDoubanNative(body []byte) []byte {
 	defer func() {
 		if r := recover(); r != nil {
@@ -485,8 +490,29 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 	var found bool
 
 	switch itemType {
-	case "Movie", "Series":
+	case "Movie":
 		rating, found = s.doubanProvider.GetRating(imdbID, title, 0)
+
+	case "Series", "TV":
+		// ✅ 剧集：优先用 season_number，其次 number_of_seasons，查最新季豆瓣分
+		seriesName := title
+		seasonNum := 0
+		if n, ok := data["season_number"].(float64); ok && n > 0 {
+			seasonNum = int(n)
+		}
+		if seasonNum == 0 {
+			if n, ok := data["number_of_seasons"].(float64); ok && n > 0 {
+				seasonNum = int(n)
+			}
+		}
+		if seasonNum > 0 {
+			rating, found = s.doubanProvider.GetSeasonRating(seriesName, seasonNum)
+		}
+		if !found {
+			// 兜底：IMDb 查整剧（当前缓存里可能没有）
+			rating, found = s.doubanProvider.GetRating(imdbID, title, 0)
+		}
+
 	case "Season":
 		// 季：用 parent_title（剧名）+ season_number
 		seriesName, _ := data["parent_title"].(string)
@@ -505,7 +531,7 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 
 	// ✅ vote_average 是字符串，保持类型
 	data["vote_average"] = fmt.Sprintf("%.1f", rating)
-	s.logger.Debug("🎬 [豆瓣评分] 原生注入 %s: vote_average → %.1f", title, rating)
+	s.logger.Debug("🎬 [豆瓣评分] 原生注入 %s (%s): vote_average → %.1f", title, itemType, rating)
 
 	newBody, err := json.Marshal(payload)
 	if err != nil {
@@ -527,6 +553,11 @@ func (s *Server) shouldInjectNativeList(path string) bool {
 // injectDoubanNativeList 注入豆瓣评分到飞牛原生列表响应
 //
 // 响应结构：{ "code":0, "data": { "list": [ {..item..}, ... ] } }
+//
+// type 说明（与详情页一致）：
+//   - "Movie"          → 用 IMDb 查电影评分
+//   - "Series" / "TV"  → 剧集，用 number_of_seasons / season_number 查最新季豆瓣分
+//   - "Season"         → 用 parent_title + season_number 查季分
 func (s *Server) injectDoubanNativeList(body []byte) []byte {
 	defer func() {
 		if r := recover(); r != nil {
@@ -568,8 +599,28 @@ func (s *Server) injectDoubanNativeList(body []byte) []byte {
 		var found bool
 
 		switch itemType {
-		case "Movie", "Series":
+		case "Movie":
 			rating, found = s.doubanProvider.GetRating(imdbID, title, 0)
+
+		case "Series", "TV":
+			// ✅ 剧集：优先用 season_number，其次 number_of_seasons，查最新季豆瓣分
+			seriesName := title
+			seasonNum := 0
+			if n, ok := item["season_number"].(float64); ok && n > 0 {
+				seasonNum = int(n)
+			}
+			if seasonNum == 0 {
+				if n, ok := item["number_of_seasons"].(float64); ok && n > 0 {
+					seasonNum = int(n)
+				}
+			}
+			if seasonNum > 0 {
+				rating, found = s.doubanProvider.GetSeasonRating(seriesName, seasonNum)
+			}
+			if !found {
+				rating, found = s.doubanProvider.GetRating(imdbID, title, 0)
+			}
+
 		case "Season":
 			seriesName, _ := item["parent_title"].(string)
 			seasonNum := 0
