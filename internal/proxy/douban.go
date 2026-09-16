@@ -826,6 +826,13 @@ func (dp *DoubanProvider) GetStats() map[string]interface{} {
 //
 // 同一部片子的多个 key（imdb:xxx + title:xxx）指向同一个 entry 指针，
 // 按指针聚合实现去重；season:xxx 是独立 entry，不会被合并
+// ListCache 返回去重后的缓存列表（按抓取时间倒序）
+//
+// 两层去重：
+//  1. 按 entry 指针聚合（同一 entry 被多个 key 引用 → 合并）
+//  2. 按 (归一化标题, 季号) 聚合（同一部片被不同参数抓取 / 重启后指针分离 → 合并）
+//
+// 关键：第二层不能靠指针，否则重启后 JSON 反序列化会把共享指针拆成独立对象，去重失效
 func (dp *DoubanProvider) ListCache() []map[string]interface{} {
 	dp.diskMu.RLock()
 	byEntry := make(map[*doubanCacheEntry][]string)
@@ -837,7 +844,13 @@ func (dp *DoubanProvider) ListCache() []map[string]interface{} {
 	}
 	dp.diskMu.RUnlock()
 
-	items := make([]map[string]interface{}, 0, len(byEntry))
+	// 第二层：按 (归一化标题, 季号) 聚合
+	type groupKey struct {
+		title     string
+		seasonNum int
+	}
+	byGroup := make(map[groupKey]map[string]interface{})
+
 	for entry, keys := range byEntry {
 		// 选主 key（season: > imdb: > title:）
 		sort.Slice(keys, func(i, j int) bool {
@@ -856,15 +869,43 @@ func (dp *DoubanProvider) ListCache() []map[string]interface{} {
 			}
 		}
 
-		items = append(items, map[string]interface{}{
-			"key":        primary,
-			"all_keys":   keys,
-			"rating":     entry.Rating,
-			"title":      entry.Title,
-			"type":       itemType,
-			"season_num": seasonNum,
-			"fetched_at": entry.FetchedAt.Format("2006-01-02 15:04:05"),
-		})
+		// 归一化标题：trim + 转小写 + 去半角/全角空格，最大程度合并
+		normTitle := strings.ToLower(strings.TrimSpace(entry.Title))
+		normTitle = strings.ReplaceAll(normTitle, " ", "")
+		normTitle = strings.ReplaceAll(normTitle, "　", "")
+
+		gk := groupKey{
+			title:     normTitle,
+			seasonNum: seasonNum,
+		}
+
+		fetchedAt := entry.FetchedAt.Format("2006-01-02 15:04:05")
+
+		if existing, ok := byGroup[gk]; ok {
+			// 已存在 → 合并 all_keys，保留最新的 rating / fetched_at
+			oldKeys, _ := existing["all_keys"].([]string)
+			existing["all_keys"] = append(oldKeys, keys...)
+			if fetchedAt > existing["fetched_at"].(string) {
+				existing["key"] = primary
+				existing["rating"] = entry.Rating
+				existing["fetched_at"] = fetchedAt
+			}
+		} else {
+			byGroup[gk] = map[string]interface{}{
+				"key":        primary,
+				"all_keys":   keys,
+				"rating":     entry.Rating,
+				"title":      entry.Title,
+				"type":       itemType,
+				"season_num": seasonNum,
+				"fetched_at": fetchedAt,
+			}
+		}
+	}
+
+	items := make([]map[string]interface{}, 0, len(byGroup))
+	for _, v := range byGroup {
+		items = append(items, v)
 	}
 
 	// 按抓取时间倒序
