@@ -16,14 +16,9 @@ import (
 )
 
 // RecordService 飞牛观看记录服务
-//
-// 设计参考 fntv-record-view（Python 版）：
-//   - 源数据库被飞牛持续写入，直接打开容易锁冲突
-//   - 采用「定期原子拷贝到临时文件 → 只读打开副本」策略
-//   - 副本默认 60 秒过期
 type RecordService struct {
-	srcPath string // 容器内源数据库路径
-	tmpPath string // 容器内副本路径
+	srcPath string
+	tmpPath string
 
 	logger *logger.Logger
 
@@ -36,8 +31,6 @@ type RecordService struct {
 }
 
 // NewRecordService 创建观看记录服务
-//
-// srcPath 为空时返回 nil（面板自动禁用「观看记录」tab）
 func NewRecordService(srcPath string, log *logger.Logger) *RecordService {
 	if srcPath == "" {
 		return nil
@@ -49,7 +42,6 @@ func NewRecordService(srcPath string, log *logger.Logger) *RecordService {
 		copyExpire: 60 * time.Second,
 		stopCh:     make(chan struct{}),
 	}
-	// 立即检测源数据库是否存在
 	if _, err := os.Stat(srcPath); err != nil {
 		log.Warn("🎬 [观看记录] 源数据库不可访问: %s (%v)", srcPath, err)
 	}
@@ -77,12 +69,10 @@ func (rs *RecordService) Available() bool {
 // 数据库副本管理
 // ============================================================
 
-// ensureCopy 确保副本存在且未过期（加锁 + 双重检查）
 func (rs *RecordService) ensureCopy() error {
 	rs.copyMu.Lock()
 	defer rs.copyMu.Unlock()
 
-	// 未过期且副本存在 → 直接用
 	if !rs.lastCopyAt.IsZero() && time.Since(rs.lastCopyAt) < rs.copyExpire {
 		if _, err := os.Stat(rs.tmpPath); err == nil {
 			return nil
@@ -91,7 +81,6 @@ func (rs *RecordService) ensureCopy() error {
 	return rs.atomicCopy()
 }
 
-// atomicCopy 拷贝源库到临时文件，再原子 rename
 func (rs *RecordService) atomicCopy() error {
 	src, err := os.Open(rs.srcPath)
 	if err != nil {
@@ -129,7 +118,6 @@ func (rs *RecordService) atomicCopy() error {
 	return nil
 }
 
-// openDB 打开只读连接（每次调用都新建，用完即关）
 func (rs *RecordService) openDB() (*sql.DB, error) {
 	if err := rs.ensureCopy(); err != nil {
 		return nil, err
@@ -139,7 +127,6 @@ func (rs *RecordService) openDB() (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	// SQLite 不适合多连接并发
 	db.SetMaxOpenConns(1)
 	return db, nil
 }
@@ -196,6 +183,15 @@ type HistoryResult struct {
 	PerPage int          `json:"per_page"`
 	Pages   int          `json:"pages"`
 	Data    []PlayRecord `json:"data"`
+}
+
+type HistoryQuery struct {
+	UserGUID    string
+	Page        int
+	PerPage     int
+	SearchTitle string
+	StartTime   string
+	EndTime     string
 }
 
 // ============================================================
@@ -288,15 +284,6 @@ func (rs *RecordService) GetUsers() ([]RecordUser, error) {
 // 查询：播放历史（分页 + 筛选）
 // ============================================================
 
-type HistoryQuery struct {
-	UserGUID    string
-	Page        int
-	PerPage     int
-	SearchTitle string
-	StartTime   string // "YYYY-MM-DD HH:MM:SS"
-	EndTime     string
-}
-
 func (rs *RecordService) GetHistory(q HistoryQuery) (*HistoryResult, error) {
 	if q.Page < 1 {
 		q.Page = 1
@@ -311,7 +298,6 @@ func (rs *RecordService) GetHistory(q HistoryQuery) (*HistoryResult, error) {
 	}
 	defer db.Close()
 
-	// 构建 WHERE 子句
 	whereClause := "WHERE iup.visible = 1"
 	var params []interface{}
 
@@ -352,7 +338,6 @@ func (rs *RecordService) GetHistory(q HistoryQuery) (*HistoryResult, error) {
 		}
 	}
 
-	// 总数
 	var total int
 	countSQL := `
 		SELECT COUNT(*) FROM item_user_play iup
@@ -367,7 +352,6 @@ func (rs *RecordService) GetHistory(q HistoryQuery) (*HistoryResult, error) {
 		return &HistoryResult{Total: 0, Page: q.Page, PerPage: q.PerPage, Pages: 0, Data: []PlayRecord{}}, nil
 	}
 
-	// 分页查询
 	offset := (q.Page - 1) * q.PerPage
 	listSQL := `
 		SELECT
@@ -390,12 +374,10 @@ func (rs *RecordService) GetHistory(q HistoryQuery) (*HistoryResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var records []PlayRecord
-	// hierarchy 缓存：item_guid → []map
-	hierCache := make(map[string][]map[string]interface{})
-
+	// ✅ 先把所有行读完，立刻关闭 rows，释放连接
+	//    否则后续 getItemHierarchy 的 Query 拿不到连接会死锁
+	var rawRecords []PlayRecord
 	for rows.Next() {
 		var rec PlayRecord
 		var position, watched, createTime, updateTime sql.NullInt64
@@ -409,12 +391,13 @@ func (rs *RecordService) GetHistory(q HistoryQuery) (*HistoryResult, error) {
 			&rec.Title, &originalTitle, &overview, &itemType,
 			&seasonNum, &episodeNum, &rec.UserGUID, &runtime, &releaseDate,
 		); err != nil {
+			rows.Close()
 			return nil, err
 		}
 
 		rec.Position = position.Int64
 		rec.Watched = watched.Int64 != 0
-		rec.Runtime = runtime.Int64 * 60 // runtime 是分钟，转秒
+		rec.Runtime = runtime.Int64 * 60
 		rec.OriginalTitle = originalTitle.String
 		rec.Overview = overview.String
 		rec.Type = itemType.String
@@ -433,11 +416,21 @@ func (rs *RecordService) GetHistory(q HistoryQuery) (*HistoryResult, error) {
 		}
 		rec.IsEpisode = rec.SeasonNumber != nil && rec.EpisodeNumber != nil
 
-		// 获取层级信息
+		rawRecords = append(rawRecords, rec)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close() // ✅ 显式关闭，后面才能安全发新查询
+
+	// ✅ rows 关掉之后，再逐条补 hierarchy（此时连接池空闲）
+	hierCache := make(map[string][]map[string]interface{})
+	records := make([]PlayRecord, 0, len(rawRecords))
+	for _, rec := range rawRecords {
 		hierarchy := rs.getItemHierarchy(db, rec.ItemGUID, hierCache)
 		rec.Hierarchy = hierarchy
 
-		// 构建显示标题
 		displayTitle := rec.Title
 		seriesInfo := ""
 		if len(hierarchy) > 1 {
@@ -456,22 +449,17 @@ func (rs *RecordService) GetHistory(q HistoryQuery) (*HistoryResult, error) {
 		rec.Title = displayTitle
 		rec.SeriesTitle = seriesInfo
 
-		// 进度
 		if rec.Runtime > 0 && rec.Position > 0 {
 			p := float64(rec.Position) / float64(rec.Runtime) * 100
 			if p > 100 {
 				p = 100
 			}
-			rec.Progress = float64(int(p*10)) / 10 // 保留 1 位小数
+			rec.Progress = float64(int(p*10)) / 10
 		}
 		rec.PositionFormatted = formatDuration(rec.Position)
 		rec.RuntimeFormatted = formatDuration(rec.Runtime)
 
 		records = append(records, rec)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 
 	pages := (total + q.PerPage - 1) / q.PerPage
