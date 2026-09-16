@@ -525,7 +525,8 @@ func (s *Server) injectDoubanNative(body []byte) []byte {
 		}
 		// ✅ TV 详情页前端不渲染 vote_average，把评分附加到 content_ratings
 		if found && rating > 0 {
-			if cr, ok := data["content_ratings"].(string); ok && !strings.Contains(cr, "⭐") {
+			cr, _ := data["content_ratings"].(string)
+            if !strings.Contains(cr, "⭐") {
 				if cr == "" {
 					data["content_ratings"] = fmt.Sprintf("⭐%.1f", rating)
 				} else {
