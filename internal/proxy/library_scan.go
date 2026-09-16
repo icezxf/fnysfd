@@ -297,7 +297,7 @@ func (ls *LibraryScanner) scanIncremental(ctx context.Context) {
 
 		for i, item := range items {
 			// ✅ 触发豆瓣抓取（异步）
-			if ls.server.doubanProvider != nil && doubanEnabled {
+			if ls.server.doubanProvider != nil && config.Global.GetEnableDoubanRating() {
 				switch item.Type {
 				case "Movie", "Series":
 					go ls.server.doubanProvider.FetchMovieOrSeries(ctx, item.ImdbID, item.Name, item.ProductionYear, item.Type)
@@ -462,7 +462,7 @@ func (ls *LibraryScanner) expandItems(ctx context.Context, userID string, authHe
 			})
 		case "Series":
 			// ✅ 触发整剧评分抓取（用 IMDb）
-			if ls.server.doubanProvider != nil && doubanEnabled {
+			if ls.server.doubanProvider != nil && config.Global.GetEnableDoubanRating() {
 				go ls.server.doubanProvider.FetchMovieOrSeries(
 					ctx, imdbID, item.Name, item.ProductionYear, "Series",
 				)
@@ -706,7 +706,7 @@ func (ls *LibraryScanner) scanOnceLocked(ctx context.Context) {
 			}
 
 			// ✅ 触发豆瓣抓取
-			if ls.server.doubanProvider != nil && doubanEnabled {
+			if ls.server.doubanProvider != nil && config.Global.GetEnableDoubanRating() {
 				switch item.Type {
 				case "Movie", "Series":
 					go ls.server.doubanProvider.FetchMovieOrSeries(ctx, item.ImdbID, item.Name, item.ProductionYear, item.Type)
@@ -1024,7 +1024,7 @@ func (ls *LibraryScanner) querySeriesEpisodes(ctx context.Context, userID string
 		}
 
 		// ✅ 触发季评分抓取（剧名 + 季号）
-		if ls.server.doubanProvider != nil && doubanEnabled && season.IndexNumber > 0 {
+		if ls.server.doubanProvider != nil && config.Global.GetEnableDoubanRating() && season.IndexNumber > 0 {
 			go ls.server.doubanProvider.FetchSeason(ctx, seriesName, season.IndexNumber)
 		}
 
@@ -1134,7 +1134,7 @@ func (ls *LibraryScanner) ScanLibraryOnce(ctx context.Context, libID string) err
 
 	for i, item := range items {
 		// ✅ 触发豆瓣抓取
-		if ls.server.doubanProvider != nil && doubanEnabled {
+		if ls.server.doubanProvider != nil && config.Global.GetEnableDoubanRating() {
 			switch item.Type {
 			case "Movie", "Series":
 				go ls.server.doubanProvider.FetchMovieOrSeries(ctx, item.ImdbID, item.Name, item.ProductionYear, item.Type)
