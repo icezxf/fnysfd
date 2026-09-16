@@ -15,18 +15,14 @@ import (
 )
 
 const (
-	maxMemoryMB     = 512  // 最大内存使用限制（MB）
+	maxMemoryMB     = 512             // 最大内存使用限制（MB）
 	memoryCheckFreq = 5 * time.Minute // 内存检查频率
 )
 
 // serverInstance 全局服务器实例
-// 注意：本变量赋值在 config.Watch 注册之前完成，Reload 回调中的读取依赖
-// Go 1.19+ 对齐指针读写的原子性保证。若未来需要在运行时替换实例，
-// 应改用 atomic.Pointer[proxy.Server]。
 var serverInstance *proxy.Server
 
 // version 通过 -ldflags "-X main.version=xxx" 在构建时注入
-// 默认值 "dev" 用于开发环境
 var version = "dev"
 
 func main() {
@@ -48,9 +44,6 @@ func main() {
 		log.Printf("Docker初始化: %v", err)
 	}
 
-	// 设置 Docker 重建完成后的优雅关闭回调（替代 docker_manager 中的裸 os.Exit）
-	// 容器重建成功后，UpdateStrmPaths 会异步调用 OnRestart，
-	// 这里向自己发送 SIGTERM 复用下方信号处理逻辑完成优雅退出
 	if docker.Global != nil {
 		docker.Global.SetStrmPaths(config.Global.GetStrmPaths())
 		docker.Global.OnRestart = func() {
@@ -63,7 +56,6 @@ func main() {
 
 	config.Watch(func() {
 		log.Println("🔄 配置已更新")
-		// 触发代理服务器热重载，使新配置（目标地址/日志级别/缓存TTL等）生效
 		if serverInstance != nil {
 			serverInstance.Reload()
 		}
@@ -79,6 +71,10 @@ func main() {
 	dash.SetStreamHandler(server.GetStreamHandler())
 	dash.SetLibraryScanner(server.GetLibraryScanner())
 	dash.SetDoubanProvider(server.GetDoubanProvider())
+	// ✅ 观看记录服务（服务为 nil 时 dashboard 自动禁用「观看记录」tab）
+	if rs := server.GetRecordService(); rs != nil {
+		dash.SetRecordProvider(rs)
+	}
 
 	log.Printf("🚀 FNYSFD 启动")
 	log.Printf("   反代监听: %s", config.Global.GetListenAddr())
@@ -94,8 +90,8 @@ func main() {
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
 		log.Println("🛑 正在关闭...")
-		close(memStop) // 通知内存监控协程退出
-		config.Stop()  // 停止配置文件监听
+		close(memStop)
+		config.Stop()
 		dash.Stop()
 		server.Stop()
 	}()
@@ -115,7 +111,6 @@ func main() {
 }
 
 // memoryMonitor 内存监控协程
-// stop 用于在服务关闭时通知本协程退出，避免泄漏
 func memoryMonitor(s *proxy.Server, stop <-chan struct{}) {
 	ticker := time.NewTicker(memoryCheckFreq)
 	defer ticker.Stop()
@@ -126,7 +121,6 @@ func memoryMonitor(s *proxy.Server, stop <-chan struct{}) {
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
 
-			// 使用 Alloc（当前活跃分配）而非 Sys（历史总申请），更准确反映实际占用
 			memMB := float64(m.Alloc) / 1024 / 1024
 
 			if memMB > maxMemoryMB {
